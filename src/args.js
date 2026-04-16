@@ -32,7 +32,7 @@ const DEFAULT_CONVERSION_ARGS = {
   inputConvention: 'graphdeco',
   linearScaleInput: false,
   colorSpace: 'srgb_rec709_display',
-  maxDepth: 5,
+  maxDepth: 4,
   leafLimit: 10000,
   tilingMode: 'explicit',
   subtreeLevels: 2,

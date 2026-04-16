@@ -62,7 +62,7 @@ const {
 
 (async () => {
   const result = await convert('data/scene.ply', './out/tileset', {
-    maxDepth: 5,
+    maxDepth: 4,
     leafLimit: 10000,
     spzSh1Bits: 8,
     spzShRestBits: 8,
@@ -127,7 +127,7 @@ Examples:
 | Input convention        | string  | `--input-convention`        | `inputConvention`      | `graphdeco`           | `graphdeco`, `khr_native`                   | Controls PLY quaternion interpretation and opacity mapping. |
 | Linear scale input      | boolean | `--linear-scale-input`      | `linearScaleInput`     | `false`               | `true`/`false`                              | If enabled, converts scale values as `ln(max(v, 1e-8))`.    |
 | Color space             | string  | `--color-space`             | `colorSpace`           | `srgb_rec709_display` | `lin_rec709_display`, `srgb_rec709_display` | Emitted in tileset extension metadata.                      |
-| Max depth               | integer | `--max-depth`               | `maxDepth`             | `5`                   | `>= 0`                                      | Controls octree depth.                                      |
+| Max depth               | integer | `--max-depth`               | `maxDepth`             | `4`                   | `>= 0`                                      | Controls octree depth.                                      |
 | Leaf limit              | integer | `--leaf-limit`              | `leafLimit`            | `10000`               | `>= 1`                                      | Max splat count per leaf tile before split stops.           |
 | Tiling mode             | string  | `--tiling-mode`             | `tilingMode`           | `explicit`            | `explicit`, `implicit`                      | Controls whether subtree files are generated.               |
 | Subtree levels          | integer | `--subtree-levels`          | `subtreeLevels`        | `2`                   | `>= 1`                                      | Grouping depth for implicit subtree files.                  |
