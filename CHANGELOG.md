@@ -6,11 +6,19 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-04-16
+
 ### Added
 
 - GitHub Actions CI and npm publish workflows.
 - GitHub issue templates, pull request template, and release note configuration.
 - README badges and documented tag-driven release flow.
+- README cover image for the GitHub and npm package landing pages.
+
+### Changed
+
+- README hero layout and top-of-page presentation.
+- npm package metadata for the published GitHub repository.
 
 ## [0.1.0] - 2026-04-16
 
