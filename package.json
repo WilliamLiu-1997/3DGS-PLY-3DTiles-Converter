@@ -1,0 +1,36 @@
+{
+  "name": "3dgs-ply-3dtiles-converter",
+  "version": "0.1.0",
+  "description": "Convert Gaussian Splatting PLY files into 3D Tiles with SPZ compressed GLB output.",
+  "author": "William Liu <lyz15972107087@gmail.com>",
+  "license": "Apache-2.0",
+  "type": "commonjs",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./cli": "./src/cli.js"
+  },
+  "bin": {
+    "3dgs-ply-3dtiles-converter": "bin/3dgs-ply-3dtiles-converter.js"
+  },
+  "files": [
+    "src/",
+    "bin/",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node -e \"require('./src').convertCloudTo3DTiles ? console.log('ok') : process.exit(1)\"",
+    "cli": "node ./bin/3dgs-ply-3dtiles-converter.js"
+  },
+  "engines": {
+    "node": ">=14.14.0"
+  },
+  "keywords": [
+    "3d-tiles",
+    "gaussian-splatting",
+    "ply",
+    "spz",
+    "converter"
+  ]
+}
