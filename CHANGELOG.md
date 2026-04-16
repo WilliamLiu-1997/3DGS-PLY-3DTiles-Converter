@@ -6,6 +6,12 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-04-16
+
+### Fixed
+
+- Tightened the positive radius bias used for voxel detail representative selection so downsampling keeps detail picks closer to the voxel's weighted center instead of over-favoring very small splats.
+
 ## [0.1.2] - 2026-04-16
 
 ### Changed

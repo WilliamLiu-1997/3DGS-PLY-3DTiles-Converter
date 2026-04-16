@@ -867,7 +867,7 @@ function simplifyCloudVoxel(cloud, targetCount, bounds = null) {
       detailWeights,
       origRadius,
       voxelDiagSq,
-      0.35,
+      0.15,
     );
     if (detailRep >= 0 && detailRep !== coarseRep) {
       const c3 = coarseRep * 3;
@@ -912,7 +912,7 @@ function simplifyCloudVoxel(cloud, targetCount, bounds = null) {
       detailWeights,
       origRadius,
       voxelDiagSq,
-      0.35,
+      0.15,
       coarseRep,
       detailRep,
     );
