@@ -1,5 +1,9 @@
 # 3DGS-PLY-3DTiles-Converter
 
+[![npm version](https://img.shields.io/npm/v/3dgs-ply-3dtiles-converter)](https://www.npmjs.com/package/3dgs-ply-3dtiles-converter)
+[![CI](https://github.com/WilliamLiu-1997/3DGS-PLY-3DTiles-Converter/actions/workflows/ci.yml/badge.svg)](https://github.com/WilliamLiu-1997/3DGS-PLY-3DTiles-Converter/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 Convert Gaussian Splatting PLY files into 3D Tiles with SPZ-compressed GLB content.
 
 This package targets **Node.js** and exposes both:
@@ -12,6 +16,8 @@ This package targets **Node.js** and exposes both:
 ```bash
 npm install 3dgs-ply-3dtiles-converter
 ```
+
+Requires Node.js 14.14 or newer.
 
 ## Run from CLI
 
@@ -34,7 +40,7 @@ node ./bin/3dgs-ply-3dtiles-converter.js --self-test <output_dir>
 Output is written under:
 
 - `tileset.json` (main tileset root)
-- `build_summary.json` (conversion metadata)
+- `build_summary.json` (conversion metadata, including `source`)
 - `tiles/{level}/{x}/{y}/{z}.glb` (tile content)
 - `subtrees/{level}/{x}/{y}/{z}.subtree` (when `--tiling-mode implicit`)
 
@@ -167,3 +173,17 @@ Examples:
 ## Build a package
 
 Because this is a CommonJS module, you can require it directly in Node scripts or run it as a CLI tool.
+
+## Release
+
+- CI runs on pushes and pull requests to `main`.
+- Tag pushes run `.github/workflows/publish.yml`.
+- If the package version is new, the workflow publishes to npm via trusted publishing and creates a GitHub release.
+- If the package version already exists on npm, the workflow skips `npm publish` and only creates the GitHub release.
+
+Typical release flow:
+
+```bash
+npm version patch
+git push origin main --tags
+```

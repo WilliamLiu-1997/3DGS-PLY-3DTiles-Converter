@@ -16,12 +16,15 @@
   "files": [
     "src/",
     "bin/",
+    "CHANGELOG.md",
     "LICENSE",
     "README.md"
   ],
   "scripts": {
     "test": "node -e \"require('./src').convertCloudTo3DTiles ? console.log('ok') : process.exit(1)\"",
-    "cli": "node ./bin/3dgs-ply-3dtiles-converter.js"
+    "cli": "node ./bin/3dgs-ply-3dtiles-converter.js",
+    "pack:check": "npm pack --dry-run",
+    "release:check": "npm test && npm run pack:check"
   },
   "repository": {
     "type": "git",

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: npm package
+    url: https://www.npmjs.com/package/3dgs-ply-3dtiles-converter
+    about: Check the published package metadata and install instructions.
+  - name: README and usage docs
+    url: https://github.com/WilliamLiu-1997/3DGS-PLY-3DTiles-Converter#readme
+    about: Review CLI and API usage before opening an issue.
