@@ -6,6 +6,15 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-04-16
+
+### Changed
+
+- Updated `build_summary.json` to track the actual emitted LOD depth with `effective_max_depth`, removed the redundant `root_geometric_error_base` field, and limit per-depth sampling and geometric-error tables to the deepest emitted level.
+- When `minGeometricError` is configured, the deepest emitted tile level now receives that value even if the build stops earlier than the configured `maxDepth`.
+- Increased the default `maxDepth` from `4` to `5` for finer out-of-the-box tiling.
+- Reduced the default `leafLimit` from `25000` to `10000` to encourage smaller leaf tiles by default.
+
 ## [0.1.1] - 2026-04-16
 
 ### Added

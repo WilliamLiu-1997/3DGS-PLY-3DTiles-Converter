@@ -164,6 +164,7 @@ function runBuildSubtreeWorkerTask(task) {
     outDir: task.outDir,
     colorSpace: task.colorSpace,
     maxDepth: task.maxDepth,
+    lodMaxDepth: task.lodMaxDepth,
     leafLimit: task.leafLimit,
     spzSh1Bits: task.spzSh1Bits,
     spzShRestBits: task.spzShRestBits,

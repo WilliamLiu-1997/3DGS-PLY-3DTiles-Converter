@@ -1213,6 +1213,10 @@ function samplingDivisorForDepth(depth, maxDepth, samplingRatePerLevel) {
   return (1.0 / samplingRatePerLevel) ** stepsFromFinest;
 }
 
+function lodMaxDepthForParams(params) {
+  return params.lodMaxDepth != null ? params.lodMaxDepth : params.maxDepth;
+}
+
 function geometricErrorScaleForDepth(depth, maxDepth, samplingRatePerLevel) {
   const rootDivisor = samplingDivisorForDepth(
     0,
@@ -1229,9 +1233,10 @@ function padLength(length, alignment) {
 }
 
 function targetSplatCountForParams(params, depth, splatCount) {
+  const lodMaxDepth = lodMaxDepthForParams(params);
   const divisor = samplingDivisorForDepth(
     depth,
-    params.maxDepth,
+    lodMaxDepth,
     params.samplingRatePerLevel,
   );
   return Math.max(1, Math.min(splatCount, Math.ceil(splatCount / divisor)));
@@ -1250,11 +1255,12 @@ function constrainTargetSplatCount(
 }
 
 function geometricErrorForParams(params, depth) {
+  const lodMaxDepth = lodMaxDepthForParams(params);
   return (
     params.rootGeometricError *
     geometricErrorScaleForDepth(
       depth,
-      params.maxDepth,
+      lodMaxDepth,
       params.samplingRatePerLevel,
     )
   );
@@ -1343,17 +1349,7 @@ function buildSubtreeNodeLocal(
   const isLeafDepth = depth >= params.maxDepth;
   const childGroups = isLeafDepth ? {} : splitCloudOctants(cloud, cellBounds);
   const childKeys = Object.keys(childGroups);
-  let maxChildSize = 0;
-  for (let i = 0; i < childKeys.length; i++) {
-    const sz = childGroups[childKeys[i]].length;
-    if (sz > maxChildSize) maxChildSize = sz;
-  }
-  const degenerateSplit =
-    !isLeafDepth &&
-    (childKeys.length <= 1 ||
-      (childKeys.length > 0 && maxChildSize === cloud.length));
-  const isLeaf =
-    isLeafDepth || cloud.length <= params.leafLimit || degenerateSplit;
+  const isLeaf = isLeafDepth || cloud.length <= params.leafLimit;
 
   if (isLeaf) {
     const uri = writeContentFile(params, cloud, level, x, y, z);
@@ -1434,6 +1430,7 @@ class OctreeTilesBuilder {
     this.nodes = new Map();
     this.maxNodeLevel = 0;
     this.rootCellBounds = computeBounds(this.cloud);
+    this.lodMaxDepth = this.maxDepth;
     this.rootGeometricErrorSource = 'estimated_root';
     this.rootGeometricError = this.resolveRootGeometricError();
     this.buildPlan = null;
@@ -1524,12 +1521,21 @@ class OctreeTilesBuilder {
     return geometricErrorForParams(this, depth);
   }
 
+  syncLodMaxDepthToBuildPlan() {
+    const planMaxLevel =
+      this.buildPlan && Number.isFinite(this.buildPlan.maxLevel)
+        ? this.buildPlan.maxLevel
+        : this.maxDepth;
+    this.lodMaxDepth = Math.max(0, Math.min(this.maxDepth, planMaxLevel));
+    this.rootGeometricError = this.resolveRootGeometricError();
+  }
+
   resolveRootGeometricError() {
     if (this.minGeometricError != null && this.minGeometricError > 0.0) {
       this.rootGeometricErrorSource = 'configured_min_geometric_error';
       return rootGeometricErrorFromMinLevel(
         this.minGeometricError,
-        this.maxDepth,
+        this.lodMaxDepth,
         this.samplingRatePerLevel,
       );
     }
@@ -1566,21 +1572,10 @@ class OctreeTilesBuilder {
     const isLeafDepth = depth >= this.maxDepth;
     const childGroups = isLeafDepth ? {} : this.splitOctants(cloud, cellBounds);
     const childKeys = Object.keys(childGroups);
-    let maxChildSize = 0;
-    for (let i = 0; i < childKeys.length; i++) {
-      const sz = childGroups[childKeys[i]].length;
-      if (sz > maxChildSize) {
-        maxChildSize = sz;
-      }
-    }
-    const degenerateSplit =
-      !isLeafDepth &&
-      (childKeys.length <= 1 ||
-        (childKeys.length > 0 && maxChildSize === cloud.length));
     return {
       childGroups,
       childKeys,
-      isLeaf: isLeafDepth || cloud.length <= this.leafLimit || degenerateSplit,
+      isLeaf: isLeafDepth || cloud.length <= this.leafLimit,
     };
   }
 
@@ -1763,6 +1758,7 @@ class OctreeTilesBuilder {
       outDir: this.outDir,
       colorSpace: this.colorSpace,
       maxDepth: this.maxDepth,
+      lodMaxDepth: this.lodMaxDepth,
       leafLimit: this.leafLimit,
       spzSh1Bits: this.spzSh1Bits,
       spzShRestBits: this.spzShRestBits,
@@ -2013,19 +2009,11 @@ class OctreeTilesBuilder {
 
   async build() {
     fs.mkdirSync(this.tilesDir, { recursive: true });
-    if (this.rootGeometricErrorSource === 'configured_min_geometric_error') {
-      this.log(
-        `[info] root geometricError base=${this.rootGeometricError.toFixed(6)} | min(level=${this.maxDepth})=${this.minGeometricError.toFixed(6)} [configured]`,
-      );
-    } else {
-      this.log(
-        `[info] root geometricError base=${this.rootGeometricError.toFixed(6)}`,
-      );
-    }
     this.log('[info] planning tile tree...');
     this.scanProgress.setTotal(this.scanWorkTotal());
     this.scanProgress.update(0, 'starting');
     this.buildPlan = this.makeBuildPlan();
+    this.syncLodMaxDepthToBuildPlan();
     this.scanProgress.done(
       [
         `nodes=${this.buildPlan.nodeCount}`,
@@ -2037,6 +2025,19 @@ class OctreeTilesBuilder {
         .filter(Boolean)
         .join(' | '),
     );
+    if (this.rootGeometricErrorSource === 'configured_min_geometric_error') {
+      const minLevelLabel =
+        this.lodMaxDepth === this.maxDepth
+          ? `level=${this.lodMaxDepth}`
+          : `level=${this.lodMaxDepth} actual (configured maxDepth=${this.maxDepth})`;
+      this.log(
+        `[info] root geometricError base=${this.rootGeometricError.toFixed(6)} | min(${minLevelLabel})=${this.minGeometricError.toFixed(6)} [configured]`,
+      );
+    } else {
+      this.log(
+        `[info] root geometricError base=${this.rootGeometricError.toFixed(6)}`,
+      );
+    }
     this.log(
       `[info] planned work | nodes=${this.buildPlan.nodeCount} | content=${this.buildPlan.contentCount}` +
         (this.buildPlan.subtreeCount > 0
@@ -2492,19 +2493,20 @@ async function buildTilesetFromCloud(cloud, outDir, args) {
     const samplingRatesByDepth = {};
     const geometricErrorScaleByDepth = {};
     const geometricErrorByDepth = {};
-    for (let depth = 0; depth <= args.maxDepth; depth++) {
+    for (let depth = 0; depth <= builder.lodMaxDepth; depth++) {
       const geometricScale = geometricErrorScaleForDepth(
         depth,
-        args.maxDepth,
+        builder.lodMaxDepth,
         args.samplingRatePerLevel,
       );
       samplingDivisorsByDepth[String(depth)] = samplingDivisorForDepth(
         depth,
-        args.maxDepth,
+        builder.lodMaxDepth,
         args.samplingRatePerLevel,
       );
       samplingRatesByDepth[String(depth)] =
-        args.samplingRatePerLevel ** Math.max(0, args.maxDepth - depth);
+        args.samplingRatePerLevel **
+        Math.max(0, builder.lodMaxDepth - depth);
       geometricErrorScaleByDepth[String(depth)] = geometricScale;
       geometricErrorByDepth[String(depth)] =
         builder.rootGeometricError * geometricScale;
@@ -2532,12 +2534,12 @@ async function buildTilesetFromCloud(cloud, outDir, args) {
           : null,
       node_count: builder.nodes.size,
       available_levels: builder.maxLevel() + 1,
+      effective_max_depth: builder.lodMaxDepth,
       root_geometric_error_source: builder.rootGeometricErrorSource,
-      root_geometric_error_base: builder.rootGeometricError,
       implicit_root_geometric_error:
         args.tilingMode === 'implicit' ? builder.implicitRootError() : null,
       root_geometric_error: root ? root.error : null,
-      min_geometric_error: builder.geometricErrorForDepth(args.maxDepth),
+      min_geometric_error: builder.geometricErrorForDepth(builder.lodMaxDepth),
       geometric_error_scale_by_depth: geometricErrorScaleByDepth,
       geometric_error_by_depth: geometricErrorByDepth,
       sampling_rates_by_depth: samplingRatesByDepth,
