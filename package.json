@@ -23,6 +23,14 @@
     "test": "node -e \"require('./src').convertCloudTo3DTiles ? console.log('ok') : process.exit(1)\"",
     "cli": "node ./bin/3dgs-ply-3dtiles-converter.js"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WilliamLiu-1997/3DGS-PLY-3DTiles-Converter.git"
+  },
+  "homepage": "https://github.com/WilliamLiu-1997/3DGS-PLY-3DTiles-Converter#readme",
+  "bugs": {
+    "url": "https://github.com/WilliamLiu-1997/3DGS-PLY-3DTiles-Converter/issues"
+  },
   "engines": {
     "node": ">=14.14.0"
   },
