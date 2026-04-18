@@ -18,6 +18,7 @@ function usage() {
     '  --spz-sh-rest-bits <1..8>',
     '  --source-up-axis <z|y>',
     '  --sampling-rate-per-level <0..1]',
+    '  --sample-mode <sample|merge>',
     '  --content-workers <0+>',
     '  --self-test',
     '  --self-test-count <int>',
@@ -41,6 +42,7 @@ const DEFAULT_CONVERSION_ARGS = {
   spzShRestBits: 8,
   sourceUpAxis: 'z',
   samplingRatePerLevel: 0.5,
+  sampleMode: 'merge',
   contentWorkers: 4,
   clean: false,
   selfTest: false,
@@ -128,6 +130,7 @@ function validateConversionArgs(args, { requireInput = false } = {}) {
   );
   assertChoice(args.tilingMode, ['explicit', 'implicit'], '--tiling-mode');
   assertChoice(args.sourceUpAxis, ['z', 'y'], '--source-up-axis');
+  assertChoice(args.sampleMode, ['sample', 'merge'], '--sample-mode');
 
   if (requireInput && !args.input) {
     throw new ConversionError('Please provide input PLY path.');
@@ -245,6 +248,10 @@ function parseArgs(argv) {
         );
       }
       args.samplingRatePerLevel = value;
+      continue;
+    }
+    if (token === '--sample-mode') {
+      args.sampleMode = requireValue(token);
       continue;
     }
     if (token === '--content-workers') {
@@ -420,6 +427,12 @@ function makeConversionArgs(
         DEFAULT_CONVERSION_ARGS.samplingRatePerLevel,
       ),
       '--sampling-rate-per-level',
+    ),
+    sampleMode: firstDefined(
+      options.sampleMode,
+      options['sample-mode'],
+      options.sample_mode,
+      DEFAULT_CONVERSION_ARGS.sampleMode,
     ),
     contentWorkers: normalizeToInt(
       firstDefined(
