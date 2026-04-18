@@ -9,6 +9,7 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 ### Fixed
 
 - Added the top-level `3DTILES_content_gltf` tileset extension metadata to generated explicit and implicit `tileset.json` files so CesiumJS can detect `KHR_gaussian_splatting` and `KHR_gaussian_splatting_compression_spz_2` content correctly.
+- Switched generated `tileset.json` and `build_summary.json` output to compact single-line JSON to reduce file size.
 
 ## [0.1.3] - 2026-04-16
 

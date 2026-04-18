@@ -45,8 +45,8 @@ node ./bin/3dgs-ply-3dtiles-converter.js --self-test <output_dir>
 
 Output is written under:
 
-- `tileset.json` (main tileset root)
-- `build_summary.json` (conversion metadata, including `source`)
+- `tileset.json` (main tileset root, written as compact single-line JSON)
+- `build_summary.json` (conversion metadata, including `source`, written as compact single-line JSON)
 - `tiles/{level}/{x}/{y}/{z}.glb` (tile content)
 - `subtrees/{level}/{x}/{y}/{z}.subtree` (when `--tiling-mode implicit`)
 

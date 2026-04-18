@@ -2511,7 +2511,7 @@ async function buildTilesetFromCloud(cloud, outDir, args) {
     const [, tileset] = await builder.build();
     fs.writeFileSync(
       path.join(outputDir, 'tileset.json'),
-      JSON.stringify(tileset, null, 2),
+      JSON.stringify(tileset),
       'utf8',
     );
 
@@ -2574,7 +2574,7 @@ async function buildTilesetFromCloud(cloud, outDir, args) {
     };
     fs.writeFileSync(
       path.join(outputDir, 'build_summary.json'),
-      JSON.stringify(summary, null, 2),
+      JSON.stringify(summary),
       'utf8',
     );
     console.log(
