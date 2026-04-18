@@ -29,6 +29,30 @@ const SUBTREE_MAGIC = 0x74627573;
 const SUBTREE_VERSION = 1;
 const SOURCE_REPOSITORY = '3DGS-PLY-3DTiles-Converter';
 const DEFAULT_WORKER_SCRIPT = path.join(__dirname, 'convert-core.js');
+const GLTF_TILESET_CONTENT_EXTENSION = '3DTILES_content_gltf';
+const GAUSSIAN_SPLATTING_GLTF_EXTENSIONS = [
+  'KHR_gaussian_splatting',
+  'KHR_gaussian_splatting_compression_spz_2',
+];
+
+function applyTilesetGltfContentExtensions(tileset) {
+  tileset.extensions = {
+    ...(tileset.extensions || {}),
+    [GLTF_TILESET_CONTENT_EXTENSION]: {
+      extensionsRequired: [...GAUSSIAN_SPLATTING_GLTF_EXTENSIONS],
+      extensionsUsed: [...GAUSSIAN_SPLATTING_GLTF_EXTENSIONS],
+    },
+  };
+
+  const extensionsUsed = Array.isArray(tileset.extensionsUsed)
+    ? tileset.extensionsUsed.filter((name) => !!name)
+    : [];
+  if (!extensionsUsed.includes(GLTF_TILESET_CONTENT_EXTENSION)) {
+    extensionsUsed.push(GLTF_TILESET_CONTENT_EXTENSION);
+  }
+  tileset.extensionsUsed = extensionsUsed;
+  return tileset;
+}
 
 class ConsoleProgressBar {
   constructor(label, total = 0, width = 28) {
@@ -2066,13 +2090,15 @@ class OctreeTilesBuilder {
 
     let tileset;
     if (this.tilingMode === 'explicit') {
-      tileset = {
+      tileset = applyTilesetGltfContentExtensions({
         asset: { version: '1.1' },
         geometricError: root.error,
         root: this.tileToJson(root),
-      };
+      });
     } else if (this.tilingMode === 'implicit') {
-      tileset = await this.writeImplicitTileset();
+      tileset = applyTilesetGltfContentExtensions(
+        await this.writeImplicitTileset(),
+      );
     } else {
       throw new ConversionError(`Unknown tiling mode: ${this.tilingMode}`);
     }

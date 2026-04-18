@@ -50,6 +50,8 @@ Output is written under:
 - `tiles/{level}/{x}/{y}/{z}.glb` (tile content)
 - `subtrees/{level}/{x}/{y}/{z}.subtree` (when `--tiling-mode implicit`)
 
+Generated `tileset.json` files declare the top-level `3DTILES_content_gltf` tileset extension metadata that CesiumJS uses to detect `KHR_gaussian_splatting` and `KHR_gaussian_splatting_compression_spz_2` glTF tile content.
+
 ## API usage
 
 ```js
