@@ -114,7 +114,12 @@ function runPackSpzWorkerTask(task) {
 function runSimplifyPackSpzWorkerTask(task) {
   const cloud = cloudFromWorkerTask(task);
   const bounds = task.cellBounds ? deserializeBounds(task.cellBounds) : null;
-  const [lodCloud] = simplifyCloudVoxel(cloud, task.targetCount, bounds);
+  const [lodCloud] = simplifyCloudVoxel(
+    cloud,
+    task.targetCount,
+    bounds,
+    task.sampleMode,
+  );
   const translation = computeBounds(lodCloud).center();
   writeCloudGlbTaskOutput(task, lodCloud, translation);
   return true;
@@ -170,6 +175,7 @@ function runBuildSubtreeWorkerTask(task) {
     spzShRestBits: task.spzShRestBits,
     sourceUpAxis: task.sourceUpAxis,
     samplingRatePerLevel: task.samplingRatePerLevel,
+    sampleMode: task.sampleMode,
     rootGeometricError: task.rootGeometricError,
   };
   const cloud = cloudFromWorkerTask(task);

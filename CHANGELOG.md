@@ -6,6 +6,14 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+### Added
+
+- Added `sampleMode` with CLI flag `--sample-mode` and API field `sampleMode` for `sample` and `merge` modes. `sample` preserves the previous representative-splat downsampling behavior, while `merge` merges assigned splats to the target count and preferentially merges detail splats before coarse splats.
+
+### Changed
+
+- Changed the default sampling mode from `sample` to `merge` for both CLI and API conversions.
+
 ## [0.1.4] - 2026-04-18
 
 ### Fixed

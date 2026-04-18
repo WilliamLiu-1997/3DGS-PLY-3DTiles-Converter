@@ -113,6 +113,7 @@ Examples:
 
 - CLI `--max-depth 5` equals API `{ maxDepth: 5 }`
 - CLI `--spz-sh1-bits 6` equals API `{ spzSh1Bits: 6 }`
+- CLI `--sample-mode merge` equals API `{ sampleMode: 'merge' }`
 
 ### Common positional args
 
@@ -138,6 +139,7 @@ Examples:
 | SH rest bits            | integer | `--spz-sh-rest-bits`        | `spzShRestBits`        | `8`                   | `1..8`                                      | SPZ quantization bits for higher SH coefficients.           |
 | Source up-axis          | string  | `--source-up-axis`          | `sourceUpAxis`         | `z`                   | `z`, `y`                                    | Source-to-3D-tiles up-axis conversion.                      |
 | Sampling rate per level | number  | `--sampling-rate-per-level` | `samplingRatePerLevel` | `0.5`                 | `(0,1]`                                     | LOD sampling ratio between levels.                          |
+| Sampling mode           | string  | `--sample-mode`             | `sampleMode`           | `merge`               | `sample`, `merge`                           | `sample` keeps representative splats; `merge` merges assigned splats into the target count and prefers merging detail splats before coarse splats. |
 | Content workers         | integer | `--content-workers`         | `contentWorkers`       | `4`                   | `>= 0`                                      | Parallel SPZ/GLB workers. `0` disables worker pool.         |
 | Self-test               | boolean | `--self-test`               | `selfTest`             | `false`               | `true`/`false`                              | Generates synthetic cloud and writes sample PLY.            |
 | Self-test count         | integer | `--self-test-count`         | `selfTestCount`        | `6000`                | integer                                     | Number of synthetic splats.                                 |

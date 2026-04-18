@@ -4,6 +4,7 @@ const { Worker } = require('worker_threads');
 
 const {
   ConversionError,
+  GaussianCloud,
   Bounds,
   TileNode,
   roundHalfToEven,
@@ -429,6 +430,471 @@ function computeThreeSigmaAabbDiagonalRadius(scaleLog, quatsXYZW) {
   return out;
 }
 
+function covarianceComponentsAt(scaleLog, quatsXYZW, index, out) {
+  const qi = index * 4;
+  let x = quatsXYZW[qi + 0];
+  let y = quatsXYZW[qi + 1];
+  let z = quatsXYZW[qi + 2];
+  let w = quatsXYZW[qi + 3];
+
+  const len2 = x * x + y * y + z * z + w * w;
+  if (len2 < 1e-20) {
+    x = 0.0;
+    y = 0.0;
+    z = 0.0;
+    w = 1.0;
+  } else {
+    const inv = 1.0 / Math.sqrt(len2);
+    x *= inv;
+    y *= inv;
+    z *= inv;
+    w *= inv;
+  }
+
+  const xx = x * x;
+  const yy = y * y;
+  const zz = z * z;
+  const xy = x * y;
+  const xz = x * z;
+  const yz = y * z;
+  const wx = w * x;
+  const wy = w * y;
+  const wz = w * z;
+
+  const s0 = Math.exp(scaleLog[index * 3 + 0]);
+  const s1 = Math.exp(scaleLog[index * 3 + 1]);
+  const s2 = Math.exp(scaleLog[index * 3 + 2]);
+  const s2x = s0 * s0;
+  const s2y = s1 * s1;
+  const s2z = s2 * s2;
+
+  const r00 = 1.0 - 2.0 * (yy + zz);
+  const r10 = 2.0 * (xy - wz);
+  const r20 = 2.0 * (xz + wy);
+  const r01 = 2.0 * (xy + wz);
+  const r11 = 1.0 - 2.0 * (xx + zz);
+  const r21 = 2.0 * (yz - wx);
+  const r02 = 2.0 * (xz - wy);
+  const r12 = 2.0 * (yz + wx);
+  const r22 = 1.0 - 2.0 * (xx + yy);
+
+  out[0] = r00 * r00 * s2x + r10 * r10 * s2y + r20 * r20 * s2z;
+  out[1] = r00 * r01 * s2x + r10 * r11 * s2y + r20 * r21 * s2z;
+  out[2] = r00 * r02 * s2x + r10 * r12 * s2y + r20 * r22 * s2z;
+  out[3] = r01 * r01 * s2x + r11 * r11 * s2y + r21 * r21 * s2z;
+  out[4] = r01 * r02 * s2x + r11 * r12 * s2y + r21 * r22 * s2z;
+  out[5] = r02 * r02 * s2x + r12 * r12 * s2y + r22 * r22 * s2z;
+  return out;
+}
+
+function quaternionFromRotationMatrix(
+  r00,
+  r01,
+  r02,
+  r10,
+  r11,
+  r12,
+  r20,
+  r21,
+  r22,
+) {
+  const trace = r00 + r11 + r22;
+  let x;
+  let y;
+  let z;
+  let w;
+
+  if (trace > 0.0) {
+    const s = Math.sqrt(trace + 1.0) * 2.0;
+    w = 0.25 * s;
+    x = (r21 - r12) / s;
+    y = (r02 - r20) / s;
+    z = (r10 - r01) / s;
+  } else if (r00 > r11 && r00 > r22) {
+    const s = Math.sqrt(Math.max(1.0 + r00 - r11 - r22, 1e-20)) * 2.0;
+    w = (r21 - r12) / s;
+    x = 0.25 * s;
+    y = (r01 + r10) / s;
+    z = (r02 + r20) / s;
+  } else if (r11 > r22) {
+    const s = Math.sqrt(Math.max(1.0 + r11 - r00 - r22, 1e-20)) * 2.0;
+    w = (r02 - r20) / s;
+    x = (r01 + r10) / s;
+    y = 0.25 * s;
+    z = (r12 + r21) / s;
+  } else {
+    const s = Math.sqrt(Math.max(1.0 + r22 - r00 - r11, 1e-20)) * 2.0;
+    w = (r10 - r01) / s;
+    x = (r02 + r20) / s;
+    y = (r12 + r21) / s;
+    z = 0.25 * s;
+  }
+
+  const len2 = x * x + y * y + z * z + w * w;
+  if (len2 < 1e-20) {
+    return [0.0, 0.0, 0.0, 1.0];
+  }
+  const inv = 1.0 / Math.sqrt(len2);
+  return [x * inv, y * inv, z * inv, w * inv];
+}
+
+function covarianceToScaleQuat(
+  c00,
+  c01,
+  c02,
+  c11,
+  c12,
+  c22,
+  scaleLogOut,
+  scaleOff,
+  quatsOut,
+  quatOff,
+) {
+  const a = [
+    [c00, c01, c02],
+    [c01, c11, c12],
+    [c02, c12, c22],
+  ];
+  const v = [
+    [1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0],
+  ];
+
+  for (let iter = 0; iter < 12; iter++) {
+    let p = 0;
+    let q = 1;
+    let maxOff = Math.abs(a[0][1]);
+    const abs02 = Math.abs(a[0][2]);
+    if (abs02 > maxOff) {
+      p = 0;
+      q = 2;
+      maxOff = abs02;
+    }
+    const abs12 = Math.abs(a[1][2]);
+    if (abs12 > maxOff) {
+      p = 1;
+      q = 2;
+      maxOff = abs12;
+    }
+
+    const scale =
+      Math.abs(a[0][0]) + Math.abs(a[1][1]) + Math.abs(a[2][2]) + 1.0;
+    if (maxOff <= 1e-10 * scale) {
+      break;
+    }
+
+    const app = a[p][p];
+    const aqq = a[q][q];
+    const apq = a[p][q];
+    if (Math.abs(apq) <= 1e-20) {
+      continue;
+    }
+
+    const tau = (aqq - app) / (2.0 * apq);
+    const signTau = tau >= 0.0 ? 1.0 : -1.0;
+    const t = signTau / (Math.abs(tau) + Math.sqrt(1.0 + tau * tau));
+    const c = 1.0 / Math.sqrt(1.0 + t * t);
+    const s = t * c;
+
+    for (let r = 0; r < 3; r++) {
+      if (r === p || r === q) {
+        continue;
+      }
+      const arp = a[r][p];
+      const arq = a[r][q];
+      const nextRp = c * arp - s * arq;
+      const nextRq = s * arp + c * arq;
+      a[r][p] = nextRp;
+      a[p][r] = nextRp;
+      a[r][q] = nextRq;
+      a[q][r] = nextRq;
+    }
+
+    a[p][p] = c * c * app - 2.0 * s * c * apq + s * s * aqq;
+    a[q][q] = s * s * app + 2.0 * s * c * apq + c * c * aqq;
+    a[p][q] = 0.0;
+    a[q][p] = 0.0;
+
+    for (let r = 0; r < 3; r++) {
+      const vrp = v[r][p];
+      const vrq = v[r][q];
+      v[r][p] = c * vrp - s * vrq;
+      v[r][q] = s * vrp + c * vrq;
+    }
+  }
+
+  const eigen = [
+    { value: Math.max(a[0][0], 1e-20), col: 0 },
+    { value: Math.max(a[1][1], 1e-20), col: 1 },
+    { value: Math.max(a[2][2], 1e-20), col: 2 },
+  ].sort((lhs, rhs) => rhs.value - lhs.value || lhs.col - rhs.col);
+
+  const rot = new Float64Array(9);
+  for (let dstCol = 0; dstCol < 3; dstCol++) {
+    const srcCol = eigen[dstCol].col;
+    let vx = v[0][srcCol];
+    let vy = v[1][srcCol];
+    let vz = v[2][srcCol];
+    const len2 = vx * vx + vy * vy + vz * vz;
+    if (len2 < 1e-20) {
+      vx = dstCol === 0 ? 1.0 : 0.0;
+      vy = dstCol === 1 ? 1.0 : 0.0;
+      vz = dstCol === 2 ? 1.0 : 0.0;
+    } else {
+      const inv = 1.0 / Math.sqrt(len2);
+      vx *= inv;
+      vy *= inv;
+      vz *= inv;
+    }
+    rot[dstCol + 0] = vx;
+    rot[dstCol + 3] = vy;
+    rot[dstCol + 6] = vz;
+  }
+
+  const det =
+    rot[0] * (rot[4] * rot[8] - rot[5] * rot[7]) -
+    rot[1] * (rot[3] * rot[8] - rot[5] * rot[6]) +
+    rot[2] * (rot[3] * rot[7] - rot[4] * rot[6]);
+  if (det < 0.0) {
+    rot[2] *= -1.0;
+    rot[5] *= -1.0;
+    rot[8] *= -1.0;
+  }
+
+  scaleLogOut[scaleOff + 0] = Math.log(Math.sqrt(eigen[0].value));
+  scaleLogOut[scaleOff + 1] = Math.log(Math.sqrt(eigen[1].value));
+  scaleLogOut[scaleOff + 2] = Math.log(Math.sqrt(eigen[2].value));
+
+  const quat = quaternionFromRotationMatrix(
+    rot[0],
+    rot[1],
+    rot[2],
+    rot[3],
+    rot[4],
+    rot[5],
+    rot[6],
+    rot[7],
+    rot[8],
+  );
+  quatsOut[quatOff + 0] = quat[0];
+  quatsOut[quatOff + 1] = quat[1];
+  quatsOut[quatOff + 2] = quat[2];
+  quatsOut[quatOff + 3] = quat[3];
+}
+
+function copySplatIntoArrays(
+  cloud,
+  srcIndex,
+  dstIndex,
+  coeffStride,
+  positions,
+  scaleLog,
+  quats,
+  opacity,
+  shCoeffs,
+  color0,
+) {
+  const s3 = srcIndex * 3;
+  const d3 = dstIndex * 3;
+  const s4 = srcIndex * 4;
+  const d4 = dstIndex * 4;
+  positions[d3 + 0] = cloud.positions[s3 + 0];
+  positions[d3 + 1] = cloud.positions[s3 + 1];
+  positions[d3 + 2] = cloud.positions[s3 + 2];
+  scaleLog[d3 + 0] = cloud.scaleLog[s3 + 0];
+  scaleLog[d3 + 1] = cloud.scaleLog[s3 + 1];
+  scaleLog[d3 + 2] = cloud.scaleLog[s3 + 2];
+  quats[d4 + 0] = cloud.quatsXYZW[s4 + 0];
+  quats[d4 + 1] = cloud.quatsXYZW[s4 + 1];
+  quats[d4 + 2] = cloud.quatsXYZW[s4 + 2];
+  quats[d4 + 3] = cloud.quatsXYZW[s4 + 3];
+  opacity[dstIndex] = cloud.opacity[srcIndex];
+  const srcCoeffBase = srcIndex * coeffStride;
+  const dstCoeffBase = dstIndex * coeffStride;
+  for (let c = 0; c < coeffStride; c++) {
+    shCoeffs[dstCoeffBase + c] = cloud.shCoeffs[srcCoeffBase + c];
+  }
+  if (color0) {
+    color0[d3 + 0] = cloud.color0[s3 + 0];
+    color0[d3 + 1] = cloud.color0[s3 + 1];
+    color0[d3 + 2] = cloud.color0[s3 + 2];
+  }
+}
+
+function mergeAggregationWeight(opacity, radius, voxelDiag) {
+  const alpha = Math.max(opacity, 1e-4);
+  const radiusNorm = Math.max(radius / Math.max(voxelDiag, 1e-6), 0.35);
+  return alpha * Math.sqrt(radiusNorm);
+}
+
+function mergeAssignedCloud(cloud, selected, assignment, origRadius, voxelDiag) {
+  const n = cloud.length;
+  const outCount = selected.length;
+  const coeffStride = cloud.shCoeffs.length / Math.max(1, n);
+  const positions = new Float32Array(outCount * 3);
+  const scaleLog = new Float32Array(outCount * 3);
+  const quats = new Float32Array(outCount * 4);
+  const opacity = new Float32Array(outCount);
+  const shCoeffs = new Float32Array(outCount * coeffStride);
+  const color0 = cloud.color0 ? new Float32Array(outCount * 3) : null;
+  const weightSums = new Float64Array(outCount);
+  const counts = new Uint32Array(outCount);
+  const firstAssigned = new Int32Array(outCount);
+  firstAssigned.fill(-1);
+  const weightedPos = new Float64Array(outCount * 3);
+  const weightedOpacity = new Float64Array(outCount);
+  const covSums = new Float64Array(outCount * 6);
+  const scratchCov = new Float64Array(6);
+
+  for (let i = 0; i < n; i++) {
+    const slot = assignment[i];
+    const weight = mergeAggregationWeight(
+      cloud.opacity[i],
+      origRadius[i],
+      voxelDiag,
+    );
+    const base3 = slot * 3;
+    const coeffBase = slot * coeffStride;
+    const src3 = i * 3;
+    const srcCoeffBase = i * coeffStride;
+    if (firstAssigned[slot] < 0) {
+      firstAssigned[slot] = i;
+    }
+    weightSums[slot] += weight;
+    counts[slot] += 1;
+    weightedPos[base3 + 0] += cloud.positions[src3 + 0] * weight;
+    weightedPos[base3 + 1] += cloud.positions[src3 + 1] * weight;
+    weightedPos[base3 + 2] += cloud.positions[src3 + 2] * weight;
+    weightedOpacity[slot] += cloud.opacity[i] * weight;
+    for (let c = 0; c < coeffStride; c++) {
+      shCoeffs[coeffBase + c] += cloud.shCoeffs[srcCoeffBase + c] * weight;
+    }
+    if (color0) {
+      color0[base3 + 0] += cloud.color0[src3 + 0] * weight;
+      color0[base3 + 1] += cloud.color0[src3 + 1] * weight;
+      color0[base3 + 2] += cloud.color0[src3 + 2] * weight;
+    }
+  }
+
+  for (let slot = 0; slot < outCount; slot++) {
+    const weight = weightSums[slot];
+    const fallbackSrc =
+      firstAssigned[slot] >= 0 ? firstAssigned[slot] : selected[slot];
+    if (!Number.isFinite(weight) || weight <= 1e-12 || counts[slot] === 0) {
+      copySplatIntoArrays(
+        cloud,
+        fallbackSrc,
+        slot,
+        coeffStride,
+        positions,
+        scaleLog,
+        quats,
+        opacity,
+        shCoeffs,
+        color0,
+      );
+      continue;
+    }
+
+    const invWeight = 1.0 / weight;
+    const base3 = slot * 3;
+    const coeffBase = slot * coeffStride;
+    positions[base3 + 0] = weightedPos[base3 + 0] * invWeight;
+    positions[base3 + 1] = weightedPos[base3 + 1] * invWeight;
+    positions[base3 + 2] = weightedPos[base3 + 2] * invWeight;
+    opacity[slot] = Math.max(
+      0.0,
+      Math.min(1.0, weightedOpacity[slot] * invWeight),
+    );
+    for (let c = 0; c < coeffStride; c++) {
+      shCoeffs[coeffBase + c] *= invWeight;
+    }
+    if (color0) {
+      color0[base3 + 0] *= invWeight;
+      color0[base3 + 1] *= invWeight;
+      color0[base3 + 2] *= invWeight;
+    }
+  }
+
+  for (let i = 0; i < n; i++) {
+    const slot = assignment[i];
+    if (!Number.isFinite(weightSums[slot]) || weightSums[slot] <= 1e-12) {
+      continue;
+    }
+    const weight = mergeAggregationWeight(
+      cloud.opacity[i],
+      origRadius[i],
+      voxelDiag,
+    );
+    const src3 = i * 3;
+    const dst3 = slot * 3;
+    const dx = cloud.positions[src3 + 0] - positions[dst3 + 0];
+    const dy = cloud.positions[src3 + 1] - positions[dst3 + 1];
+    const dz = cloud.positions[src3 + 2] - positions[dst3 + 2];
+    covarianceComponentsAt(cloud.scaleLog, cloud.quatsXYZW, i, scratchCov);
+    const covBase = slot * 6;
+    covSums[covBase + 0] += weight * (scratchCov[0] + dx * dx);
+    covSums[covBase + 1] += weight * (scratchCov[1] + dx * dy);
+    covSums[covBase + 2] += weight * (scratchCov[2] + dx * dz);
+    covSums[covBase + 3] += weight * (scratchCov[3] + dy * dy);
+    covSums[covBase + 4] += weight * (scratchCov[4] + dy * dz);
+    covSums[covBase + 5] += weight * (scratchCov[5] + dz * dz);
+  }
+
+  for (let slot = 0; slot < outCount; slot++) {
+    const weight = weightSums[slot];
+    const fallbackSrc =
+      firstAssigned[slot] >= 0 ? firstAssigned[slot] : selected[slot];
+    if (
+      !Number.isFinite(weight) ||
+      weight <= 1e-12 ||
+      counts[slot] === 0 ||
+      counts[slot] === 1
+    ) {
+      copySplatIntoArrays(
+        cloud,
+        fallbackSrc,
+        slot,
+        coeffStride,
+        positions,
+        scaleLog,
+        quats,
+        opacity,
+        shCoeffs,
+        color0,
+      );
+      continue;
+    }
+
+    const invWeight = 1.0 / weight;
+    const covBase = slot * 6;
+    covarianceToScaleQuat(
+      Math.max(covSums[covBase + 0] * invWeight, 1e-20),
+      covSums[covBase + 1] * invWeight,
+      covSums[covBase + 2] * invWeight,
+      Math.max(covSums[covBase + 3] * invWeight, 1e-20),
+      covSums[covBase + 4] * invWeight,
+      Math.max(covSums[covBase + 5] * invWeight, 1e-20),
+      scaleLog,
+      slot * 3,
+      quats,
+      slot * 4,
+    );
+  }
+
+  const out = new GaussianCloud(
+    positions,
+    scaleLog,
+    quats,
+    opacity,
+    shCoeffs,
+    color0,
+  );
+  out._shDegree = cloud.shDegree;
+  return out;
+}
+
 function computeBounds(cloud) {
   const n = cloud.length;
   const ext = computeThreeSigmaExtents(cloud.scaleLog, cloud.quatsXYZW);
@@ -755,7 +1221,12 @@ function representativeIndexForGroup(
   return rep;
 }
 
-function simplifyCloudVoxel(cloud, targetCount, bounds = null) {
+function simplifyCloudVoxel(
+  cloud,
+  targetCount,
+  bounds = null,
+  sampleMode = 'sample',
+) {
   const n = cloud.length;
   const target = Math.max(1, Math.min(Math.floor(targetCount), n));
   if (n <= target) {
@@ -1166,7 +1637,6 @@ function simplifyCloudVoxel(cloud, targetCount, bounds = null) {
   }
 
   const selectedCloud = cloud.subset(selected, false);
-
   const keptRadius = new Float32Array(selected.length);
   for (let i = 0; i < selected.length; i++) {
     keptRadius[i] = origRadius[selected[i]];
@@ -1213,23 +1683,47 @@ function simplifyCloudVoxel(cloud, targetCount, bounds = null) {
     }
   }
 
+  const outputCloud =
+    sampleMode === 'merge'
+      ? mergeAssignedCloud(
+          cloud,
+          selected,
+          assignment,
+          origRadius,
+          voxelDiag,
+        )
+      : selectedCloud;
+  const outputRadius =
+    sampleMode === 'merge'
+      ? computeThreeSigmaAabbDiagonalRadius(
+          outputCloud.scaleLog,
+          outputCloud.quatsXYZW,
+        )
+      : (() => {
+          const kept = new Float32Array(selected.length);
+          for (let i = 0; i < selected.length; i++) {
+            kept[i] = origRadius[selected[i]];
+          }
+          return kept;
+        })();
+
   const err = new Float32Array(n);
   for (let i = 0; i < n; i++) {
     const r = assignment[i];
     const px = cloud.positions[i * 3 + 0];
     const py = cloud.positions[i * 3 + 1];
     const pz = cloud.positions[i * 3 + 2];
-    const sx = selectedCloud.positions[r * 3 + 0];
-    const sy = selectedCloud.positions[r * 3 + 1];
-    const sz = selectedCloud.positions[r * 3 + 2];
+    const sx = outputCloud.positions[r * 3 + 0];
+    const sy = outputCloud.positions[r * 3 + 1];
+    const sz = outputCloud.positions[r * 3 + 2];
     const dx = px - sx;
     const dy = py - sy;
     const dz = pz - sz;
     const centerErr = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    err[i] = centerErr + origRadius[i] + keptRadius[r];
+    err[i] = centerErr + origRadius[i] + outputRadius[r];
   }
 
-  return [selectedCloud, assignment, percent95(err)];
+  return [outputCloud, assignment, percent95(err)];
 }
 
 function samplingDivisorForDepth(depth, maxDepth, samplingRatePerLevel) {
@@ -1394,7 +1888,12 @@ function buildSubtreeNodeLocal(
     cloud.length,
     childKeys.length,
   );
-  const [lodCloud] = simplifyCloudVoxel(cloud, targetCount, cellBounds);
+  const [lodCloud] = simplifyCloudVoxel(
+    cloud,
+    targetCount,
+    cellBounds,
+    params.sampleMode,
+  );
   const uri = writeContentFile(params, lodCloud, level, x, y, z);
   const children = [];
   for (let oct = 0; oct < 8; oct++) {
@@ -1443,6 +1942,7 @@ class OctreeTilesBuilder {
     this.spzShRestBits = params.spzShRestBits;
     this.sourceUpAxis = params.sourceUpAxis;
     this.samplingRatePerLevel = params.samplingRatePerLevel;
+    this.sampleMode = params.sampleMode || 'merge';
     this.minGeometricError = params.minGeometricError;
     this.contentWorkers = params.contentWorkers || 0;
     this.workerScriptPath = params.workerScriptPath || DEFAULT_WORKER_SCRIPT;
@@ -1577,11 +2077,15 @@ class OctreeTilesBuilder {
     if (target >= this.cloud.length) {
       return Math.max(diag * 0.125, diag * 1e-6, 1e-6);
     }
-    const ownError = estimateVoxelGroupingError(
-      this.cloud,
-      target,
-      this.rootCellBounds,
-    );
+    const ownError =
+      this.sampleMode === 'merge'
+        ? simplifyCloudVoxel(
+            this.cloud,
+            target,
+            this.rootCellBounds,
+            this.sampleMode,
+          )[2]
+        : estimateVoxelGroupingError(this.cloud, target, this.rootCellBounds);
     if (!Number.isFinite(ownError) || ownError <= 0.0) {
       return Math.max(diag * 0.125, 1e-6);
     }
@@ -1788,6 +2292,7 @@ class OctreeTilesBuilder {
       spzShRestBits: this.spzShRestBits,
       sourceUpAxis: this.sourceUpAxis,
       samplingRatePerLevel: this.samplingRatePerLevel,
+      sampleMode: this.sampleMode,
       rootGeometricError: this.rootGeometricError,
       depth,
       level,
@@ -1888,7 +2393,12 @@ class OctreeTilesBuilder {
           z,
         );
       } else {
-        const [lodCloud] = simplifyCloudVoxel(cloud, targetCount, cellBounds);
+        const [lodCloud] = simplifyCloudVoxel(
+          cloud,
+          targetCount,
+          cellBounds,
+          this.sampleMode,
+        );
         uri = this.writeContent(lodCloud, level, x, y, z);
       }
 
@@ -1953,7 +2463,12 @@ class OctreeTilesBuilder {
         }
       }
     } else {
-      const [lodCloud] = simplifyCloudVoxel(cloud, targetCount, cellBounds);
+      const [lodCloud] = simplifyCloudVoxel(
+        cloud,
+        targetCount,
+        cellBounds,
+        this.sampleMode,
+      );
       uri = this.writeContent(lodCloud, level, x, y, z);
       for (let oct = 0; oct < 8; oct++) {
         const idx = childGroups[oct];
@@ -2231,7 +2746,12 @@ class OctreeTilesBuilder {
 
   writeSimplifiedContent(cloud, targetCount, cellBounds, level, x, y, z) {
     if (!this.contentWorkerPool || cloud.length < SPZ_ASYNC_WRITE_THRESHOLD) {
-      const [lodCloud] = simplifyCloudVoxel(cloud, targetCount, cellBounds);
+      const [lodCloud] = simplifyCloudVoxel(
+        cloud,
+        targetCount,
+        cellBounds,
+        this.sampleMode,
+      );
       return this.writeContent(lodCloud, level, x, y, z);
     }
     const relPath = this.contentRelPath(level, x, y, z);
@@ -2241,6 +2761,7 @@ class OctreeTilesBuilder {
       kind: 'simplify-pack-spz',
       outPath,
       targetCount,
+      sampleMode: this.sampleMode,
       cellBounds: serializeBounds(cellBounds),
       sh1Bits: this.spzSh1Bits,
       shRestBits: this.spzShRestBits,
@@ -2480,7 +3001,7 @@ async function buildTilesetFromCloud(cloud, outDir, args) {
   }
 
   console.log(
-    `[info] building tileset | splats=${cloud.length} | mode=${args.tilingMode} | codec=spz_stream`,
+    `[info] building tileset | splats=${cloud.length} | mode=${args.tilingMode} | sample=${args.sampleMode} | codec=spz_stream`,
   );
 
   const inputSplatCount = cloud.length;
@@ -2499,6 +3020,7 @@ async function buildTilesetFromCloud(cloud, outDir, args) {
     spzShRestBits: args.spzShRestBits,
     sourceUpAxis: args.sourceUpAxis,
     samplingRatePerLevel: args.samplingRatePerLevel,
+    sampleMode: args.sampleMode,
     minGeometricError:
       args.minGeometricError != null && args.minGeometricError > 0.0
         ? args.minGeometricError
@@ -2554,6 +3076,7 @@ async function buildTilesetFromCloud(cloud, outDir, args) {
       spz_sh1_bits: args.spzSh1Bits,
       spz_sh_rest_bits: args.spzShRestBits,
       source_up_axis: args.sourceUpAxis,
+      sample_mode: args.sampleMode,
       configured_min_geometric_error:
         args.minGeometricError != null && args.minGeometricError > 0.0
           ? args.minGeometricError
