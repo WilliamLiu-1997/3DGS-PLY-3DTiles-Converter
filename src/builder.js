@@ -36,6 +36,12 @@ const GAUSSIAN_SPLATTING_GLTF_EXTENSIONS = [
   'KHR_gaussian_splatting_compression_spz_2',
 ];
 
+function makeTilesetAsset() {
+  return {
+    version: '1.1',
+  };
+}
+
 function applyTilesetGltfContentExtensions(tileset) {
   tileset.extensions = {
     ...(tileset.extensions || {}),
@@ -53,6 +59,46 @@ function applyTilesetGltfContentExtensions(tileset) {
   }
   tileset.extensionsUsed = extensionsUsed;
   return tileset;
+}
+
+function applyRootTransform(root, transform) {
+  if (!transform) {
+    return root;
+  }
+  root.transform = transform.slice();
+  return root;
+}
+
+const BUILT_IN_SOURCE_TO_TILE_Z_UP = [
+  [1.0, 0.0, 0.0],
+  [0.0, 0.0, 1.0],
+  [0.0, -1.0, 0.0],
+];
+
+function applyContentBoxTransform(box) {
+  if (!Array.isArray(box) || box.length !== 12) {
+    return box;
+  }
+
+  const out = box.slice();
+  for (const base of [0, 3, 6, 9]) {
+    const x = out[base];
+    const y = out[base + 1];
+    const z = out[base + 2];
+    out[base] =
+      BUILT_IN_SOURCE_TO_TILE_Z_UP[0][0] * x +
+      BUILT_IN_SOURCE_TO_TILE_Z_UP[0][1] * y +
+      BUILT_IN_SOURCE_TO_TILE_Z_UP[0][2] * z;
+    out[base + 1] =
+      BUILT_IN_SOURCE_TO_TILE_Z_UP[1][0] * x +
+      BUILT_IN_SOURCE_TO_TILE_Z_UP[1][1] * y +
+      BUILT_IN_SOURCE_TO_TILE_Z_UP[1][2] * z;
+    out[base + 2] =
+      BUILT_IN_SOURCE_TO_TILE_Z_UP[2][0] * x +
+      BUILT_IN_SOURCE_TO_TILE_Z_UP[2][1] * y +
+      BUILT_IN_SOURCE_TO_TILE_Z_UP[2][2] * z;
+  }
+  return out;
 }
 
 class ConsoleProgressBar {
@@ -1870,7 +1916,6 @@ function writeContentFile(params, cloud, level, x, y, z) {
     cloud,
     params.colorSpace,
     translation,
-    params.sourceUpAxis,
   );
   return relPath;
 }
@@ -1963,7 +2008,9 @@ class OctreeTilesBuilder {
     this.subtreeLevels = params.subtreeLevels;
     this.spzSh1Bits = params.spzSh1Bits;
     this.spzShRestBits = params.spzShRestBits;
-    this.sourceUpAxis = params.sourceUpAxis;
+    this.rootTransform = Array.isArray(params.rootTransform)
+      ? params.rootTransform.slice()
+      : null;
     this.samplingRatePerLevel = params.samplingRatePerLevel;
     this.sampleMode = params.sampleMode || 'merge';
     this.minGeometricError = params.minGeometricError;
@@ -2244,7 +2291,6 @@ class OctreeTilesBuilder {
         sh1Bits: this.spzSh1Bits,
         shRestBits: this.spzShRestBits,
         colorSpace: this.colorSpace,
-        sourceUpAxis: this.sourceUpAxis,
         translation,
         cloud: serializeCloudForWorkerTask(cloud),
       };
@@ -2272,7 +2318,6 @@ class OctreeTilesBuilder {
       cloud,
       this.colorSpace,
       translation,
-      this.sourceUpAxis,
     );
 
     this.markContentCompleted(relPath, splatCount, level);
@@ -2320,7 +2365,6 @@ class OctreeTilesBuilder {
       leafLimit: this.leafLimit,
       spzSh1Bits: this.spzSh1Bits,
       spzShRestBits: this.spzShRestBits,
-      sourceUpAxis: this.sourceUpAxis,
       samplingRatePerLevel: this.samplingRatePerLevel,
       sampleMode: this.sampleMode,
       rootGeometricError: this.rootGeometricError,
@@ -2540,7 +2584,9 @@ class OctreeTilesBuilder {
 
   tileToJson(node) {
     const obj = {
-      boundingVolume: { box: node.bounds.toBoxArray() },
+      boundingVolume: {
+        box: applyContentBoxTransform(node.bounds.toBoxArray()),
+      },
       geometricError: node.error,
       refine: 'REPLACE',
       content: { uri: node.contentUri },
@@ -2639,10 +2685,14 @@ class OctreeTilesBuilder {
 
     let tileset;
     if (this.tilingMode === 'explicit') {
+      const rootJson = applyRootTransform(
+        this.tileToJson(root),
+        this.rootTransform,
+      );
       tileset = applyTilesetGltfContentExtensions({
-        asset: { version: '1.1' },
+        asset: makeTilesetAsset(),
         geometricError: root.error,
-        root: this.tileToJson(root),
+        root: rootJson,
       });
     } else if (this.tilingMode === 'implicit') {
       tileset = applyTilesetGltfContentExtensions(
@@ -2668,20 +2718,25 @@ class OctreeTilesBuilder {
     await this.writeAllSubtrees(availableLevels, subtreeLevels);
     const rootError = this.implicitRootError();
     return {
-      asset: { version: '1.1' },
+      asset: makeTilesetAsset(),
       geometricError: rootError,
-      root: {
-        boundingVolume: { box: this.rootCellBounds.toBoxArray() },
-        refine: 'REPLACE',
-        geometricError: rootError,
-        content: { uri: 'tiles/{level}/{x}/{y}/{z}.glb' },
-        implicitTiling: {
-          subdivisionScheme: 'OCTREE',
-          availableLevels,
-          subtreeLevels,
-          subtrees: { uri: 'subtrees/{level}/{x}/{y}/{z}.subtree' },
+      root: applyRootTransform(
+        {
+          boundingVolume: {
+            box: applyContentBoxTransform(this.rootCellBounds.toBoxArray()),
+          },
+          refine: 'REPLACE',
+          geometricError: rootError,
+          content: { uri: 'tiles/{level}/{x}/{y}/{z}.glb' },
+          implicitTiling: {
+            subdivisionScheme: 'OCTREE',
+            availableLevels,
+            subtreeLevels,
+            subtrees: { uri: 'subtrees/{level}/{x}/{y}/{z}.subtree' },
+          },
         },
-      },
+        this.rootTransform,
+      ),
     };
   }
 
@@ -2811,7 +2866,6 @@ class OctreeTilesBuilder {
       sh1Bits: this.spzSh1Bits,
       shRestBits: this.spzShRestBits,
       colorSpace: this.colorSpace,
-      sourceUpAxis: this.sourceUpAxis,
       cloud: serializeCloudForWorkerTask(cloud),
     };
     const transfer = transferListForCloud(cloud);
@@ -3063,7 +3117,7 @@ async function buildTilesetFromCloud(cloud, outDir, args) {
     subtreeLevels: args.subtreeLevels,
     spzSh1Bits: args.spzSh1Bits,
     spzShRestBits: args.spzShRestBits,
-    sourceUpAxis: args.sourceUpAxis,
+    rootTransform: args.transform,
     samplingRatePerLevel: args.samplingRatePerLevel,
     sampleMode: args.sampleMode,
     minGeometricError:
@@ -3119,7 +3173,13 @@ async function buildTilesetFromCloud(cloud, outDir, args) {
       spz_version: SPZ_STREAM_VERSION,
       spz_sh1_bits: args.spzSh1Bits,
       spz_sh_rest_bits: args.spzShRestBits,
-      source_up_axis: args.sourceUpAxis,
+      root_transform: args.transform ? args.transform.slice() : null,
+      root_coordinate: args.coordinate ? args.coordinate.slice() : null,
+      root_transform_source: args.coordinate
+        ? 'coordinate'
+        : args.transform
+          ? 'transform'
+          : null,
       sample_mode: args.sampleMode,
       configured_min_geometric_error:
         args.minGeometricError != null && args.minGeometricError > 0.0

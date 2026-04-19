@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const { ConversionError, ensure } = require('./parser');
+const { ensure } = require('./parser');
 
 const GLTF_ACCESSOR_COMPONENTS = {
   SCALAR: 1,
@@ -13,10 +13,10 @@ const GLTF_ACCESSOR_COMPONENTS = {
   MAT4: 16,
 };
 
-const Z_UP_TO_Y_UP = [
+const Y_AXIS_SOURCE_TO_GLTF_Y_UP = [
   [1.0, 0.0, 0.0],
-  [0.0, 0.0, 1.0],
   [0.0, -1.0, 0.0],
+  [0.0, 0.0, -1.0],
 ];
 
 function pad4Length(length) {
@@ -50,33 +50,30 @@ function mat4ToGltfColumnMajorList(m) {
   ];
 }
 
-function make3DTilesGltfRootMatrix(translation, sourceUpAxis) {
+function make3DTilesGltfRootMatrix(translation) {
   const t0 = translation[0];
   const t1 = translation[1];
   const t2 = translation[2];
-  let t = [t0, t1, t2];
-  let r;
-  if (sourceUpAxis === 'z') {
-    r = [
-      Z_UP_TO_Y_UP[0][0],
-      Z_UP_TO_Y_UP[0][1],
-      Z_UP_TO_Y_UP[0][2],
-      Z_UP_TO_Y_UP[1][0],
-      Z_UP_TO_Y_UP[1][1],
-      Z_UP_TO_Y_UP[1][2],
-      Z_UP_TO_Y_UP[2][0],
-      Z_UP_TO_Y_UP[2][1],
-      Z_UP_TO_Y_UP[2][2],
-    ];
-    const nt0 = r[0] * t0 + r[1] * t1 + r[2] * t2;
-    const nt1 = r[3] * t0 + r[4] * t1 + r[5] * t2;
-    const nt2 = r[6] * t0 + r[7] * t1 + r[8] * t2;
-    t = [nt0, nt1, nt2];
-  } else if (sourceUpAxis === 'y') {
-    r = [1, 0, 0, 0, 1, 0, 0, 0, 1];
-  } else {
-    throw new ConversionError(`Unknown source_up_axis: ${sourceUpAxis}`);
-  }
+  // Many 3DGS PLY datasets that are described as "y-axis" content still use
+  // the common camera-style basis (+Y down, +Z forward). Normalize that to
+  // glTF's Y-up local space before the 3D Tiles runtime applies its standard
+  // glTF Y-up -> tile Z-up rotation.
+  const r = [
+    Y_AXIS_SOURCE_TO_GLTF_Y_UP[0][0],
+    Y_AXIS_SOURCE_TO_GLTF_Y_UP[0][1],
+    Y_AXIS_SOURCE_TO_GLTF_Y_UP[0][2],
+    Y_AXIS_SOURCE_TO_GLTF_Y_UP[1][0],
+    Y_AXIS_SOURCE_TO_GLTF_Y_UP[1][1],
+    Y_AXIS_SOURCE_TO_GLTF_Y_UP[1][2],
+    Y_AXIS_SOURCE_TO_GLTF_Y_UP[2][0],
+    Y_AXIS_SOURCE_TO_GLTF_Y_UP[2][1],
+    Y_AXIS_SOURCE_TO_GLTF_Y_UP[2][2],
+  ];
+  const t = [
+    r[0] * t0 + r[1] * t1 + r[2] * t2,
+    r[3] * t0 + r[4] * t1 + r[5] * t2,
+    r[6] * t0 + r[7] * t1 + r[8] * t2,
+  ];
 
   const m = [
     r[0],
@@ -207,7 +204,6 @@ class GltfBuilder {
     cloud,
     colorSpace,
     translation,
-    sourceUpAxis,
   ) {
     const bufferViewIndex = this.addBufferView(Buffer.from(spzBytes));
     const n = cloud.length;
@@ -316,7 +312,7 @@ class GltfBuilder {
       nodes: [
         {
           mesh: 0,
-          matrix: make3DTilesGltfRootMatrix(translation, sourceUpAxis),
+          matrix: make3DTilesGltfRootMatrix(translation),
         },
       ],
       materials: [{ extensions: { KHR_materials_unlit: {} } }],

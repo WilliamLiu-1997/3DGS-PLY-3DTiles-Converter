@@ -6,10 +6,20 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+### Added
+
+- Added `transform` and `coordinate` placement options to both the CLI and API. `transform` writes `tileset.root.transform` directly, while `coordinate` accepts `[lat, long, height]` in WGS84 degrees/meters and generates an ENU root transform automatically.
+- Added `root_transform`, `root_coordinate`, and `root_transform_source` placement metadata to generated `build_summary.json` files.
+
 ### Changed
 
+- Removed `sourceUpAxis` / `--source-up-axis` and standardized conversion on the built-in y-axis/camera-style normalization path.
 - Split voxel simplification's grouping budget from its final retained splat budget so `targetCount` continues to control emitted splat counts while a separate `voxelTargetCount` controls initial voxel occupancy. The default voxel budget now biases toward fewer occupied voxels so a fixed output budget can place multiple representatives in the same voxel more often.
 - Updated voxel-based geometric error estimation and worker-thread simplification tasks to use the same `voxelTargetCount` handling as the main-thread simplification path.
+
+### Fixed
+
+- Rotated emitted tile bounding volumes into the same 3D Tiles z-up frame as content and root transforms so geographic placement and custom `tileset.root.transform` values align with the generated GLB content.
 
 ## [0.1.5] - 2026-04-18
 
