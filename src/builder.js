@@ -728,7 +728,13 @@ function mergeAggregationWeight(opacity, radius, voxelDiag) {
   return alpha * Math.sqrt(radiusNorm);
 }
 
-function mergeAssignedCloud(cloud, selected, assignment, origRadius, voxelDiag) {
+function mergeAssignedCloud(
+  cloud,
+  selected,
+  assignment,
+  origRadius,
+  voxelDiag,
+) {
   const n = cloud.length;
   const outCount = selected.length;
   const coeffStride = cloud.shCoeffs.length / Math.max(1, n);
@@ -959,6 +965,17 @@ function chooseGridDims(bounds, targetCount) {
   return dims;
 }
 
+function normalizeSplatTargetCount(targetCount, splatCount) {
+  return Math.max(1, Math.min(splatCount, Math.floor(targetCount)));
+}
+
+function defaultVoxelTargetCount(targetCount, splatCount) {
+  const normalized = normalizeSplatTargetCount(targetCount, splatCount);
+  // Start from fewer occupied voxels so the fixed final budget can place
+  // multiple representatives into each voxel more often.
+  return Math.max(1, Math.floor(normalized / 4));
+}
+
 function groupMembersFromInverse(inverse, numGroups) {
   const groups = Array.from({ length: numGroups }, () => []);
   for (let i = 0; i < inverse.length; i++) {
@@ -980,15 +997,24 @@ function percent95(arr) {
   return frac === 0 ? sorted[lo] : sorted[lo] * (1 - frac) + sorted[hi] * frac;
 }
 
-function estimateVoxelGroupingError(cloud, targetCount, bounds = null) {
+function estimateVoxelGroupingError(
+  cloud,
+  targetCount,
+  bounds = null,
+  voxelTargetCount = targetCount,
+) {
   const n = cloud.length;
-  const target = Math.max(1, Math.min(Math.floor(targetCount), n));
+  const target = normalizeSplatTargetCount(targetCount, n);
+  const voxelTarget = Math.max(
+    target,
+    normalizeSplatTargetCount(voxelTargetCount, n),
+  );
   if (n <= target) {
     return 0.0;
   }
 
   const activeBounds = bounds || computeBounds(cloud);
-  let dims = chooseGridDims(activeBounds, target);
+  let dims = chooseGridDims(activeBounds, voxelTarget);
   const mins = activeBounds.minimum;
   const ext = activeBounds.extents().map((v) => Math.max(v, 1e-6));
   const pos = cloud.positions;
@@ -1226,9 +1252,14 @@ function simplifyCloudVoxel(
   targetCount,
   bounds = null,
   sampleMode = 'sample',
+  voxelTargetCount = targetCount,
 ) {
   const n = cloud.length;
-  const target = Math.max(1, Math.min(Math.floor(targetCount), n));
+  const target = normalizeSplatTargetCount(targetCount, n);
+  const voxelTarget = Math.max(
+    target,
+    normalizeSplatTargetCount(voxelTargetCount, n),
+  );
   if (n <= target) {
     const assign = new Int32Array(n);
     for (let i = 0; i < n; i++) {
@@ -1238,7 +1269,7 @@ function simplifyCloudVoxel(
   }
 
   const activeBounds = bounds || computeBounds(cloud);
-  let dims = chooseGridDims(activeBounds, target);
+  let dims = chooseGridDims(activeBounds, voxelTarget);
   const mins = activeBounds.minimum;
   const ext = activeBounds.extents().map((v) => Math.max(v, 1e-6));
 
@@ -1685,13 +1716,7 @@ function simplifyCloudVoxel(
 
   const outputCloud =
     sampleMode === 'merge'
-      ? mergeAssignedCloud(
-          cloud,
-          selected,
-          assignment,
-          origRadius,
-          voxelDiag,
-        )
+      ? mergeAssignedCloud(cloud, selected, assignment, origRadius, voxelDiag)
       : selectedCloud;
   const outputRadius =
     sampleMode === 'merge'
@@ -1776,11 +1801,7 @@ function geometricErrorForParams(params, depth) {
   const lodMaxDepth = lodMaxDepthForParams(params);
   return (
     params.rootGeometricError *
-    geometricErrorScaleForDepth(
-      depth,
-      lodMaxDepth,
-      params.samplingRatePerLevel,
-    )
+    geometricErrorScaleForDepth(depth, lodMaxDepth, params.samplingRatePerLevel)
   );
 }
 
@@ -1888,11 +1909,13 @@ function buildSubtreeNodeLocal(
     cloud.length,
     childKeys.length,
   );
+  const voxelTargetCount = defaultVoxelTargetCount(targetCount, cloud.length);
   const [lodCloud] = simplifyCloudVoxel(
     cloud,
     targetCount,
     cellBounds,
     params.sampleMode,
+    voxelTargetCount,
   );
   const uri = writeContentFile(params, lodCloud, level, x, y, z);
   const children = [];
@@ -2074,6 +2097,7 @@ class OctreeTilesBuilder {
       return Math.max(diag * 1e-6, 1e-6);
     }
     const target = this.targetSplatCountForDepth(0, this.cloud.length);
+    const voxelTarget = defaultVoxelTargetCount(target, this.cloud.length);
     if (target >= this.cloud.length) {
       return Math.max(diag * 0.125, diag * 1e-6, 1e-6);
     }
@@ -2084,8 +2108,14 @@ class OctreeTilesBuilder {
             target,
             this.rootCellBounds,
             this.sampleMode,
+            voxelTarget,
           )[2]
-        : estimateVoxelGroupingError(this.cloud, target, this.rootCellBounds);
+        : estimateVoxelGroupingError(
+            this.cloud,
+            target,
+            this.rootCellBounds,
+            voxelTarget,
+          );
     if (!Number.isFinite(ownError) || ownError <= 0.0) {
       return Math.max(diag * 0.125, 1e-6);
     }
@@ -2359,6 +2389,7 @@ class OctreeTilesBuilder {
       cloud.length,
       childKeys.length,
     );
+    const voxelTargetCount = defaultVoxelTargetCount(targetCount, cloud.length);
     const useAsyncSimplify =
       this.contentWorkerPool && cloud.length >= SPZ_ASYNC_WRITE_THRESHOLD;
     const useParallelChildBuild = this.shouldBuildChildrenInWorkers(
@@ -2386,6 +2417,7 @@ class OctreeTilesBuilder {
         uri = this.writeSimplifiedContent(
           cloud,
           targetCount,
+          voxelTargetCount,
           cellBounds,
           level,
           x,
@@ -2398,6 +2430,7 @@ class OctreeTilesBuilder {
           targetCount,
           cellBounds,
           this.sampleMode,
+          voxelTargetCount,
         );
         uri = this.writeContent(lodCloud, level, x, y, z);
       }
@@ -2468,6 +2501,7 @@ class OctreeTilesBuilder {
         targetCount,
         cellBounds,
         this.sampleMode,
+        voxelTargetCount,
       );
       uri = this.writeContent(lodCloud, level, x, y, z);
       for (let oct = 0; oct < 8; oct++) {
@@ -2744,13 +2778,23 @@ class OctreeTilesBuilder {
     return relPath;
   }
 
-  writeSimplifiedContent(cloud, targetCount, cellBounds, level, x, y, z) {
+  writeSimplifiedContent(
+    cloud,
+    targetCount,
+    voxelTargetCount,
+    cellBounds,
+    level,
+    x,
+    y,
+    z,
+  ) {
     if (!this.contentWorkerPool || cloud.length < SPZ_ASYNC_WRITE_THRESHOLD) {
       const [lodCloud] = simplifyCloudVoxel(
         cloud,
         targetCount,
         cellBounds,
         this.sampleMode,
+        voxelTargetCount,
       );
       return this.writeContent(lodCloud, level, x, y, z);
     }
@@ -2761,6 +2805,7 @@ class OctreeTilesBuilder {
       kind: 'simplify-pack-spz',
       outPath,
       targetCount,
+      voxelTargetCount,
       sampleMode: this.sampleMode,
       cellBounds: serializeBounds(cellBounds),
       sh1Bits: this.spzSh1Bits,
@@ -3053,8 +3098,7 @@ async function buildTilesetFromCloud(cloud, outDir, args) {
         args.samplingRatePerLevel,
       );
       samplingRatesByDepth[String(depth)] =
-        args.samplingRatePerLevel **
-        Math.max(0, builder.lodMaxDepth - depth);
+        args.samplingRatePerLevel ** Math.max(0, builder.lodMaxDepth - depth);
       geometricErrorScaleByDepth[String(depth)] = geometricScale;
       geometricErrorByDepth[String(depth)] =
         builder.rootGeometricError * geometricScale;

@@ -119,6 +119,7 @@ function runSimplifyPackSpzWorkerTask(task) {
     task.targetCount,
     bounds,
     task.sampleMode,
+    task.voxelTargetCount,
   );
   const translation = computeBounds(lodCloud).center();
   writeCloudGlbTaskOutput(task, lodCloud, translation);

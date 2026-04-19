@@ -6,6 +6,11 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+### Changed
+
+- Split voxel simplification's grouping budget from its final retained splat budget so `targetCount` continues to control emitted splat counts while a separate `voxelTargetCount` controls initial voxel occupancy. The default voxel budget now biases toward fewer occupied voxels so a fixed output budget can place multiple representatives in the same voxel more often.
+- Updated voxel-based geometric error estimation and worker-thread simplification tasks to use the same `voxelTargetCount` handling as the main-thread simplification path.
+
 ## [0.1.5] - 2026-04-18
 
 ### Added
