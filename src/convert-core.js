@@ -101,7 +101,6 @@ function writeCloudGlbTaskOutput(task, cloud, translation) {
     cloud,
     task.colorSpace,
     translation,
-    task.sourceUpAxis,
   );
 }
 
@@ -174,7 +173,6 @@ function runBuildSubtreeWorkerTask(task) {
     leafLimit: task.leafLimit,
     spzSh1Bits: task.spzSh1Bits,
     spzShRestBits: task.spzShRestBits,
-    sourceUpAxis: task.sourceUpAxis,
     samplingRatePerLevel: task.samplingRatePerLevel,
     sampleMode: task.sampleMode,
     rootGeometricError: task.rootGeometricError,

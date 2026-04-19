@@ -1,5 +1,10 @@
 const { ConversionError } = require('./parser');
 
+const WGS84_SEMI_MAJOR_AXIS = 6378137.0;
+const WGS84_FLATTENING = 1.0 / 298.257223563;
+const WGS84_ECCENTRICITY_SQUARED =
+  WGS84_FLATTENING * (2.0 - WGS84_FLATTENING);
+
 function usage() {
   return [
     'Usage: 3dgs-ply-3dtiles-converter [options] <input.ply> <output_dir>',
@@ -16,7 +21,8 @@ function usage() {
     '  --min-geometric-error <number>',
     '  --spz-sh1-bits <1..8>',
     '  --spz-sh-rest-bits <1..8>',
-    '  --source-up-axis <z|y>',
+    '  --transform <json_matrix4>',
+    '  --coordinate <json_[lat,long,height]>',
     '  --sampling-rate-per-level <0..1]',
     '  --sample-mode <sample|merge>',
     '  --content-workers <0+>',
@@ -40,7 +46,8 @@ const DEFAULT_CONVERSION_ARGS = {
   minGeometricError: null,
   spzSh1Bits: 8,
   spzShRestBits: 8,
-  sourceUpAxis: 'z',
+  transform: null,
+  coordinate: null,
   samplingRatePerLevel: 0.5,
   sampleMode: 'merge',
   contentWorkers: 4,
@@ -87,6 +94,185 @@ function normalizeToFloat(value, name) {
   return parsed;
 }
 
+function parseJsonValue(value, name) {
+  if (value === undefined || value === null || typeof value !== 'string') {
+    return value;
+  }
+  try {
+    return JSON.parse(value);
+  } catch (err) {
+    throw new ConversionError(`Invalid JSON for ${name}: ${value}`);
+  }
+}
+
+function normalizeMatrix4(value, name) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+
+  const parsed = parseJsonValue(value, name);
+  if (!Array.isArray(parsed)) {
+    throw new ConversionError(
+      `${name} must be a 4x4 JSON matrix or a flat 16-number array.`,
+    );
+  }
+
+  if (
+    parsed.length === 4 &&
+    parsed.every((row) => Array.isArray(row) && row.length === 4)
+  ) {
+    const rows = parsed.map((row, rowIndex) =>
+      row.map((entry, columnIndex) =>
+        normalizeToFloat(entry, `${name}[${rowIndex}][${columnIndex}]`),
+      ),
+    );
+    return [
+      rows[0][0],
+      rows[1][0],
+      rows[2][0],
+      rows[3][0],
+      rows[0][1],
+      rows[1][1],
+      rows[2][1],
+      rows[3][1],
+      rows[0][2],
+      rows[1][2],
+      rows[2][2],
+      rows[3][2],
+      rows[0][3],
+      rows[1][3],
+      rows[2][3],
+      rows[3][3],
+    ];
+  }
+
+  if (parsed.length !== 16 || parsed.some((entry) => Array.isArray(entry))) {
+    throw new ConversionError(
+      `${name} must be a 4x4 JSON matrix or a flat 16-number array.`,
+    );
+  }
+
+  return parsed.map((entry, index) =>
+    normalizeToFloat(entry, `${name}[${index}]`),
+  );
+}
+
+function normalizeCoordinate(value, name) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+
+  const parsed = parseJsonValue(value, name);
+  let triplet = null;
+
+  if (Array.isArray(parsed)) {
+    if (parsed.length !== 3 || parsed.some((entry) => Array.isArray(entry))) {
+      throw new ConversionError(
+        `${name} must be [lat, long, height] in degrees/meters.`,
+      );
+    }
+    triplet = parsed;
+  } else if (typeof parsed === 'object') {
+    if (!parsed) {
+      throw new ConversionError(
+        `${name} must be [lat, long, height] in degrees/meters.`,
+      );
+    }
+    const lat = firstDefined(parsed.lat, parsed.latitude);
+    const lon = firstDefined(
+      parsed.long,
+      parsed.lng,
+      parsed.lon,
+      parsed.longitude,
+    );
+    const height = firstDefined(parsed.height, parsed.alt, parsed.altitude);
+    if (lat === undefined || lon === undefined || height === undefined) {
+      throw new ConversionError(
+        `${name} object must include lat/latitude, long/lon/lng/longitude, and height.`,
+      );
+    }
+    triplet = [lat, lon, height];
+  } else {
+    throw new ConversionError(
+      `${name} must be [lat, long, height] in degrees/meters.`,
+    );
+  }
+
+  const lat = normalizeToFloat(triplet[0], `${name}[0]`);
+  const lon = normalizeToFloat(triplet[1], `${name}[1]`);
+  const height = normalizeToFloat(triplet[2], `${name}[2]`);
+
+  if (lat < -90.0 || lat > 90.0) {
+    throw new ConversionError(`${name}[0] latitude must be in [-90, 90].`);
+  }
+  if (lon < -180.0 || lon > 180.0) {
+    throw new ConversionError(`${name}[1] longitude must be in [-180, 180].`);
+  }
+
+  return [lat, lon, height];
+}
+
+function degreesToRadians(degrees) {
+  return (degrees * Math.PI) / 180.0;
+}
+
+function makeCoordinateTransform(coordinate) {
+  if (!coordinate) {
+    return null;
+  }
+
+  const latRad = degreesToRadians(coordinate[0]);
+  const lonRad = degreesToRadians(coordinate[1]);
+  const height = coordinate[2];
+
+  const sinLat = Math.sin(latRad);
+  const cosLat = Math.cos(latRad);
+  const sinLon = Math.sin(lonRad);
+  const cosLon = Math.cos(lonRad);
+
+  const primeVerticalRadius =
+    WGS84_SEMI_MAJOR_AXIS /
+    Math.sqrt(1.0 - WGS84_ECCENTRICITY_SQUARED * sinLat * sinLat);
+
+  const tx = (primeVerticalRadius + height) * cosLat * cosLon;
+  const ty = (primeVerticalRadius + height) * cosLat * sinLon;
+  const tz =
+    (primeVerticalRadius * (1.0 - WGS84_ECCENTRICITY_SQUARED) + height) *
+    sinLat;
+
+  const east = [-sinLon, cosLon, 0.0];
+  const north = [-sinLat * cosLon, -sinLat * sinLon, cosLat];
+  const up = [cosLat * cosLon, cosLat * sinLon, sinLat];
+
+  // 3D Tiles applies transforms in this order:
+  // 1. glTF node hierarchy
+  // 2. glTF y-up to z-up runtime transform
+  // 3. tile.transform
+  //
+  // Therefore the root tileset transform has to be expressed in the 3D Tiles
+  // z-up tile frame, not raw glTF y-up space. The emitted content is normalized
+  // to the converter's single supported source-up-axis mode before
+  // tile.transform is applied.
+  return [
+    east[0],
+    east[1],
+    east[2],
+    0.0,
+    north[0],
+    north[1],
+    north[2],
+    0.0,
+    up[0],
+    up[1],
+    up[2],
+    0.0,
+    tx,
+    ty,
+    tz,
+    1.0,
+  ];
+}
+
 function assertChoice(value, choices, flagName) {
   if (!choices.includes(value)) {
     throw new ConversionError(
@@ -129,8 +315,21 @@ function validateConversionArgs(args, { requireInput = false } = {}) {
     '--color-space',
   );
   assertChoice(args.tilingMode, ['explicit', 'implicit'], '--tiling-mode');
-  assertChoice(args.sourceUpAxis, ['z', 'y'], '--source-up-axis');
   assertChoice(args.sampleMode, ['sample', 'merge'], '--sample-mode');
+  if (args.transform !== null) {
+    if (!Array.isArray(args.transform) || args.transform.length !== 16) {
+      throw new ConversionError(
+        '--transform must normalize to a 16-number matrix.',
+      );
+    }
+  }
+  if (args.coordinate !== null) {
+    if (!Array.isArray(args.coordinate) || args.coordinate.length !== 3) {
+      throw new ConversionError(
+        '--coordinate must normalize to [lat, long, height].',
+      );
+    }
+  }
 
   if (requireInput && !args.input) {
     throw new ConversionError('Please provide input PLY path.');
@@ -236,7 +435,16 @@ function parseArgs(argv) {
       continue;
     }
     if (token === '--source-up-axis') {
-      args.sourceUpAxis = requireValue(token);
+      throw new ConversionError(
+        '--source-up-axis has been removed. The converter now always uses the built-in y normalization path.',
+      );
+    }
+    if (token === '--transform') {
+      args.transform = requireValue(token);
+      continue;
+    }
+    if (token === '--coordinate') {
+      args.coordinate = requireValue(token);
       continue;
     }
     if (token === '--sampling-rate-per-level') {
@@ -313,6 +521,16 @@ function parseArgs(argv) {
     }
   }
 
+  if (args.transform != null && args.coordinate != null) {
+    throw new ConversionError(
+      'Please provide either --transform or --coordinate, not both.',
+    );
+  }
+  args.coordinate = normalizeCoordinate(args.coordinate, '--coordinate');
+  args.transform =
+    args.coordinate != null
+      ? makeCoordinateTransform(args.coordinate)
+      : normalizeMatrix4(args.transform, '--transform');
   validateConversionArgs(args);
   return args;
 }
@@ -323,6 +541,33 @@ function makeConversionArgs(
   options = {},
   { requireInput = false } = {},
 ) {
+  const rawTransform = firstDefined(
+    options.transform,
+    options['transform'],
+    options.rootTransform,
+    options.root_transform,
+  );
+  const rawCoordinate = firstDefined(
+    options.coordinate,
+    options['coordinate'],
+    options.rootCoordinate,
+    options.root_coordinate,
+  );
+  if (rawTransform != null && rawCoordinate != null) {
+    throw new ConversionError(
+      'Please provide either transform or coordinate, not both.',
+    );
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(options, 'sourceUpAxis') ||
+    Object.prototype.hasOwnProperty.call(options, 'source-up-axis') ||
+    Object.prototype.hasOwnProperty.call(options, 'source_up_axis')
+  ) {
+    throw new ConversionError(
+      'sourceUpAxis / --source-up-axis has been removed. The converter now always uses the built-in y normalization path.',
+    );
+  }
+
   const merged = {
     ...DEFAULT_CONVERSION_ARGS,
     ...options,
@@ -413,12 +658,8 @@ function makeConversionArgs(
       ),
       '--spz-sh-rest-bits',
     ),
-    sourceUpAxis: firstDefined(
-      options.sourceUpAxis,
-      options['source-up-axis'],
-      options.source_up_axis,
-      DEFAULT_CONVERSION_ARGS.sourceUpAxis,
-    ),
+    coordinate: normalizeCoordinate(rawCoordinate, 'coordinate'),
+    transform: null,
     samplingRatePerLevel: normalizeToFloat(
       firstDefined(
         options.samplingRatePerLevel,
@@ -465,6 +706,10 @@ function makeConversionArgs(
     ),
   };
 
+  merged.transform =
+    merged.coordinate != null
+      ? makeCoordinateTransform(merged.coordinate)
+      : normalizeMatrix4(rawTransform, 'transform');
   validateConversionArgs(merged, { requireInput });
   return merged;
 }
@@ -474,6 +719,9 @@ module.exports = {
   usage,
   parseArgs,
   makeConversionArgs,
+  normalizeMatrix4,
+  normalizeCoordinate,
+  makeCoordinateTransform,
   normalizeToInt,
   normalizeToFloat,
   validateConversionArgs,
