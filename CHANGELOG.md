@@ -6,6 +6,8 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-04-19
+
 ### Added
 
 - Added `transform` and `coordinate` placement options to both the CLI and API. `transform` writes `tileset.root.transform` directly, while `coordinate` accepts `[lat, long, height]` in WGS84 degrees/meters and generates an ENU root transform automatically.
