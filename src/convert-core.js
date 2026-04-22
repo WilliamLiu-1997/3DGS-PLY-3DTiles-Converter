@@ -37,6 +37,7 @@ const {
   writeSubtreeFile,
   buildTilesetFromCloud,
 } = require('./builder');
+const { startViewerSession } = require('./viewer/session');
 
 async function convertPlyTo3DTiles(inputPath, outputDir, options = {}) {
   const args = makeConversionArgs(inputPath, outputDir, options, {
@@ -226,11 +227,45 @@ if (!isMainThread && parentPort) {
   });
 }
 
+function resolveAndValidateViewerDir(rawDir) {
+  const viewerDir = path.resolve(rawDir);
+  if (!fs.existsSync(viewerDir)) {
+    throw new ConversionError(
+      `Viewer tiles directory does not exist: ${viewerDir}`,
+    );
+  }
+  if (!fs.statSync(viewerDir).isDirectory()) {
+    throw new ConversionError(
+      `Viewer tiles path must be a directory: ${viewerDir}`,
+    );
+  }
+  const tilesetPath = path.join(viewerDir, 'tileset.json');
+  if (!fs.existsSync(tilesetPath)) {
+    throw new ConversionError(
+      `Viewer tiles directory must contain tileset.json: ${viewerDir}`,
+    );
+  }
+  return viewerDir;
+}
+
+async function runViewer(dir) {
+  const session = await startViewerSession(dir);
+  console.log(`[ok] viewer ready: ${session.url}`);
+  console.log('[info] press Ctrl+C to stop the local viewer server.');
+  await session.waitUntilClosed();
+}
+
 async function main(argv) {
   try {
     const args = parseArgs(argv);
     if (args.help) {
       console.log(usage());
+      return 0;
+    }
+
+    if (args.viewerDir) {
+      const viewerDir = resolveAndValidateViewerDir(args.viewerDir);
+      await runViewer(viewerDir);
       return 0;
     }
 
@@ -254,6 +289,9 @@ async function main(argv) {
       );
       console.log(`[ok] self-test completed: ${outDir}`);
       console.log(`[ok] sample input PLY: ${samplePlyPath}`);
+      if (args.openViewer) {
+        await runViewer(outDir);
+      }
       return 0;
     }
 
@@ -279,6 +317,9 @@ async function main(argv) {
     );
     await buildTilesetFromCloud(cloud, outDir, args);
     console.log(`[ok] output completed: ${outDir}`);
+    if (args.openViewer) {
+      await runViewer(outDir);
+    }
     return 0;
   } catch (err) {
     if (err instanceof ConversionError) {
@@ -318,6 +359,8 @@ module.exports = {
   parseArgs,
   usage,
   main,
+  runViewer,
+  resolveAndValidateViewerDir,
   makeConversionArgs,
   convertPlyTo3DTiles,
   convertCloudTo3DTiles,

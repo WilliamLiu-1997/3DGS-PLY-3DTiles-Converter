@@ -9,6 +9,7 @@ function usage() {
   return [
     'Usage: 3dgs-ply-3dtiles-converter [options] <input.ply> <output_dir>',
     '       3dgs-ply-3dtiles-converter --self-test <output_dir>',
+    '       3dgs-ply-3dtiles-converter --viewer-dir <tiles_dir>',
     '',
     'Options:',
     '  --input-convention <graphdeco|khr_native>',
@@ -26,6 +27,8 @@ function usage() {
     '  --sampling-rate-per-level <0..1]',
     '  --sample-mode <sample|merge>',
     '  --content-workers <0+>',
+    '  --open-viewer',
+    '  --viewer-dir <tiles_dir>',
     '  --self-test',
     '  --self-test-count <int>',
     '  --clean',
@@ -55,6 +58,28 @@ const DEFAULT_CONVERSION_ARGS = {
   selfTest: false,
   selfTestCount: 6000,
   help: false,
+  openViewer: false,
+  viewerDir: null,
+};
+
+const VIEWER_DIR_INCOMPATIBLE_FLAGS = {
+  clean: '--clean',
+  colorSpace: '--color-space',
+  contentWorkers: '--content-workers',
+  coordinate: '--coordinate',
+  inputConvention: '--input-convention',
+  leafLimit: '--leaf-limit',
+  linearScaleInput: '--linear-scale-input',
+  maxDepth: '--max-depth',
+  minGeometricError: '--min-geometric-error',
+  sampleMode: '--sample-mode',
+  samplingRatePerLevel: '--sampling-rate-per-level',
+  selfTestCount: '--self-test-count',
+  spzSh1Bits: '--spz-sh1-bits',
+  spzShRestBits: '--spz-sh-rest-bits',
+  subtreeLevels: '--subtree-levels',
+  tilingMode: '--tiling-mode',
+  transform: '--transform',
 };
 
 function firstDefined(...values) {
@@ -282,6 +307,10 @@ function assertChoice(value, choices, flagName) {
 }
 
 function validateConversionArgs(args, { requireInput = false } = {}) {
+  if (args.viewerDir != null) {
+    return;
+  }
+
   if (args.maxDepth < 0) {
     throw new ConversionError('--max-depth must be >= 0');
   }
@@ -336,6 +365,18 @@ function validateConversionArgs(args, { requireInput = false } = {}) {
   }
   if (!args.help && !args.output) {
     throw new ConversionError('Missing output directory.');
+  }
+}
+
+function assertViewerDirOnlyArgs(args) {
+  for (const [key, flag] of Object.entries(VIEWER_DIR_INCOMPATIBLE_FLAGS)) {
+    const defaultValue = DEFAULT_CONVERSION_ARGS[key];
+    const currentValue = args[key];
+    if (JSON.stringify(currentValue) !== JSON.stringify(defaultValue)) {
+      throw new ConversionError(
+        `--viewer-dir cannot be used together with ${flag}.`,
+      );
+    }
   }
 }
 
@@ -473,6 +514,14 @@ function parseArgs(argv) {
       args.contentWorkers = value;
       continue;
     }
+    if (token === '--open-viewer') {
+      args.openViewer = true;
+      continue;
+    }
+    if (token === '--viewer-dir') {
+      args.viewerDir = requireValue(token);
+      continue;
+    }
     if (token === '--self-test') {
       args.selfTest = true;
       continue;
@@ -498,7 +547,13 @@ function parseArgs(argv) {
     positionals.push(token);
   }
 
-  if (args.selfTest) {
+  if (args.viewerDir) {
+    if (positionals.length > 0) {
+      throw new ConversionError(
+        `Unexpected positional argument: ${positionals[0]}`,
+      );
+    }
+  } else if (args.selfTest) {
     if (positionals.length > 0) {
       args.output = positionals[0];
     }
@@ -526,6 +581,19 @@ function parseArgs(argv) {
       'Please provide either --transform or --coordinate, not both.',
     );
   }
+  if (args.viewerDir != null) {
+    if (args.selfTest) {
+      throw new ConversionError(
+        '--viewer-dir cannot be used together with --self-test.',
+      );
+    }
+    if (args.openViewer) {
+      throw new ConversionError(
+        '--viewer-dir already opens the viewer and cannot be combined with --open-viewer.',
+      );
+    }
+    assertViewerDirOnlyArgs(args);
+  }
   args.coordinate = normalizeCoordinate(args.coordinate, '--coordinate');
   args.transform =
     args.coordinate != null
@@ -541,6 +609,19 @@ function makeConversionArgs(
   options = {},
   { requireInput = false } = {},
 ) {
+  if (
+    Object.prototype.hasOwnProperty.call(options, 'openViewer') ||
+    Object.prototype.hasOwnProperty.call(options, 'open-viewer') ||
+    Object.prototype.hasOwnProperty.call(options, 'open_viewer') ||
+    Object.prototype.hasOwnProperty.call(options, 'viewerDir') ||
+    Object.prototype.hasOwnProperty.call(options, 'viewer-dir') ||
+    Object.prototype.hasOwnProperty.call(options, 'viewer_dir')
+  ) {
+    throw new ConversionError(
+      'openViewer / open_viewer / --open-viewer / viewerDir / viewer_dir / --viewer-dir are CLI-only and are not supported by the library API.',
+    );
+  }
+
   const rawTransform = firstDefined(
     options.transform,
     options['transform'],
@@ -725,4 +806,5 @@ module.exports = {
   normalizeToInt,
   normalizeToFloat,
   validateConversionArgs,
+  assertViewerDirOnlyArgs,
 };

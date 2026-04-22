@@ -11,7 +11,8 @@
     "./cli": "./src/cli.js"
   },
   "bin": {
-    "3dgs-ply-3dtiles-converter": "bin/3dgs-ply-3dtiles-converter.js"
+    "3dgs-ply-3dtiles-converter": "bin/3dgs-ply-3dtiles-converter.js",
+    "3dtiles-viewer": "bin/3dtiles-viewer.js"
   },
   "files": [
     "src/",

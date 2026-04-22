@@ -6,6 +6,20 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+### Added
+
+- Added CLI-only `--open-viewer`, which starts a localhost viewer session after conversion, opens the browser automatically, and lets users save updated root transforms back into `tileset.json` and `build_summary.json`. Viewer assets are written to an OS temp directory and removed on exit.
+- Added a dedicated `3dtiles-viewer <tiles_dir>` bin (and the equivalent `3dgs-ply-3dtiles-converter --viewer-dir <tiles_dir>` flag) for skipping conversion and opening the interactive viewer directly on an existing 3D Tiles output directory.
+- Added vendored viewer assets under `src/viewer/`, including the browser-side runtime and the shared `cameraController.js` copied from the 3DGS plugin examples.
+- Added viewer `Lat` / `Lon` / `Height` controls for moving the camera to a specific WGS84 coordinate and for applying the same ENU root placement as `--coordinate` before saving.
+- Added viewer `Set Position`, which lets users click the globe and move the tileset to that location with the same ENU placement logic as `--coordinate`.
+
+### Changed
+
+- The library API now rejects `openViewer` / `open_viewer` / `--open-viewer` so browser-launching behavior remains CLI-only.
+- Viewer assets are no longer written into the tiles output directory; they live in an OS temp directory routed by the local server and are removed on clean shutdown. This prevents the viewer from touching user files outside the served tiles.
+- The viewer server rejects cross-origin POSTs to `/__viewer/*` by checking the `Origin` header against the server's own 127.0.0.1 origin.
+
 ## [0.1.6] - 2026-04-19
 
 ### Added
