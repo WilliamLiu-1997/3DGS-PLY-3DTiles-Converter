@@ -1,28 +1,16 @@
-const { ConversionError } = require('./parser');
-const {
-  main,
-  runViewer,
-  resolveAndValidateViewerDir,
-} = require('./convert-core');
-const { usage, parseArgs } = require('./args');
+const { ViewerError } = require('./errors');
+const { runViewer } = require('./viewer-core');
 
-async function run(argv = process.argv.slice(2)) {
-  return main(argv);
-}
-
-function viewerUsage() {
+function usage() {
   return [
-    'Usage: 3dtiles-viewer [options] <tiles_dir>',
-    '       3dtiles-viewer --viewer-dir <tiles_dir>',
+    'Usage: 3dtiles-viewer [options] <tileset_json>',
     '',
     'Options:',
-    '  --viewer-dir <tiles_dir>',
     '  --help',
   ].join('\n');
 }
 
-function parseViewerCliArgs(argv) {
-  let viewerDir = null;
+function parseArgs(argv) {
   let help = false;
   const positionals = [];
 
@@ -32,56 +20,38 @@ function parseViewerCliArgs(argv) {
       help = true;
       continue;
     }
-    if (token === '--viewer-dir') {
-      const next = argv[i + 1];
-      if (next === undefined) {
-        throw new ConversionError('--viewer-dir requires a value.');
-      }
-      viewerDir = next;
-      i++;
-      continue;
-    }
     if (token.startsWith('--')) {
-      throw new ConversionError(`Unknown option ${token}`);
+      throw new ViewerError(`Unknown option ${token}`);
     }
     positionals.push(token);
   }
 
   if (help) {
-    return { help: true, viewerDir: null };
+    return { help: true, tilesetPath: null };
   }
 
-  if (viewerDir == null) {
-    if (positionals.length === 0) {
-      throw new ConversionError(
-        'Missing <tiles_dir>. Provide a positional path or use --viewer-dir.',
-      );
-    }
-    viewerDir = positionals[0];
-    positionals.shift();
+  if (positionals.length === 0) {
+    throw new ViewerError('Missing <tileset_json>.');
   }
 
-  if (positionals.length > 0) {
-    throw new ConversionError(
-      `Unexpected positional argument: ${positionals[0]}`,
-    );
+  if (positionals.length > 1) {
+    throw new ViewerError(`Unexpected positional argument: ${positionals[1]}`);
   }
 
-  return { help: false, viewerDir };
+  return { help: false, tilesetPath: positionals[0] };
 }
 
-async function runViewerCli(argv = process.argv.slice(2)) {
+async function run(argv = process.argv.slice(2)) {
   try {
-    const args = parseViewerCliArgs(argv);
+    const args = parseArgs(argv);
     if (args.help) {
-      console.log(viewerUsage());
+      console.log(usage());
       return 0;
     }
-    const dir = resolveAndValidateViewerDir(args.viewerDir);
-    await runViewer(dir);
+    await runViewer(args.tilesetPath);
     return 0;
   } catch (err) {
-    if (err instanceof ConversionError) {
+    if (err instanceof ViewerError) {
       console.error(`Viewer failed: ${err.message}`);
     } else if (err != null) {
       console.error(err.message || String(err));
@@ -92,13 +62,15 @@ async function runViewerCli(argv = process.argv.slice(2)) {
 
 module.exports = {
   run,
-  runViewerCli,
   usage,
-  viewerUsage,
   parseArgs,
-  parseViewerCliArgs,
 };
 
 if (require.main === module) {
-  run(process.argv.slice(2)).then((code) => process.exit(code));
+  run(process.argv.slice(2))
+    .then((code) => process.exit(code))
+    .catch((err) => {
+      console.error(err && err.message ? err.message : String(err));
+      process.exit(2);
+    });
 }

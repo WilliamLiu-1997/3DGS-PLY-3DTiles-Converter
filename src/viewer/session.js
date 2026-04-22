@@ -4,12 +4,18 @@ const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
 
-const { ConversionError } = require('../parser');
+const { ViewerError } = require('../errors');
+const { resolveAndValidateTilesetPath } = require('../tileset-path');
 
 const VIEWER_HTML_NAME = 'viewer.html';
 const VIEWER_DIR_NAME = 'viewer';
-const VIEWER_APP_NAME = 'app.js';
-const VIEWER_CAMERA_CONTROLLER_NAME = 'cameraController.js';
+const BUILT_VIEWER_ASSETS_DIR = path.resolve(
+  __dirname,
+  '..',
+  '..',
+  'dist',
+  'viewer-assets',
+);
 const SAVE_ENDPOINT_PATH = '/__viewer/save-transform';
 const SHUTDOWN_ENDPOINT_PATH = '/__viewer/shutdown';
 const MAX_SAVE_BODY_BYTES = 64 * 1024;
@@ -31,23 +37,40 @@ const MIME_TYPES = {
   '.subtree': 'application/octet-stream',
   '.svg': 'image/svg+xml; charset=utf-8',
   '.txt': 'text/plain; charset=utf-8',
+  '.wasm': 'application/wasm',
 };
 
-const VIEWER_IMPORTS = {
-  three: 'https://esm.sh/three@0.180.0',
-  'three/addons/': 'https://esm.sh/three@0.180.0/addons/',
-  'three/examples/jsm/': 'https://esm.sh/three@0.180.0/examples/jsm/',
-  cesium: 'https://esm.sh/cesium@1.140.0',
-  '@sparkjsdev/spark': 'https://esm.sh/@sparkjsdev/spark@2.0.0?external=three',
-  '3d-tiles-renderer': 'https://esm.sh/3d-tiles-renderer@0.4.24?external=three',
-  '3d-tiles-renderer/build/': 'https://esm.sh/3d-tiles-renderer@0.4.24/build/',
-  '3d-tiles-renderer/plugins':
-    'https://esm.sh/3d-tiles-renderer@0.4.24/plugins?external=three',
-  '3d-tiles-renderer/three/plugins':
-    'https://esm.sh/3d-tiles-renderer@0.4.24/three/plugins?external=three,3d-tiles-renderer',
-  '3d-tiles-rendererjs-3dgs-plugin':
-    'https://esm.sh/3d-tiles-rendererjs-3dgs-plugin@0.1.4?external=three,3d-tiles-renderer,@sparkjsdev/spark',
-};
+function encodePathSegment(segment) {
+  return encodeURIComponent(segment).replace(/[!'()*]/g, (char) =>
+    `%${char.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+}
+
+function getBrowserRelativePath(fromDir, targetPath) {
+  const relativePath = path.relative(fromDir, targetPath);
+  if (
+    relativePath.length === 0 ||
+    relativePath === '.' ||
+    relativePath.startsWith('..') ||
+    path.isAbsolute(relativePath)
+  ) {
+    throw new ViewerError(
+      `Tileset path must stay within the viewer root: ${targetPath}`,
+    );
+  }
+
+  return relativePath
+    .split(path.sep)
+    .map(encodePathSegment)
+    .join('/');
+}
+
+function stringifyInlineScriptValue(value) {
+  return JSON.stringify(value)
+    .replace(/</g, '\\u003C')
+    .replace(/>/g, '\\u003E')
+    .replace(/&/g, '\\u0026');
+}
 
 function cloneIdentityMatrix4() {
   return IDENTITY_MATRIX4.slice();
@@ -55,13 +78,13 @@ function cloneIdentityMatrix4() {
 
 function normalizeMatrix4Array(value, name = 'transform') {
   if (!Array.isArray(value) || value.length !== 16) {
-    throw new ConversionError(`${name} must be a 16-number matrix.`);
+    throw new ViewerError(`${name} must be a 16-number matrix.`);
   }
 
   return value.map((entry, index) => {
     const number = Number(entry);
     if (!Number.isFinite(number)) {
-      throw new ConversionError(`${name}[${index}] must be a finite number.`);
+      throw new ViewerError(`${name}[${index}] must be a finite number.`);
     }
     return number;
   });
@@ -95,26 +118,46 @@ function writeJsonAtomic(filePath, value) {
   fs.renameSync(tempPath, filePath);
 }
 
-function createViewerAssetsDir() {
+function copyDirectoryRecursive(sourceDir, targetDir) {
+  fs.mkdirSync(targetDir, { recursive: true });
+  for (const entry of fs.readdirSync(sourceDir, { withFileTypes: true })) {
+    const sourcePath = path.join(sourceDir, entry.name);
+    const targetPath = path.join(targetDir, entry.name);
+    if (entry.isDirectory()) {
+      copyDirectoryRecursive(sourcePath, targetPath);
+    } else if (entry.isFile()) {
+      fs.copyFileSync(sourcePath, targetPath);
+    }
+  }
+}
+
+function resolveBuiltViewerSubdir() {
+  const builtViewerSubdir = path.join(BUILT_VIEWER_ASSETS_DIR, VIEWER_DIR_NAME);
+  if (!fs.existsSync(builtViewerSubdir)) {
+    throw new ViewerError(
+      'Missing built viewer assets. Run `npm run build:viewer` first.',
+    );
+  }
+  if (!fs.statSync(builtViewerSubdir).isDirectory()) {
+    throw new ViewerError(
+      `Built viewer assets path must be a directory: ${builtViewerSubdir}`,
+    );
+  }
+  return builtViewerSubdir;
+}
+
+function createViewerAssetsDir(viewerConfig) {
   const assetsDir = fs.mkdtempSync(
-    path.join(os.tmpdir(), '3dgs-ply-3dtiles-viewer-'),
+    path.join(os.tmpdir(), '3dtiles-viewer-'),
   );
   const viewerSubdir = path.join(assetsDir, VIEWER_DIR_NAME);
   fs.mkdirSync(viewerSubdir, { recursive: true });
   fs.writeFileSync(
     path.join(assetsDir, VIEWER_HTML_NAME),
-    buildViewerHtml(),
+    buildViewerHtml(viewerConfig),
     'utf8',
   );
-  const sourceDir = __dirname;
-  fs.copyFileSync(
-    path.join(sourceDir, VIEWER_APP_NAME),
-    path.join(viewerSubdir, VIEWER_APP_NAME),
-  );
-  fs.copyFileSync(
-    path.join(sourceDir, VIEWER_CAMERA_CONTROLLER_NAME),
-    path.join(viewerSubdir, VIEWER_CAMERA_CONTROLLER_NAME),
-  );
+  copyDirectoryRecursive(resolveBuiltViewerSubdir(), viewerSubdir);
   return assetsDir;
 }
 
@@ -128,7 +171,7 @@ function removeViewerAssetsDir(assetsDir) {
 function normalizePositiveFinite(value, name) {
   const number = Number(value);
   if (!Number.isFinite(number) || number <= 0) {
-    throw new ConversionError(
+    throw new ViewerError(
       `${name} must be a finite number greater than 0.`,
     );
   }
@@ -142,7 +185,7 @@ function scaleGeometricErrorValue(target, key, scale, label) {
 
   const number = Number(target[key]);
   if (!Number.isFinite(number)) {
-    throw new ConversionError(`${label} must be a finite number.`);
+    throw new ViewerError(`${label} must be a finite number.`);
   }
 
   target[key] = number * scale;
@@ -242,20 +285,20 @@ function updateTilesetJsonFile(
     resolvedPath !== rootDir &&
     !resolvedPath.startsWith(`${rootDir}${path.sep}`)
   ) {
-    throw new ConversionError(
+    throw new ViewerError(
       `Nested tileset path escapes the viewer root: ${resolvedPath}`,
     );
   }
 
   if (!fs.existsSync(resolvedPath)) {
-    throw new ConversionError(
+    throw new ViewerError(
       `Referenced nested tileset does not exist: ${resolvedPath}`,
     );
   }
 
   const tileset = readJsonFile(resolvedPath);
   if (!tileset || typeof tileset !== 'object' || !tileset.root) {
-    throw new ConversionError(`${resolvedPath} must contain a root object.`);
+    throw new ViewerError(`${resolvedPath} must contain a root object.`);
   }
 
   if (rootTransform) {
@@ -296,7 +339,7 @@ function updateTilesetJsonFile(
 }
 
 function saveViewerTransform(
-  outputDir,
+  rootTilesetPath,
   editMatrix,
   { geometricErrorScale = 1 } = {},
 ) {
@@ -305,18 +348,20 @@ function saveViewerTransform(
     geometricErrorScale,
     'geometricErrorScale',
   );
-  const rootDir = path.resolve(outputDir);
-  const tilesetPath = path.join(rootDir, 'tileset.json');
+  const tilesetPath = path.resolve(rootTilesetPath);
+  const rootDir = path.dirname(tilesetPath);
 
   if (!fs.existsSync(tilesetPath)) {
-    throw new ConversionError(
+    throw new ViewerError(
       `Cannot save viewer transform because ${tilesetPath} does not exist.`,
     );
   }
 
   const tileset = readJsonFile(tilesetPath);
   if (!tileset || typeof tileset !== 'object' || !tileset.root) {
-    throw new ConversionError('tileset.json must contain a root object.');
+    throw new ViewerError(
+      `Root tileset JSON must contain a root object: ${tilesetPath}`,
+    );
   }
 
   const currentRoot = Array.isArray(tileset.root.transform)
@@ -356,11 +401,11 @@ function resolveStaticFilePath(tilesDir, viewerAssetsDir, pathname) {
   try {
     decodedPathname = decodeURIComponent(pathname || '/');
   } catch (err) {
-    throw new ConversionError('Request path is not valid URL encoding.');
+    throw new ViewerError('Request path is not valid URL encoding.');
   }
 
   if (decodedPathname.includes('\0')) {
-    throw new ConversionError('Request path contains invalid characters.');
+    throw new ViewerError('Request path contains invalid characters.');
   }
 
   const requested =
@@ -381,7 +426,7 @@ function resolveStaticFilePath(tilesDir, viewerAssetsDir, pathname) {
     resolvedPath !== resolvedRoot &&
     !resolvedPath.startsWith(`${resolvedRoot}${path.sep}`)
   ) {
-    throw new ConversionError('Request path escapes the viewer root.');
+    throw new ViewerError('Request path escapes the viewer root.');
   }
 
   return resolvedPath;
@@ -416,7 +461,7 @@ function readRequestBody(req) {
     req.on('data', (chunk) => {
       size += chunk.length;
       if (size > MAX_SAVE_BODY_BYTES) {
-        reject(new ConversionError('Request body is too large.'));
+        reject(new ViewerError('Request body is too large.'));
         req.destroy();
         return;
       }
@@ -439,7 +484,7 @@ function normalizeRequestTarget(rawTarget) {
   return rawTarget;
 }
 
-async function handleSaveTransformRequest(rootDir, req, res) {
+async function handleSaveTransformRequest(rootTilesetPath, req, res) {
   let payload;
   try {
     const body = await readRequestBody(req);
@@ -490,7 +535,7 @@ async function handleSaveTransformRequest(rootDir, req, res) {
 
   let nextRoot;
   try {
-    nextRoot = saveViewerTransform(rootDir, normalizedEdit, {
+    nextRoot = saveViewerTransform(rootTilesetPath, normalizedEdit, {
       geometricErrorScale: normalizedGeometricErrorScale,
     });
   } catch (err) {
@@ -512,6 +557,7 @@ async function handleSaveTransformRequest(rootDir, req, res) {
 
 async function handleViewerRequest(
   tilesDir,
+  rootTilesetPath,
   viewerAssetsDir,
   req,
   res,
@@ -525,7 +571,7 @@ async function handleViewerRequest(
       sendText(res, 405, 'Method Not Allowed', { Allow: 'POST' });
       return;
     }
-    await handleSaveTransformRequest(tilesDir, req, res);
+    await handleSaveTransformRequest(rootTilesetPath, req, res);
     return;
   }
 
@@ -617,8 +663,8 @@ function openBrowser(url) {
   });
 }
 
-function buildViewerHtml() {
-  const importMap = JSON.stringify({ imports: VIEWER_IMPORTS }, null, 2);
+function buildViewerHtml(viewerConfig) {
+  const serializedViewerConfig = stringifyInlineScriptValue(viewerConfig);
   return `<!doctype html>
 <html lang="en">
   <head>
@@ -931,7 +977,6 @@ function buildViewerHtml() {
         }
       }
     </style>
-    <script type="importmap">${importMap}</script>
   </head>
   <body>
     <div id="app"></div>
@@ -998,6 +1043,9 @@ function buildViewerHtml() {
         </div>
       </div>
     </div>
+    <script>
+      globalThis.__TILES_VIEWER_CONFIG__ = ${serializedViewerConfig};
+    </script>
     <script type="module" src="./viewer/app.js"></script>
   </body>
 </html>
@@ -1005,11 +1053,15 @@ function buildViewerHtml() {
 }
 
 async function startViewerSession(
-  outputDir,
+  rawTilesetPath,
   { openBrowser: shouldOpenBrowser = true, handleSignals = true } = {},
 ) {
-  const rootDir = path.resolve(outputDir);
-  const viewerAssetsDir = createViewerAssetsDir();
+  const tilesetPath = resolveAndValidateTilesetPath(rawTilesetPath);
+  const rootDir = path.dirname(tilesetPath);
+  const viewerAssetsDir = createViewerAssetsDir({
+    tilesetLabel: path.basename(tilesetPath),
+    tilesetUrl: `./${getBrowserRelativePath(rootDir, tilesetPath)}`,
+  });
   let sessionOrigin = null;
   let closingPromise = null;
   let shutdownTimer = null;
@@ -1106,16 +1158,22 @@ async function startViewerSession(
     }
 
     cancelScheduledShutdown();
-    handleViewerRequest(rootDir, viewerAssetsDir, req, res, requestUrl).catch(
-      (err) => {
+    handleViewerRequest(
+      rootDir,
+      tilesetPath,
+      viewerAssetsDir,
+      req,
+      res,
+      requestUrl,
+    )
+      .catch((err) => {
         sendJson(res, 500, {
           error:
             err instanceof Error && err.message
               ? err.message
               : 'Unexpected viewer server error.',
         });
-      },
-    );
+      });
   });
 
   if (handleSignals) {
@@ -1143,7 +1201,7 @@ async function startViewerSession(
   const address = server.address();
   if (!address || typeof address === 'string') {
     await close();
-    throw new ConversionError('Viewer server failed to bind to a TCP port.');
+    throw new ViewerError('Viewer server failed to bind to a TCP port.');
   }
 
   sessionOrigin = `http://127.0.0.1:${address.port}`;
@@ -1161,10 +1219,7 @@ async function startViewerSession(
   return {
     close,
     port: address.port,
-    rootDir,
-    server,
     url,
-    viewerAssetsDir,
     waitUntilClosed() {
       return closed;
     },

@@ -15,7 +15,7 @@ body:
     id: proposal
     attributes:
       label: Proposed solution
-      description: Describe the behavior, flags, API surface, or output changes you want.
+      description: Describe the viewer behavior, controls, CLI/API surface, or save workflow you want.
     validations:
       required: true
   - type: textarea

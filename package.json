@@ -1,48 +1,52 @@
 {
-  "name": "3dgs-ply-3dtiles-converter",
+  "name": "3dtiles-viewer",
   "version": "0.1.6",
-  "description": "Convert Gaussian Splatting PLY files into 3D Tiles with SPZ compressed GLB output.",
+  "description": "Open an interactive local viewer for 3D Tiles tilesets and save updated root transforms.",
   "author": "William Liu <lyz15972107087@gmail.com>",
   "license": "Apache-2.0",
   "type": "commonjs",
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js",
-    "./cli": "./src/cli.js"
+    "./cli": "./src/cli.js",
+    "./session": "./src/viewer/session.js"
   },
   "bin": {
-    "3dgs-ply-3dtiles-converter": "bin/3dgs-ply-3dtiles-converter.js",
     "3dtiles-viewer": "bin/3dtiles-viewer.js"
   },
   "files": [
     "src/",
+    "dist/viewer-assets/",
     "bin/",
     "CHANGELOG.md",
     "LICENSE",
     "README.md"
   ],
   "scripts": {
-    "test": "node -e \"require('./src').convertCloudTo3DTiles ? console.log('ok') : process.exit(1)\"",
-    "cli": "node ./bin/3dgs-ply-3dtiles-converter.js",
+    "test": "node -e \"const path = require('path'); const api = require('./src'); if (typeof api.startViewerSession !== 'function' || typeof api.runViewer !== 'function' || typeof api.resolveAndValidateTilesetPath !== 'function') process.exit(1); if ('resolveAndValidateViewerDir' in api || 'parseArgs' in api || 'run' in api || 'usage' in api) process.exit(1); if (api.resolveAndValidateTilesetPath('./out_tiles/tileset.json') !== path.resolve('./out_tiles/tileset.json')) process.exit(1); console.log('ok')\"",
+    "build:viewer": "node ./scripts/build-viewer.js",
+    "prepare": "npm run build:viewer",
+    "cli": "node ./bin/3dtiles-viewer.js",
     "pack:check": "npm pack --dry-run",
     "release:check": "npm test && npm run pack:check"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/WilliamLiu-1997/3DGS-PLY-3DTiles-Converter.git"
-  },
-  "homepage": "https://github.com/WilliamLiu-1997/3DGS-PLY-3DTiles-Converter#readme",
-  "bugs": {
-    "url": "https://github.com/WilliamLiu-1997/3DGS-PLY-3DTiles-Converter/issues"
   },
   "engines": {
     "node": ">=14.14.0"
   },
   "keywords": [
     "3d-tiles",
+    "viewer",
+    "tileset",
+    "cesium",
     "gaussian-splatting",
-    "ply",
-    "spz",
-    "converter"
-  ]
+    "3dgs"
+  ],
+  "devDependencies": {
+    "@sparkjsdev/spark": "2.0.0",
+    "3d-tiles-renderer": "0.4.24",
+    "3d-tiles-rendererjs-3dgs-plugin": "0.1.4",
+    "cesium": "1.140.0",
+    "esbuild": "^0.25.11",
+    "three": "0.180.0"
+  }
 }

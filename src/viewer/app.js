@@ -38,12 +38,25 @@ import { CameraController } from './cameraController.js';
 
 const SAVE_URL = new URL('../__viewer/save-transform', import.meta.url).href;
 const SHUTDOWN_URL = new URL('../__viewer/shutdown', import.meta.url).href;
+const VIEWER_CONFIG =
+  globalThis.__TILES_VIEWER_CONFIG__ &&
+  typeof globalThis.__TILES_VIEWER_CONFIG__ === 'object'
+    ? globalThis.__TILES_VIEWER_CONFIG__
+    : {};
+const ROOT_TILESET_LABEL =
+  typeof VIEWER_CONFIG.tilesetLabel === 'string' &&
+  VIEWER_CONFIG.tilesetLabel.length > 0
+    ? VIEWER_CONFIG.tilesetLabel
+    : 'tileset.json';
 const TILESET_URL = normalizeLocalResourceUrl(
-  new URL('../tileset.json', import.meta.url).href,
+  VIEWER_CONFIG.tilesetUrl || new URL('../tileset.json', import.meta.url).href,
 );
-const THREE_EXAMPLES_BASE_URL = 'https://unpkg.com/three@0.180.0/examples/jsm';
-const DRACO_DECODER_PATH = `${THREE_EXAMPLES_BASE_URL}/libs/draco/gltf/`;
-const BASIS_TRANSCODER_PATH = `${THREE_EXAMPLES_BASE_URL}/libs/basis/`;
+const THREE_EXAMPLES_BASE_URL = new URL(
+  './vendor/three/examples/jsm/',
+  import.meta.url,
+).href;
+const DRACO_DECODER_PATH = `${THREE_EXAMPLES_BASE_URL}libs/draco/gltf/`;
+const BASIS_TRANSCODER_PATH = `${THREE_EXAMPLES_BASE_URL}libs/basis/`;
 const SATELLITE_IMAGERY = {
   url: 'https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
   levels: 18,
@@ -326,6 +339,8 @@ function configureGlobeTiles(next) {
 
 function createImageryGlobeTiles() {
   const next = new TilesRenderer();
+  next.downloadQueue.maxJobs = 8;
+  next.parseQueue.maxJobs = 2;
   next.registerPlugin(
     new XYZTilesPlugin({
       shape: 'ellipsoid',
@@ -335,12 +350,14 @@ function createImageryGlobeTiles() {
     }),
   );
   configureGlobeTiles(next);
-  setRendererBaseErrorTarget(next, DEFAULT_ERROR_TARGET);
+  next.errorTarget = DEFAULT_ERROR_TARGET;
   return next;
 }
 
 function createTerrainGlobeTiles() {
   const next = new TilesRenderer();
+  next.downloadQueue.maxJobs = 8;
+  next.parseQueue.maxJobs = 2;
   next.registerPlugin(
     new CesiumIonAuthPlugin({
       apiToken: CESIUM_ION_TERRAIN.apiToken,
@@ -369,7 +386,7 @@ function createTerrainGlobeTiles() {
     }),
   );
   configureGlobeTiles(next);
-  setRendererBaseErrorTarget(next, DEFAULT_TERRAIN_ERROR_TARGET);
+  next.errorTarget = DEFAULT_TERRAIN_ERROR_TARGET;
   return next;
 }
 
@@ -423,7 +440,6 @@ const savedRootInverseMatrix = new Matrix4();
 const pointerCoords = new Vector2();
 const pickRaycaster = new Raycaster();
 const pickTargets = [];
-const rendererBaseErrorTargets = new WeakMap();
 let tiles = null;
 let toolbarVisible = true;
 let activeTransformMode = null;
@@ -442,18 +458,12 @@ function getActiveEllipsoid() {
   return tiles?.ellipsoid || globeTiles?.ellipsoid || null;
 }
 
-function updateRendererErrorTarget(tilesRenderer) {
-  const baseErrorTarget = rendererBaseErrorTargets.get(tilesRenderer);
-  if (baseErrorTarget == null) {
+function updateTilesetErrorTarget() {
+  if (!tiles) {
     return;
   }
 
-  tilesRenderer.errorTarget = baseErrorTarget / geometricErrorScale;
-}
-
-function setRendererBaseErrorTarget(tilesRenderer, baseErrorTarget) {
-  rendererBaseErrorTargets.set(tilesRenderer, baseErrorTarget);
-  updateRendererErrorTarget(tilesRenderer);
+  tiles.errorTarget = DEFAULT_ERROR_TARGET / geometricErrorScale;
 }
 
 function updateGeometricErrorScaleDisplay() {
@@ -473,8 +483,7 @@ function setGeometricErrorScaleExponent(exponent) {
   );
   geometricErrorScaleInput.value = geometricErrorScaleExponent.toFixed(1);
   updateGeometricErrorScaleDisplay();
-  updateRendererErrorTarget(globeTiles);
-  updateRendererErrorTarget(tiles);
+  updateTilesetErrorTarget();
 }
 
 function syncTerrainButton() {
@@ -717,7 +726,7 @@ async function refreshSavedRootMatrix(url) {
   const response = await fetch(url, { cache: 'no-store' });
   if (!response.ok) {
     throw new Error(
-      `Failed to load tileset metadata for coordinate placement (${response.status}).`,
+      `Failed to load ${ROOT_TILESET_LABEL} metadata for coordinate placement (${response.status}).`,
     );
   }
 
@@ -1179,6 +1188,8 @@ function loadTileset(url) {
   );
 
   const next = new TilesRenderer(url);
+  next.downloadQueue.maxJobs = 8;
+  next.parseQueue.maxJobs = 4;
   next.registerPlugin(new TilesFadePlugin());
   next.registerPlugin(new TileCompressionPlugin());
   next.registerPlugin(new UnloadTilesPlugin());
@@ -1197,7 +1208,8 @@ function loadTileset(url) {
   next.preprocessURL = normalizeLocalResourceUrl;
   next.setCamera(camera);
   next.setResolutionFromRenderer(camera, renderer);
-  setRendererBaseErrorTarget(next, DEFAULT_ERROR_TARGET);
+  tiles = next;
+  updateTilesetErrorTarget();
   next.addEventListener('load-model', ({ scene: modelScene }) => {
     forceOpaqueScene(modelScene);
     tilesTransformDirty = true;
@@ -1228,7 +1240,6 @@ function loadTileset(url) {
 
   next.addEventListener('load-tile-set', tryFrame);
   next.addEventListener('load-tileset', tryFrame);
-  tiles = next;
 }
 
 async function saveTransform() {
@@ -1286,7 +1297,7 @@ async function saveTransform() {
     setStatus(
       `Saved transform and geometric-error scale x${formatGeometricErrorScale(
         geometricErrorScale,
-      )} to tileset.json and build_summary.json.`,
+      )} to ${ROOT_TILESET_LABEL} and build_summary.json.`,
     );
   } catch (err) {
     setStatus(err && err.message ? err.message : String(err), true);
@@ -1363,15 +1374,11 @@ loadTileset(TILESET_URL);
 
 function frame() {
   cameraController.update();
-  camera.updateMatrixWorld(true);
-  updateTilesRendererGroupMatrices(globeTiles);
   if (tilesTransformDirty) {
     editableGroup.updateMatrixWorld(true);
     updateTilesRendererGroupMatrices(tiles);
     refreshLoadedTileSceneMatrices(tiles);
     tilesTransformDirty = false;
-  } else {
-    updateTilesRendererGroupMatrices(tiles);
   }
   globeTiles?.update();
   tiles?.update();

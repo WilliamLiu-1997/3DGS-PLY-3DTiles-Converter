@@ -1,3 +1,5 @@
 
 *.ply
 out_tiles/
+node_modules/
+dist/

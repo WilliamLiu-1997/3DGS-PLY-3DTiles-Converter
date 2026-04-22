@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a reproducible defect in the converter, CLI, or generated output.
+description: Report a reproducible defect in the viewer CLI, local server, or interactive session.
 title: "[Bug]: "
 labels:
   - bug
@@ -29,7 +29,7 @@ body:
       label: Usage mode
       options:
         - CLI
-        - Library API
+        - Node API
         - Both
     validations:
       required: true
@@ -38,7 +38,7 @@ body:
     attributes:
       label: Command or code snippet
       render: bash
-      placeholder: 3dgs-ply-3dtiles-converter input.ply out_tiles
+      placeholder: 3dtiles-viewer out_tiles
     validations:
       required: true
   - type: textarea
@@ -61,5 +61,5 @@ body:
   - type: textarea
     id: sample_data
     attributes:
-      label: Sample input details
-      description: Describe the PLY format, point count, or link to a minimal repro dataset if you can share one.
+      label: Tileset details
+      description: Describe the tileset structure, nested tilesets, external content, or link to a minimal repro dataset if you can share one.

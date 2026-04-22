@@ -1,10 +1,10 @@
-const core = require('./convert-core');
+const { ViewerError } = require('./errors');
+const { runViewer, resolveAndValidateTilesetPath } = require('./viewer-core');
+const { startViewerSession } = require('./viewer/session');
 
 module.exports = {
-  ...core,
-
-  // Library-friendly aliases
-  convert: core.convertPlyTo3DTiles,
-  convertCloud: core.convertCloudTo3DTiles,
-  run: core.main,
+  ViewerError,
+  resolveAndValidateTilesetPath,
+  runViewer,
+  startViewerSession,
 };
