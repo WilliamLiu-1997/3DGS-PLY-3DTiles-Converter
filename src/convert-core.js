@@ -12,8 +12,6 @@ const {
   parseCommonGaussianPly,
   makeSelfTestCloud,
   writeGraphdecoLikePly,
-  deserializeBounds,
-  serializeTileNode,
 } = require('./parser');
 
 const { packCloudToSpz } = require('./codec');
@@ -29,14 +27,8 @@ const {
 } = require('./args');
 
 const {
-  computeBounds,
-  simplifyCloudVoxel,
-  buildSubtreeNodeLocal,
-  OctreeTilesBuilder,
-  buildSubtreeArtifact,
-  writeSubtreeFile,
-  buildTilesetFromCloud,
-} = require('./builder');
+  convertPartitionedPlyTo3DTiles,
+} = require('./partitioned-ply');
 
 async function convertPlyTo3DTiles(inputPath, outputDir, options = {}) {
   const args = makeConversionArgs(inputPath, outputDir, options, {
@@ -44,32 +36,16 @@ async function convertPlyTo3DTiles(inputPath, outputDir, options = {}) {
   });
   const inPath = path.resolve(args.input);
   const outPath = path.resolve(args.output);
-  const cloud = parseCommonGaussianPly(
+  const result = await convertPartitionedPlyTo3DTiles(
     inPath,
-    args.inputConvention,
-    args.colorSpace,
-    args.linearScaleInput,
+    outPath,
+    args,
   );
-  await buildTilesetFromCloud(cloud, outPath, args);
   return {
     inputPath: inPath,
     outputDir: outPath,
-    splatCount: cloud.length,
-    shDegree: cloud.shDegree,
-    args,
-  };
-}
-
-async function convertCloudTo3DTiles(cloud, outputDir, options = {}) {
-  const args = makeConversionArgs(null, outputDir, options, {
-    requireInput: false,
-  });
-  const outPath = path.resolve(args.output);
-  await buildTilesetFromCloud(cloud, outPath, args);
-  return {
-    outputDir: outPath,
-    splatCount: cloud.length,
-    shDegree: cloud.shDegree,
+    splatCount: result.splatCount,
+    shDegree: result.shDegree,
     args,
   };
 }
@@ -110,102 +86,12 @@ function runPackSpzWorkerTask(task) {
   return true;
 }
 
-function runSimplifyPackSpzWorkerTask(task) {
-  const cloud = cloudFromWorkerTask(task);
-  const bounds = task.cellBounds ? deserializeBounds(task.cellBounds) : null;
-  const [lodCloud] = simplifyCloudVoxel(
-    cloud,
-    task.targetCount,
-    bounds,
-    task.sampleMode,
-    task.voxelTargetCount,
-  );
-  const translation = computeBounds(lodCloud).center();
-  writeCloudGlbTaskOutput(task, lodCloud, translation);
-  return true;
-}
-
-let cachedSubtreeNodeTableId = null;
-let cachedSubtreeNodeLookup = null;
-
-function getSubtreeNodeLookup(task) {
-  if (
-    cachedSubtreeNodeTableId === task.nodeTableId &&
-    cachedSubtreeNodeLookup
-  ) {
-    return cachedSubtreeNodeLookup;
-  }
-
-  const packed = new Int32Array(task.nodeTableBuffer);
-  const lookup = new Set();
-  for (let i = 0; i < task.nodeCount; i++) {
-    const off = i * 4;
-    lookup.add(
-      `${packed[off]}/${packed[off + 1]}/${packed[off + 2]}/${packed[off + 3]}`,
-    );
-  }
-  cachedSubtreeNodeTableId = task.nodeTableId;
-  cachedSubtreeNodeLookup = lookup;
-  return lookup;
-}
-
-function runWriteSubtreeWorkerTask(task) {
-  const lookup = getSubtreeNodeLookup(task);
-  const { subtree, blob } = buildSubtreeArtifact(
-    task.level,
-    task.x,
-    task.y,
-    task.z,
-    task.availableLevels,
-    task.subtreeLevels,
-    (level, x, y, z) => lookup.has(`${level}/${x}/${y}/${z}`),
-  );
-  writeSubtreeFile(task.subtreePath, subtree, blob);
-  return true;
-}
-
-function runBuildSubtreeWorkerTask(task) {
-  const params = {
-    outDir: task.outDir,
-    colorSpace: task.colorSpace,
-    maxDepth: task.maxDepth,
-    lodMaxDepth: task.lodMaxDepth,
-    leafLimit: task.leafLimit,
-    spzSh1Bits: task.spzSh1Bits,
-    spzShRestBits: task.spzShRestBits,
-    samplingRatePerLevel: task.samplingRatePerLevel,
-    sampleMode: task.sampleMode,
-    rootGeometricError: task.rootGeometricError,
-  };
-  const cloud = cloudFromWorkerTask(task);
-  const node = buildSubtreeNodeLocal(
-    params,
-    cloud,
-    deserializeBounds(task.cellBounds),
-    task.depth,
-    task.level,
-    task.x,
-    task.y,
-    task.z,
-  );
-  return { root: serializeTileNode(node) };
-}
-
 function runWorkerTask(task) {
   if (!task || !task.kind) {
     throw new ConversionError('Missing worker task kind.');
   }
   if (task.kind === 'pack-spz') {
     return runPackSpzWorkerTask(task);
-  }
-  if (task.kind === 'simplify-pack-spz') {
-    return runSimplifyPackSpzWorkerTask(task);
-  }
-  if (task.kind === 'write-subtree') {
-    return runWriteSubtreeWorkerTask(task);
-  }
-  if (task.kind === 'build-subtree') {
-    return runBuildSubtreeWorkerTask(task);
   }
   throw new ConversionError(`Unknown worker task kind: ${task.kind}`);
 }
@@ -245,13 +131,11 @@ async function main(argv) {
       if (fs.existsSync(outDir) && args.clean) {
         fs.rmSync(outDir, { recursive: true, force: true });
       }
+      fs.mkdirSync(outDir, { recursive: true });
+      writeGraphdecoLikePly(samplePlyPath, cloud);
       const buildArgs = { ...args };
       buildArgs.clean = false;
-      await buildTilesetFromCloud(cloud, outDir, buildArgs);
-      writeGraphdecoLikePly(
-        samplePlyPath,
-        makeSelfTestCloud(args.selfTestCount),
-      );
+      await convertPartitionedPlyTo3DTiles(samplePlyPath, outDir, buildArgs);
       console.log(`[ok] self-test completed: ${outDir}`);
       console.log(`[ok] sample input PLY: ${samplePlyPath}`);
       return 0;
@@ -268,16 +152,14 @@ async function main(argv) {
 
     const inPath = path.resolve(args.input);
     console.log(`[info] reading PLY: ${inPath}`);
-    const cloud = parseCommonGaussianPly(
+    const result = await convertPartitionedPlyTo3DTiles(
       inPath,
-      args.inputConvention,
-      args.colorSpace,
-      args.linearScaleInput,
+      outDir,
+      args,
     );
     console.log(
-      `[info] parsed PLY | splats=${cloud.length} | sh_degree=${cloud.shDegree}`,
+      `[info] parsed PLY | splats=${result.splatCount} | sh_degree=${result.shDegree}`,
     );
-    await buildTilesetFromCloud(cloud, outDir, args);
     console.log(`[ok] output completed: ${outDir}`);
     return 0;
   } catch (err) {
@@ -309,18 +191,14 @@ module.exports = {
   Bounds,
   TileNode,
   GltfBuilder,
-  OctreeTilesBuilder,
   parseCommonGaussianPly,
   makeSelfTestCloud,
   writeGraphdecoLikePly,
-  buildTilesetFromCloud,
-  buildSubtreeArtifact,
   parseArgs,
   usage,
   main,
   makeConversionArgs,
   convertPlyTo3DTiles,
-  convertCloudTo3DTiles,
   normalizeToInt,
   normalizeToFloat,
 };

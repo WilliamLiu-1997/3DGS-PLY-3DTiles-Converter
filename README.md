@@ -15,7 +15,7 @@
 This package targets **Node.js** and exposes both:
 
 - A CLI entry (`3dgs-ply-3dtiles-converter`)
-- A library API (`convert`, `convertCloud`, and lower-level helpers)
+- A library API (`convert` and lower-level helpers)
 
 ## Install
 
@@ -52,12 +52,13 @@ Output is written under:
 
 Generated `tileset.json` files declare the top-level `3DTILES_content_gltf` tileset extension metadata that CesiumJS uses to detect `KHR_gaussian_splatting` and `KHR_gaussian_splatting_compression_spz_2` glTF tile content.
 
+Large PLY conversion through `convert(...)` now uses a temp-file-backed partitioned pipeline by default. That path writes canonical leaf/handoff buckets, builds parent LODs in either `partitioned` or `entire` mode, uses exact streaming simplify so internal nodes do not need a full in-memory SH payload up front, processes each level with bounded concurrency, and automatically resumes from `.tmp-ply-partitions` if the same output directory is rerun without `--clean`. `parseCommonGaussianPly(...)` remains available as an async in-memory helper, but it is not the recommended entry point for multi-GB inputs.
+
 ## API usage
 
 ```js
 const {
   convert,
-  convertCloud,
   parseCommonGaussianPly,
   makeConversionArgs,
 } = require('3dgs-ply-3dtiles-converter');
@@ -68,6 +69,8 @@ const {
     leafLimit: 10000,
     spzSh1Bits: 8,
     spzShRestBits: 8,
+    plyBuildMode: 'partitioned',
+    buildConcurrency: 2,
     contentWorkers: 4,
   });
   console.log(result.outputDir, result.splatCount);
@@ -75,23 +78,16 @@ const {
 ```
 
 ```js
-const {
-  parseCommonGaussianPly,
-  convertCloud,
-} = require('3dgs-ply-3dtiles-converter');
+const { parseCommonGaussianPly } = require('3dgs-ply-3dtiles-converter');
 
 (async () => {
-  const cloud = parseCommonGaussianPly(
+  const cloud = await parseCommonGaussianPly(
     'data/scene.ply',
     'graphdeco',
     'srgb_rec709_display',
     false,
   );
-  const result = await convertCloud(cloud, './out/tileset', {
-    tilingMode: 'implicit',
-    subtreeLevels: 2,
-  });
-  console.log(result.outputDir, result.splatCount);
+  console.log(cloud.length, cloud.shDegree);
 })();
 ```
 
@@ -103,7 +99,6 @@ const {
   - `splatCount`: point count
   - `shDegree`: inferred SH degree
   - `args`: normalized and validated parameters; when `coordinate` is provided, `args.transform` contains the generated ENU root transform
-- `convertCloud(...)` returns the same object except `inputPath` is omitted.
 
 ## Parameters (CLI + API)
 
@@ -120,7 +115,7 @@ Examples:
 
 | Type     | CLI             | API          | Description                                                                            |
 | -------- | --------------- | ------------ | -------------------------------------------------------------------------------------- |
-| required | `input.ply`     | `inputPath`  | Path to input PLY. Required unless `--self-test` or API helper `convertCloud` is used. |
+| required | `input.ply`     | `inputPath`  | Path to input PLY. Required unless `--self-test` is used. |
 | required | `output_dir`    | `outputDir`  | Output directory path. Required unless `--help` is used.                               |
 | optional | `--help` / `-h` | `help: true` | Print help text and exit.                                                              |
 
@@ -142,6 +137,8 @@ Examples:
 | Root coordinate         | vec3    | `--coordinate`              | `coordinate`           | `null`                | `[lat, long, height]`                       | Generates `tileset.root.transform` from WGS84 degrees/meters as a standard ENU frame in 3D Tiles tile coordinates. The API also accepts object forms such as `{ lat, lon, height }` and `{ latitude, longitude, altitude }`. Mutually exclusive with `transform`. |
 | Sampling rate per level | number  | `--sampling-rate-per-level` | `samplingRatePerLevel` | `0.5`                 | `(0,1]`                                     | LOD sampling ratio between levels.                          |
 | Sampling mode           | string  | `--sample-mode`             | `sampleMode`           | `merge`               | `sample`, `merge`                           | `sample` keeps representative splats; `merge` merges assigned splats into the target count and prefers merging detail splats before coarse splats. |
+| PLY build mode          | string  | `--ply-build-mode`          | `plyBuildMode`         | `partitioned`         | `partitioned`, `entire`                     | `partitioned` builds parent LODs from child handoff buckets. `entire` rebuilds each parent from all descendant raw leaf buckets. |
+| Build concurrency       | integer | `--build-concurrency`       | `buildConcurrency`     | `2`                   | `>= 1`                                      | Parallel node builds per level in `partitioned` mode. Lower values reduce peak memory. |
 | Content workers         | integer | `--content-workers`         | `contentWorkers`       | `4`                   | `>= 0`                                      | Parallel SPZ/GLB workers. `0` disables worker pool.         |
 | Self-test               | boolean | `--self-test`               | `selfTest`             | `false`               | `true`/`false`                              | Generates synthetic cloud and writes sample PLY.            |
 | Self-test count         | integer | `--self-test-count`         | `selfTestCount`        | `6000`                | integer                                     | Number of synthetic splats.                                 |
@@ -175,7 +172,7 @@ await convert('scene.ply', './out_tiles', {
 ## Utility exports
 
 - `parseCommonGaussianPly(filePath, inputConvention, colorSpace, linearScaleInput)`  
-  Parse a PLY into `GaussianCloud`.
+  Async helper that parses a PLY into `Promise<GaussianCloud>`. Intended for in-memory workflows rather than very large inputs.
 - `GaussianCloud`  
   In-memory point-cloud class (`positions`, `scaleLog`, `quatsXYZW`, `opacity`, `shCoeffs`, `color0`).
 - `makeConversionArgs(inputPath, outputDir, options, { requireInput })`  
@@ -185,6 +182,14 @@ await convert('scene.ply', './out_tiles', {
 - `usage()`  
   Return CLI usage string.
 
+## Partitioned pipeline notes
+
+- `partitioned` is the default PLY build mode and is the recommended mode for multi-GB inputs.
+- Handoff buckets now use the same canonical32 row format as leaf buckets, trading more temp disk and IO for better LOD fidelity.
+- If a `partitioned` build fails, rerunning the same command against the same `outputDir` resumes from `.tmp-ply-partitions`. Use `--clean` to discard the checkpoint and rebuild from scratch.
+- `buildConcurrency` bounds level-wise `partitioned` bottom-up work. Lower values reduce peak memory by limiting how many nodes hold active simplify state at once.
+- `contentWorkers` only controls parallel SPZ/GLB packing. You can keep it higher than `buildConcurrency` when encoding throughput matters more than build parallelism.
+
 ## Entry files
 
 - `src/index.js` - main package export (`module.exports`)
@@ -193,7 +198,7 @@ await convert('scene.ply', './out_tiles', {
 - `src/parser.js` - cloud model, PLY parse/load, self-test data helpers
 - `src/codec.js` - SPZ stream encoding and worker payload helpers
 - `src/gltf.js` - GLB/gltf assembly for Gaussian Splatting content
-- `src/builder.js` - octree/subtree construction and tileset writing
+- `src/builder.js` - shared simplify planning, subtree binary helpers, progress, and worker-pool utilities
 - `src/convert-core.js` - CLI/options, worker entry, top-level conversion wiring
 - `bin/3dgs-ply-3dtiles-converter.js` - npm binary entry
 

@@ -22,6 +22,18 @@ const PLY_DTYPE_MAP = {
   float64: { size: 8, view: 'Float64' },
 };
 
+const MAX_PLY_HEADER_BYTES = 8 * 1024 * 1024;
+const HEADER_READ_CHUNK_SIZE = 64 * 1024;
+const STREAM_READ_CHUNK_SIZE = 8 * 1024 * 1024;
+
+const PLY_KIND_SKIP = 0;
+const PLY_KIND_POSITION = 1;
+const PLY_KIND_SH0 = 2;
+const PLY_KIND_SCALE = 3;
+const PLY_KIND_ROT = 4;
+const PLY_KIND_OPACITY = 5;
+const PLY_KIND_REST = 6;
+
 class ConversionError extends Error {
   constructor(message) {
     super(message);
@@ -241,59 +253,102 @@ function deserializeTileNode(serialized) {
   );
 }
 
-function readLineAscii(buffer, start) {
-  let end = start;
-  while (end < buffer.length && buffer[end] !== 0x0a && buffer[end] !== 0x0d) {
-    end += 1;
+function findLineEnd(buffer, start) {
+  for (let i = start; i < buffer.length; i++) {
+    if (buffer[i] === 0x0a || buffer[i] === 0x0d) {
+      return i;
+    }
   }
-  const line = buffer.slice(start, end).toString('ascii').trim();
-  let next = end;
-  while (
-    next < buffer.length &&
-    (buffer[next] === 0x0a || buffer[next] === 0x0d)
-  ) {
-    next += 1;
-  }
-  return [line, next];
+  return -1;
 }
 
-function readPlyHeader(fileBuffer, filePath) {
-  let cursor = 0;
-  const [firstLine, afterFirst] = readLineAscii(fileBuffer, cursor);
-  cursor = afterFirst;
-  ensure(firstLine === 'ply', `${filePath} is not a valid PLY file.`);
+function canonicalGaussianRowFloatCount(coeffCount) {
+  return 11 + coeffCount * 3;
+}
 
+function canonicalGaussianRowByteSize(coeffCount) {
+  return canonicalGaussianRowFloatCount(coeffCount) * 4;
+}
+
+async function readPlyHeaderFromHandle(handle, filePath) {
   let format = null;
   let vertexCount = null;
   const vertexProps = [];
   let currentElement = null;
+  let sawMagic = false;
+  let cursor = 0;
+  let fileOffset = 0;
+  let headerBuffer = Buffer.alloc(0);
+  let sawEndHeader = false;
 
-  while (cursor < fileBuffer.length) {
-    const [line, nextCursor] = readLineAscii(fileBuffer, cursor);
-    cursor = nextCursor;
-    if (!line || line.startsWith('comment')) {
-      continue;
-    }
-    const parts = line.split(/\s+/);
-    if (parts[0] === 'format') {
-      format = parts[1];
-    } else if (parts[0] === 'element') {
-      currentElement = parts[1];
-      if (currentElement === 'vertex') {
-        vertexCount = Number(parts[2]);
+  while (!sawEndHeader) {
+    const chunk = Buffer.allocUnsafe(HEADER_READ_CHUNK_SIZE);
+    const { bytesRead } = await handle.read(
+      chunk,
+      0,
+      chunk.length,
+      fileOffset,
+    );
+    ensure(bytesRead > 0, `PLY header is incomplete in ${filePath}.`);
+    headerBuffer = Buffer.concat([headerBuffer, chunk.subarray(0, bytesRead)]);
+    fileOffset += bytesRead;
+    ensure(
+      headerBuffer.length <= MAX_PLY_HEADER_BYTES,
+      `PLY header exceeds ${MAX_PLY_HEADER_BYTES} bytes in ${filePath}.`,
+    );
+
+    while (true) {
+      const lineEnd = findLineEnd(headerBuffer, cursor);
+      if (lineEnd < 0) {
+        break;
       }
-    } else if (parts[0] === 'property' && currentElement === 'vertex') {
-      if (parts[1] === 'list') {
-        throw new ConversionError(
-          'List property in vertex data is not supported.',
-        );
+
+      const line = headerBuffer.toString('ascii', cursor, lineEnd).trim();
+      let nextCursor = lineEnd;
+      while (
+        nextCursor < headerBuffer.length &&
+        (headerBuffer[nextCursor] === 0x0a || headerBuffer[nextCursor] === 0x0d)
+      ) {
+        nextCursor += 1;
       }
-      vertexProps.push({ name: parts[2], type: parts[1] });
-    } else if (parts[0] === 'end_header') {
-      break;
+      cursor = nextCursor;
+
+      if (!sawMagic) {
+        ensure(line === 'ply', `${filePath} is not a valid PLY file.`);
+        sawMagic = true;
+        continue;
+      }
+
+      if (line === 'end_header') {
+        sawEndHeader = true;
+        break;
+      }
+
+      if (!line || line.startsWith('comment')) {
+        continue;
+      }
+
+      const parts = line.split(/\s+/);
+      if (parts[0] === 'format') {
+        format = parts[1];
+      } else if (parts[0] === 'element') {
+        currentElement = parts[1];
+        if (currentElement === 'vertex') {
+          vertexCount = Number(parts[2]);
+        }
+      } else if (parts[0] === 'property' && currentElement === 'vertex') {
+        if (parts[1] === 'list') {
+          throw new ConversionError(
+            'List property in vertex data is not supported.',
+          );
+        }
+        vertexProps.push({ name: parts[2], type: parts[1] });
+      }
     }
   }
 
+  ensure(sawMagic, `${filePath} is not a valid PLY file.`);
+  ensure(sawEndHeader, `PLY header is incomplete in ${filePath}.`);
   ensure(
     format === 'binary_little_endian' || format === 'ascii',
     `Only ascii or binary_little_endian PLY is supported; got ${format}.`,
@@ -303,6 +358,26 @@ function readPlyHeader(fileBuffer, filePath) {
     'No vertex element or vertex properties found in PLY header.',
   );
   return { format, vertexCount, vertexProps, dataOffset: cursor };
+}
+
+async function readExact(handle, buffer, length, position, eofMessage) {
+  let offset = 0;
+  let readPosition = position;
+  while (offset < length) {
+    const { bytesRead } = await handle.read(
+      buffer,
+      offset,
+      length - offset,
+      readPosition,
+    );
+    if (bytesRead === 0) {
+      throw new ConversionError(eofMessage);
+    }
+    offset += bytesRead;
+    if (readPosition != null) {
+      readPosition += bytesRead;
+    }
+  }
 }
 
 function shDegreeFromCoeffCount(totalCoeffs) {
@@ -364,15 +439,7 @@ function readPlyScalar(view, offset, typeInfo) {
   throw new ConversionError(`Unsupported binary reader view: ${typeInfo.view}`);
 }
 
-function writeNormalizedQuaternion(
-  out,
-  outOff,
-  inputConvention,
-  r0,
-  r1,
-  r2,
-  r3,
-) {
+function writeNormalizedQuaternion(out, outOff, inputConvention, r0, r1, r2, r3) {
   let x;
   let y;
   let z;
@@ -403,19 +470,50 @@ function writeNormalizedQuaternion(
   out[outOff + 3] = w * inv;
 }
 
-function parseCommonGaussianPly(
+function writeNormalizedQuaternionToView(
+  view,
+  inputConvention,
+  r0,
+  r1,
+  r2,
+  r3,
+) {
+  let x;
+  let y;
+  let z;
+  let w;
+  if (inputConvention === 'graphdeco') {
+    x = r1;
+    y = r2;
+    z = r3;
+    w = r0;
+  } else if (inputConvention === 'khr_native') {
+    x = r0;
+    y = r1;
+    z = r2;
+    w = r3;
+  } else {
+    throw new ConversionError(`Unknown input_convention: ${inputConvention}`);
+  }
+
+  let n = Math.sqrt(x * x + y * y + z * z + w * w);
+  if (n < 1e-12) {
+    n = 1.0;
+  }
+  const sign = w < 0.0 ? -1.0 : 1.0;
+  const inv = sign / n;
+  view.setFloat32(24, x * inv, true);
+  view.setFloat32(28, y * inv, true);
+  view.setFloat32(32, z * inv, true);
+  view.setFloat32(36, w * inv, true);
+}
+
+function buildGaussianPlyLayout(
+  vertexProps,
   filePath,
   inputConvention,
-  colorSpace,
   linearScaleInput,
 ) {
-  const fileBuffer = fs.readFileSync(filePath);
-  const {
-    format,
-    vertexCount: n,
-    vertexProps,
-    dataOffset,
-  } = readPlyHeader(fileBuffer, filePath);
   const propNames = vertexProps.map((p) => p.name);
   const required = ['x', 'y', 'z', 'opacity', 'f_dc_0', 'f_dc_1', 'f_dc_2'];
   const missing = required.filter((name) => !propNames.includes(name));
@@ -446,12 +544,6 @@ function parseCommonGaussianPly(
   const degree = inferShDegreeFromRestCount(restNames.length);
   const extraDim = { 0: 0, 1: 3, 2: 8, 3: 15 }[degree];
   const coeffCount = 1 + extraDim;
-  const positions = new Float32Array(n * 3);
-  const scaleLog = new Float32Array(n * 3);
-  const quats = new Float32Array(n * 4);
-  const opacity = new Float32Array(n);
-  const color0 = new Float32Array(n * 3);
-  const shCoeffs = new Float32Array(n * coeffCount * 3);
 
   const scaleIndexByName = Object.create(null);
   for (let i = 0; i < scaleNames.length; i++) {
@@ -466,170 +558,557 @@ function parseCommonGaussianPly(
     restIndexByName[restNames[i]] = i;
   }
 
-  const KIND_SKIP = 0;
-  const KIND_POSITION = 1;
-  const KIND_SH0 = 2;
-  const KIND_SCALE = 3;
-  const KIND_ROT = 4;
-  const KIND_OPACITY = 5;
-  const KIND_REST = 6;
-
-  const propertyPlan = vertexProps.map((prop) => {
+  const propertyPlan = [];
+  const binaryPositionProps = new Array(3).fill(null);
+  let sourceRecordSize = 0;
+  for (const prop of vertexProps) {
     const typeInfo = PLY_DTYPE_MAP[prop.type];
     ensure(!!typeInfo, `Unsupported PLY property type: ${prop.type}`);
     const name = prop.name;
-    if (name === 'x') return { kind: KIND_POSITION, index: 0, typeInfo };
-    if (name === 'y') return { kind: KIND_POSITION, index: 1, typeInfo };
-    if (name === 'z') return { kind: KIND_POSITION, index: 2, typeInfo };
-    if (name === 'opacity') return { kind: KIND_OPACITY, typeInfo };
-    if (name === 'f_dc_0') return { kind: KIND_SH0, index: 0, typeInfo };
-    if (name === 'f_dc_1') return { kind: KIND_SH0, index: 1, typeInfo };
-    if (name === 'f_dc_2') return { kind: KIND_SH0, index: 2, typeInfo };
+    let plan = null;
+    if (name === 'x') plan = { kind: PLY_KIND_POSITION, index: 0, typeInfo };
+    else if (name === 'y') {
+      plan = { kind: PLY_KIND_POSITION, index: 1, typeInfo };
+    } else if (name === 'z') {
+      plan = { kind: PLY_KIND_POSITION, index: 2, typeInfo };
+    } else if (name === 'opacity') {
+      plan = { kind: PLY_KIND_OPACITY, typeInfo };
+    } else if (name === 'f_dc_0') {
+      plan = { kind: PLY_KIND_SH0, index: 0, typeInfo };
+    } else if (name === 'f_dc_1') {
+      plan = { kind: PLY_KIND_SH0, index: 1, typeInfo };
+    } else if (name === 'f_dc_2') {
+      plan = { kind: PLY_KIND_SH0, index: 2, typeInfo };
+    }
 
     const scaleIdx = scaleIndexByName[name];
-    if (scaleIdx != null) {
-      return { kind: KIND_SCALE, index: scaleIdx, typeInfo };
+    if (!plan && scaleIdx != null) {
+      plan = { kind: PLY_KIND_SCALE, index: scaleIdx, typeInfo };
     }
 
     const rotIdx = rotIndexByName[name];
-    if (rotIdx != null) {
-      return { kind: KIND_ROT, index: rotIdx, typeInfo };
+    if (!plan && rotIdx != null) {
+      plan = { kind: PLY_KIND_ROT, index: rotIdx, typeInfo };
     }
 
     const restIdx = restIndexByName[name];
-    if (restIdx != null) {
+    if (!plan && restIdx != null) {
       const coeff = restIdx % extraDim;
       const channel = Math.floor(restIdx / extraDim);
-      return {
-        kind: KIND_REST,
+      plan = {
+        kind: PLY_KIND_REST,
         index: 3 * (1 + coeff) + channel,
         typeInfo,
       };
     }
 
-    return { kind: KIND_SKIP, typeInfo };
-  });
+    if (!plan) {
+      plan = { kind: PLY_KIND_SKIP, typeInfo };
+    }
+    if (plan.kind === PLY_KIND_POSITION) {
+      binaryPositionProps[plan.index] = {
+        offset: sourceRecordSize,
+        typeInfo,
+      };
+    }
+    propertyPlan.push(plan);
+    sourceRecordSize += typeInfo.size;
+  }
+  ensure(sourceRecordSize > 0, `PLY vertex record is empty in ${filePath}.`);
 
-  const writeScalar = (rowIndex, plan, value) => {
-    const p = rowIndex * 3;
-    const coeffBase = rowIndex * coeffCount * 3;
-    switch (plan.kind) {
-      case KIND_POSITION:
-        positions[p + plan.index] = value;
-        break;
-      case KIND_SH0:
-        shCoeffs[coeffBase + plan.index] = value;
-        color0[p + plan.index] = clamp(value * C0 + 0.5, 0.0, 1.0);
-        break;
-      case KIND_SCALE:
-        scaleLog[p + plan.index] = linearScaleInput
-          ? Math.log(Math.max(value, 1e-8))
-          : value;
-        break;
-      case KIND_OPACITY:
-        opacity[rowIndex] =
-          inputConvention === 'graphdeco'
-            ? sigmoid(value)
-            : clamp(value, 0.0, 1.0);
-        break;
-      case KIND_REST:
-        shCoeffs[coeffBase + plan.index] = value;
-        break;
-      default:
-        break;
+  return {
+    inputConvention,
+    linearScaleInput,
+    degree,
+    coeffCount,
+    extraDim,
+    propertyPlan,
+    fieldCount: propertyPlan.length,
+    sourceRecordSize,
+    binaryPositionProps,
+    canonicalFloatCount: canonicalGaussianRowFloatCount(coeffCount),
+    canonicalByteSize: canonicalGaussianRowByteSize(coeffCount),
+  };
+}
+
+function writeCanonicalScalarToView(view, layout, plan, value) {
+  switch (plan.kind) {
+    case PLY_KIND_POSITION:
+      view.setFloat32(plan.index * 4, value, true);
+      break;
+    case PLY_KIND_SH0:
+      view.setFloat32((11 + plan.index) * 4, value, true);
+      break;
+    case PLY_KIND_SCALE:
+      view.setFloat32(
+        (3 + plan.index) * 4,
+        layout.linearScaleInput ? Math.log(Math.max(value, 1e-8)) : value,
+        true,
+      );
+      break;
+    case PLY_KIND_OPACITY:
+      view.setFloat32(
+        40,
+        layout.inputConvention === 'graphdeco'
+          ? sigmoid(value)
+          : clamp(value, 0.0, 1.0),
+        true,
+      );
+      break;
+    case PLY_KIND_REST:
+      view.setFloat32((11 + plan.index) * 4, value, true);
+      break;
+    default:
+      break;
+  }
+}
+
+function decodeBinaryGaussianRecordToCanonical(sourceView, offset, layout, rowView) {
+  let r0 = 0.0;
+  let r1 = 0.0;
+  let r2 = 0.0;
+  let r3 = 1.0;
+  for (let p = 0; p < layout.propertyPlan.length; p++) {
+    const plan = layout.propertyPlan[p];
+    if (plan.kind === PLY_KIND_SKIP) {
+      offset += plan.typeInfo.size;
+      continue;
+    }
+    const value = readPlyScalar(sourceView, offset, plan.typeInfo);
+    offset += plan.typeInfo.size;
+    if (plan.kind === PLY_KIND_ROT) {
+      if (plan.index === 0) r0 = value;
+      else if (plan.index === 1) r1 = value;
+      else if (plan.index === 2) r2 = value;
+      else r3 = value;
+    } else {
+      writeCanonicalScalarToView(rowView, layout, plan, value);
+    }
+  }
+  writeNormalizedQuaternionToView(
+    rowView,
+    layout.inputConvention,
+    r0,
+    r1,
+    r2,
+    r3,
+  );
+  return offset;
+}
+
+async function forEachBinaryGaussianPlyPosition(
+  handle,
+  filePath,
+  header,
+  layout,
+  onPosition,
+) {
+  const positionProps = layout.binaryPositionProps;
+  ensure(
+    Array.isArray(positionProps) &&
+      positionProps[0] &&
+      positionProps[1] &&
+      positionProps[2],
+    `Binary PLY layout is missing direct position offsets in ${filePath}.`,
+  );
+  const rowsPerChunk = Math.max(
+    1,
+    Math.floor(STREAM_READ_CHUNK_SIZE / layout.sourceRecordSize),
+  );
+  const chunk = Buffer.allocUnsafe(rowsPerChunk * layout.sourceRecordSize);
+  let fileOffset = header.dataOffset;
+
+  for (
+    let rowBase = 0;
+    rowBase < header.vertexCount;
+    rowBase += rowsPerChunk
+  ) {
+    const rowCount = Math.min(rowsPerChunk, header.vertexCount - rowBase);
+    const byteCount = rowCount * layout.sourceRecordSize;
+    await readExact(
+      handle,
+      chunk,
+      byteCount,
+      fileOffset,
+      `Binary PLY payload ended early in ${filePath}.`,
+    );
+    fileOffset += byteCount;
+
+    const view = new DataView(chunk.buffer, chunk.byteOffset, byteCount);
+    for (let i = 0; i < rowCount; i++) {
+      const rowOffset = i * layout.sourceRecordSize;
+      const x = readPlyScalar(
+        view,
+        rowOffset + positionProps[0].offset,
+        positionProps[0].typeInfo,
+      );
+      const y = readPlyScalar(
+        view,
+        rowOffset + positionProps[1].offset,
+        positionProps[1].typeInfo,
+      );
+      const z = readPlyScalar(
+        view,
+        rowOffset + positionProps[2].offset,
+        positionProps[2].typeInfo,
+      );
+      onPosition(rowBase + i, x, y, z);
+    }
+  }
+}
+
+async function forEachBinaryGaussianPlyCanonicalRecord(
+  handle,
+  filePath,
+  header,
+  layout,
+  onRecord,
+) {
+  const rowsPerChunk = Math.max(
+    1,
+    Math.floor(STREAM_READ_CHUNK_SIZE / layout.sourceRecordSize),
+  );
+  const chunk = Buffer.allocUnsafe(rowsPerChunk * layout.sourceRecordSize);
+  const rowBuffer = Buffer.allocUnsafe(layout.canonicalByteSize);
+  const rowView = new DataView(
+    rowBuffer.buffer,
+    rowBuffer.byteOffset,
+    rowBuffer.byteLength,
+  );
+  let fileOffset = header.dataOffset;
+
+  for (
+    let rowBase = 0;
+    rowBase < header.vertexCount;
+    rowBase += rowsPerChunk
+  ) {
+    const rowCount = Math.min(rowsPerChunk, header.vertexCount - rowBase);
+    const byteCount = rowCount * layout.sourceRecordSize;
+    await readExact(
+      handle,
+      chunk,
+      byteCount,
+      fileOffset,
+      `Binary PLY payload ended early in ${filePath}.`,
+    );
+    fileOffset += byteCount;
+
+    const view = new DataView(chunk.buffer, chunk.byteOffset, byteCount);
+    let offset = 0;
+    for (let i = 0; i < rowCount; i++) {
+      offset = decodeBinaryGaussianRecordToCanonical(view, offset, layout, rowView);
+      const maybePromise = onRecord(rowBase + i, rowBuffer, rowView);
+      if (maybePromise && typeof maybePromise.then === 'function') {
+        await maybePromise;
+      }
+    }
+  }
+}
+
+async function forEachAsciiGaussianPlyPosition(
+  handle,
+  filePath,
+  header,
+  layout,
+  onPosition,
+) {
+  const expected = header.vertexCount * layout.fieldCount;
+  const chunk = Buffer.allocUnsafe(STREAM_READ_CHUNK_SIZE);
+  let fileOffset = header.dataOffset;
+  let tokenCarry = '';
+  let rowIndex = 0;
+  let propIndex = 0;
+  let count = 0;
+  let x = 0.0;
+  let y = 0.0;
+  let z = 0.0;
+
+  const processToken = (token) => {
+    if (rowIndex >= header.vertexCount) {
+      return;
+    }
+    const plan = layout.propertyPlan[propIndex];
+    if (plan.kind === PLY_KIND_POSITION) {
+      const value = Number.parseFloat(token);
+      if (plan.index === 0) x = value;
+      else if (plan.index === 1) y = value;
+      else z = value;
+    }
+    propIndex += 1;
+    count += 1;
+    if (propIndex === layout.fieldCount) {
+      onPosition(rowIndex, x, y, z);
+      rowIndex += 1;
+      propIndex = 0;
+      x = 0.0;
+      y = 0.0;
+      z = 0.0;
     }
   };
 
-  if (format === 'binary_little_endian') {
-    const data = fileBuffer.subarray(dataOffset);
-    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-    let offset = 0;
-    for (let i = 0; i < n; i++) {
-      let r0 = 0.0;
-      let r1 = 0.0;
-      let r2 = 0.0;
-      let r3 = 1.0;
-      for (let p = 0; p < propertyPlan.length; p++) {
-        const plan = propertyPlan[p];
-        const value = readPlyScalar(view, offset, plan.typeInfo);
-        offset += plan.typeInfo.size;
-        if (plan.kind === KIND_ROT) {
-          if (plan.index === 0) r0 = value;
-          else if (plan.index === 1) r1 = value;
-          else if (plan.index === 2) r2 = value;
-          else r3 = value;
-        } else {
-          writeScalar(i, plan, value);
-        }
-      }
-      writeNormalizedQuaternion(quats, i * 4, inputConvention, r0, r1, r2, r3);
+  while (rowIndex < header.vertexCount) {
+    const { bytesRead } = await handle.read(chunk, 0, chunk.length, fileOffset);
+    if (bytesRead === 0) {
+      break;
     }
-  } else {
-    const bytes = fileBuffer.subarray(dataOffset);
-    const expected = n * propertyPlan.length;
-    let cursor = 0;
-    let count = 0;
-    for (let i = 0; i < n; i++) {
-      let r0 = 0.0;
-      let r1 = 0.0;
-      let r2 = 0.0;
-      let r3 = 1.0;
-      for (let p = 0; p < propertyPlan.length; p++) {
-        while (cursor < bytes.length) {
-          const ch = bytes[cursor];
-          if (ch > 0x20) {
-            break;
-          }
-          cursor += 1;
-        }
+    fileOffset += bytesRead;
 
-        if (cursor >= bytes.length) {
-          throw new ConversionError(
-            `ASCII PLY rows mismatch. Expected at least ${expected} values, got ${count}.`,
-          );
+    const text = tokenCarry + chunk.toString('ascii', 0, bytesRead);
+    let tokenStart = -1;
+    for (let i = 0; i < text.length && rowIndex < header.vertexCount; i++) {
+      if (text.charCodeAt(i) > 0x20) {
+        if (tokenStart < 0) {
+          tokenStart = i;
         }
-
-        const start = cursor;
-        while (cursor < bytes.length && bytes[cursor] > 0x20) {
-          cursor += 1;
-        }
-        const value = Number.parseFloat(bytes.toString('ascii', start, cursor));
-        cursor += 1;
-        count += 1;
-
-        const plan = propertyPlan[p];
-        if (plan.kind === KIND_ROT) {
-          if (plan.index === 0) r0 = value;
-          else if (plan.index === 1) r1 = value;
-          else if (plan.index === 2) r2 = value;
-          else r3 = value;
-        } else {
-          writeScalar(i, plan, value);
-        }
+      } else if (tokenStart >= 0) {
+        processToken(text.slice(tokenStart, i));
+        tokenStart = -1;
       }
-      writeNormalizedQuaternion(quats, i * 4, inputConvention, r0, r1, r2, r3);
     }
-    ensure(
-      count >= expected,
-      `ASCII PLY rows mismatch. Expected at least ${expected} values, got ${count}.`,
-    );
+    tokenCarry =
+      tokenStart >= 0 && rowIndex < header.vertexCount
+        ? text.slice(tokenStart)
+        : '';
   }
 
+  if (rowIndex < header.vertexCount && tokenCarry) {
+    processToken(tokenCarry);
+  }
+
+  ensure(
+    count >= expected && rowIndex === header.vertexCount && propIndex === 0,
+    `ASCII PLY rows mismatch. Expected at least ${expected} values, got ${count}.`,
+  );
+}
+
+async function forEachAsciiGaussianPlyCanonicalRecord(
+  handle,
+  filePath,
+  header,
+  layout,
+  onRecord,
+) {
+  const expected = header.vertexCount * layout.fieldCount;
+  const chunk = Buffer.allocUnsafe(STREAM_READ_CHUNK_SIZE);
+  const rowBuffer = Buffer.allocUnsafe(layout.canonicalByteSize);
+  const rowView = new DataView(
+    rowBuffer.buffer,
+    rowBuffer.byteOffset,
+    rowBuffer.byteLength,
+  );
+  let fileOffset = header.dataOffset;
+  let tokenCarry = '';
+  let rowIndex = 0;
+  let propIndex = 0;
+  let count = 0;
+  let r0 = 0.0;
+  let r1 = 0.0;
+  let r2 = 0.0;
+  let r3 = 1.0;
+
+  const processToken = (token) => {
+    if (rowIndex >= header.vertexCount) {
+      return;
+    }
+    const plan = layout.propertyPlan[propIndex];
+    if (plan.kind !== PLY_KIND_SKIP) {
+      const value = Number.parseFloat(token);
+      if (plan.kind === PLY_KIND_ROT) {
+        if (plan.index === 0) r0 = value;
+        else if (plan.index === 1) r1 = value;
+        else if (plan.index === 2) r2 = value;
+        else r3 = value;
+      } else {
+        writeCanonicalScalarToView(rowView, layout, plan, value);
+      }
+    }
+    propIndex += 1;
+    count += 1;
+    if (propIndex === layout.fieldCount) {
+      writeNormalizedQuaternionToView(
+        rowView,
+        layout.inputConvention,
+        r0,
+        r1,
+        r2,
+        r3,
+      );
+      const maybePromise = onRecord(rowIndex, rowBuffer, rowView);
+      rowIndex += 1;
+      propIndex = 0;
+      r0 = 0.0;
+      r1 = 0.0;
+      r2 = 0.0;
+      r3 = 1.0;
+      return maybePromise;
+    }
+    return null;
+  };
+
+  while (rowIndex < header.vertexCount) {
+    const { bytesRead } = await handle.read(chunk, 0, chunk.length, fileOffset);
+    if (bytesRead === 0) {
+      break;
+    }
+    fileOffset += bytesRead;
+
+    const text = tokenCarry + chunk.toString('ascii', 0, bytesRead);
+    let tokenStart = -1;
+    for (let i = 0; i < text.length && rowIndex < header.vertexCount; i++) {
+      if (text.charCodeAt(i) > 0x20) {
+        if (tokenStart < 0) {
+          tokenStart = i;
+        }
+      } else if (tokenStart >= 0) {
+        const maybePromise = processToken(text.slice(tokenStart, i));
+        if (maybePromise && typeof maybePromise.then === 'function') {
+          await maybePromise;
+        }
+        tokenStart = -1;
+      }
+    }
+    tokenCarry =
+      tokenStart >= 0 && rowIndex < header.vertexCount
+        ? text.slice(tokenStart)
+        : '';
+  }
+
+  if (rowIndex < header.vertexCount && tokenCarry) {
+    const maybePromise = processToken(tokenCarry);
+    if (maybePromise && typeof maybePromise.then === 'function') {
+      await maybePromise;
+    }
+  }
+
+  ensure(
+    count >= expected && rowIndex === header.vertexCount && propIndex === 0,
+    `ASCII PLY rows mismatch. Expected at least ${expected} values, got ${count}.`,
+  );
+}
+
+async function forEachGaussianPlyPosition(
+  handle,
+  filePath,
+  header,
+  layout,
+  onPosition,
+) {
+  if (header.format === 'binary_little_endian') {
+    await forEachBinaryGaussianPlyPosition(
+      handle,
+      filePath,
+      header,
+      layout,
+      onPosition,
+    );
+    return;
+  }
+  await forEachAsciiGaussianPlyPosition(
+    handle,
+    filePath,
+    header,
+    layout,
+    onPosition,
+  );
+}
+
+async function forEachGaussianPlyCanonicalRecord(
+  handle,
+  filePath,
+  header,
+  layout,
+  onRecord,
+) {
+  if (header.format === 'binary_little_endian') {
+    await forEachBinaryGaussianPlyCanonicalRecord(
+      handle,
+      filePath,
+      header,
+      layout,
+      onRecord,
+    );
+    return;
+  }
+  await forEachAsciiGaussianPlyCanonicalRecord(
+    handle,
+    filePath,
+    header,
+    layout,
+    onRecord,
+  );
+}
+
+async function parseCommonGaussianPly(
+  filePath,
+  inputConvention,
+  colorSpace,
+  linearScaleInput,
+) {
   ensure(
     colorSpace === 'lin_rec709_display' || colorSpace === 'srgb_rec709_display',
     `Unsupported colorSpace: ${colorSpace}`,
   );
 
-  const cloud = new GaussianCloud(
-    positions,
-    scaleLog,
-    quats,
-    opacity,
-    shCoeffs,
-    color0,
-  );
-  cloud._shDegree = degree;
-  return cloud;
+  const handle = await fs.promises.open(filePath, 'r');
+  try {
+    const header = await readPlyHeaderFromHandle(handle, filePath);
+    const layout = buildGaussianPlyLayout(
+      header.vertexProps,
+      filePath,
+      inputConvention,
+      linearScaleInput,
+    );
+    const n = header.vertexCount;
+    const positions = new Float32Array(n * 3);
+    const scaleLog = new Float32Array(n * 3);
+    const quats = new Float32Array(n * 4);
+    const opacity = new Float32Array(n);
+    const color0 = new Float32Array(n * 3);
+    const shCoeffs = new Float32Array(n * layout.coeffCount * 3);
+
+    await forEachGaussianPlyCanonicalRecord(
+      handle,
+      filePath,
+      header,
+      layout,
+      (rowIndex, _rowBuffer, rowView) => {
+        const base3 = rowIndex * 3;
+        const base4 = rowIndex * 4;
+        const coeffBase = rowIndex * layout.coeffCount * 3;
+        positions[base3 + 0] = rowView.getFloat32(0, true);
+        positions[base3 + 1] = rowView.getFloat32(4, true);
+        positions[base3 + 2] = rowView.getFloat32(8, true);
+        scaleLog[base3 + 0] = rowView.getFloat32(12, true);
+        scaleLog[base3 + 1] = rowView.getFloat32(16, true);
+        scaleLog[base3 + 2] = rowView.getFloat32(20, true);
+        quats[base4 + 0] = rowView.getFloat32(24, true);
+        quats[base4 + 1] = rowView.getFloat32(28, true);
+        quats[base4 + 2] = rowView.getFloat32(32, true);
+        quats[base4 + 3] = rowView.getFloat32(36, true);
+        opacity[rowIndex] = rowView.getFloat32(40, true);
+
+        for (let c = 0; c < layout.coeffCount * 3; c++) {
+          shCoeffs[coeffBase + c] = rowView.getFloat32((11 + c) * 4, true);
+        }
+        color0[base3 + 0] = clamp(shCoeffs[coeffBase + 0] * C0 + 0.5, 0.0, 1.0);
+        color0[base3 + 1] = clamp(shCoeffs[coeffBase + 1] * C0 + 0.5, 0.0, 1.0);
+        color0[base3 + 2] = clamp(shCoeffs[coeffBase + 2] * C0 + 0.5, 0.0, 1.0);
+      },
+    );
+
+    const cloud = new GaussianCloud(
+      positions,
+      scaleLog,
+      quats,
+      opacity,
+      shCoeffs,
+      color0,
+    );
+    cloud._shDegree = layout.degree;
+    return cloud;
+  } finally {
+    await handle.close();
+  }
 }
 
 function writeGraphdecoLikePly(filePath, cloud) {
@@ -850,4 +1329,10 @@ module.exports = {
   parseCommonGaussianPly,
   makeSelfTestCloud,
   writeGraphdecoLikePly,
+  _canonicalGaussianRowFloatCount: canonicalGaussianRowFloatCount,
+  _canonicalGaussianRowByteSize: canonicalGaussianRowByteSize,
+  _readPlyHeaderFromHandle: readPlyHeaderFromHandle,
+  _buildGaussianPlyLayout: buildGaussianPlyLayout,
+  _forEachGaussianPlyPosition: forEachGaussianPlyPosition,
+  _forEachGaussianPlyCanonicalRecord: forEachGaussianPlyCanonicalRecord,
 };

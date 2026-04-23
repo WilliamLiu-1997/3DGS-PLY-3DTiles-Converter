@@ -25,6 +25,8 @@ function usage() {
     '  --coordinate <json_[lat,long,height]>',
     '  --sampling-rate-per-level <0..1]',
     '  --sample-mode <sample|merge>',
+    '  --ply-build-mode <partitioned|entire>',
+    '  --build-concurrency <1+>',
     '  --content-workers <0+>',
     '  --self-test',
     '  --self-test-count <int>',
@@ -50,6 +52,8 @@ const DEFAULT_CONVERSION_ARGS = {
   coordinate: null,
   samplingRatePerLevel: 0.5,
   sampleMode: 'merge',
+  plyBuildMode: 'partitioned',
+  buildConcurrency: 2,
   contentWorkers: 4,
   clean: false,
   selfTest: false,
@@ -303,6 +307,9 @@ function validateConversionArgs(args, { requireInput = false } = {}) {
   if (args.contentWorkers < 0) {
     throw new ConversionError('--content-workers must be >= 0');
   }
+  if (args.buildConcurrency < 1) {
+    throw new ConversionError('--build-concurrency must be >= 1');
+  }
 
   assertChoice(
     args.inputConvention,
@@ -316,6 +323,11 @@ function validateConversionArgs(args, { requireInput = false } = {}) {
   );
   assertChoice(args.tilingMode, ['explicit', 'implicit'], '--tiling-mode');
   assertChoice(args.sampleMode, ['sample', 'merge'], '--sample-mode');
+  assertChoice(
+    args.plyBuildMode,
+    ['partitioned', 'entire'],
+    '--ply-build-mode',
+  );
   if (args.transform !== null) {
     if (!Array.isArray(args.transform) || args.transform.length !== 16) {
       throw new ConversionError(
@@ -460,6 +472,21 @@ function parseArgs(argv) {
     }
     if (token === '--sample-mode') {
       args.sampleMode = requireValue(token);
+      continue;
+    }
+    if (token === '--ply-build-mode') {
+      args.plyBuildMode = requireValue(token);
+      continue;
+    }
+    if (token === '--build-concurrency') {
+      const raw = requireValue(token);
+      const value = Number.parseInt(raw, 10);
+      if (!Number.isInteger(value)) {
+        throw new ConversionError(
+          `Invalid integer for --build-concurrency: ${raw}`,
+        );
+      }
+      args.buildConcurrency = value;
       continue;
     }
     if (token === '--content-workers') {
@@ -674,6 +701,21 @@ function makeConversionArgs(
       options['sample-mode'],
       options.sample_mode,
       DEFAULT_CONVERSION_ARGS.sampleMode,
+    ),
+    plyBuildMode: firstDefined(
+      options.plyBuildMode,
+      options['ply-build-mode'],
+      options.ply_build_mode,
+      DEFAULT_CONVERSION_ARGS.plyBuildMode,
+    ),
+    buildConcurrency: normalizeToInt(
+      firstDefined(
+        options.buildConcurrency,
+        options['build-concurrency'],
+        options.build_concurrency,
+        DEFAULT_CONVERSION_ARGS.buildConcurrency,
+      ),
+      '--build-concurrency',
     ),
     contentWorkers: normalizeToInt(
       firstDefined(
