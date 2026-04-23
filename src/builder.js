@@ -461,11 +461,6 @@ function normalizeSplatTargetCount(targetCount, splatCount) {
   return Math.max(1, Math.min(splatCount, Math.floor(targetCount)));
 }
 
-function defaultVoxelTargetCount(targetCount, splatCount) {
-  const normalized = normalizeSplatTargetCount(targetCount, splatCount);
-  return Math.max(1, Math.floor(normalized * 4));
-}
-
 function constrainTargetSplatCount(
   targetCount,
   splatCount,
@@ -598,10 +593,7 @@ function planSimplifyCloudVoxel(
 ) {
   const n = cloud.length;
   const target = normalizeSplatTargetCount(targetCount, n);
-  const voxelTarget = Math.max(
-    target,
-    normalizeSplatTargetCount(voxelTargetCount, n),
-  );
+  const voxelTarget = normalizeSplatTargetCount(voxelTargetCount, n);
   if (n <= target) {
     const selected = [];
     const assignment = new Int32Array(n);
@@ -696,12 +688,10 @@ function planSimplifyCloudVoxel(
   const voxelDiagSq =
     voxelSize0 * voxelSize0 + voxelSize1 * voxelSize1 + voxelSize2 * voxelSize2;
   const voxelDiag = Math.max(Math.sqrt(voxelDiagSq), 1e-6);
-  const detailWeights = new Float64Array(n);
   const coarseWeights = new Float64Array(n);
   for (let i = 0; i < n; i++) {
     const opacity = Math.max(cloud.opacity[i], 1e-4);
     const radiusNorm = Math.max(origRadius[i] / voxelDiag, 0.35);
-    detailWeights[i] = opacity / Math.sqrt(radiusNorm);
     coarseWeights[i] = opacity * Math.sqrt(radiusNorm);
   }
 
@@ -710,11 +700,7 @@ function planSimplifyCloudVoxel(
   selectedSlotByOrig.fill(-1);
   const assignment = new Int32Array(n);
   const taken = new Uint8Array(n);
-  const secondaryCandidates = [];
-  const tertiaryDetailCandidates = [];
-  const tertiaryCoarseCandidates = [];
-  let coarseSelectedCount = 0;
-  let detailSelectedCount = 0;
+  const extraCoarseCandidates = [];
 
   for (const idxs of selectedGroups) {
     if (idxs.length === 0) {
@@ -732,34 +718,6 @@ function planSimplifyCloudVoxel(
     selected.push(coarseRep);
     selectedSlotByOrig[coarseRep] = coarseOutIdx;
     taken[coarseRep] = 1;
-    coarseSelectedCount += 1;
-
-    const detailRep = representativeIndexForGroup(
-      cloud,
-      idxs,
-      detailWeights,
-      origRadius,
-      voxelDiagSq,
-      0.15,
-    );
-    if (detailRep >= 0 && detailRep !== coarseRep) {
-      const c3 = coarseRep * 3;
-      const d3 = detailRep * 3;
-      const dx = pos[d3 + 0] - pos[c3 + 0];
-      const dy = pos[d3 + 1] - pos[c3 + 1];
-      const dz = pos[d3 + 2] - pos[c3 + 2];
-      const sepNorm = Math.sqrt(dx * dx + dy * dy + dz * dz) / voxelDiag;
-      const radiusRatio =
-        Math.max(origRadius[coarseRep], 1e-6) /
-        Math.max(origRadius[detailRep], 1e-6);
-      secondaryCandidates.push({
-        rep: detailRep,
-        priority:
-          detailWeights[detailRep] *
-          (1.0 + sepNorm) *
-          (1.0 + Math.max(0.0, Math.log2(Math.max(radiusRatio, 1.0)))),
-      });
-    }
 
     const extraCoarseRep = representativeIndexForGroup(
       cloud,
@@ -769,35 +727,17 @@ function planSimplifyCloudVoxel(
       voxelDiagSq,
       -0.15,
       coarseRep,
-      detailRep,
     );
     if (extraCoarseRep >= 0) {
-      tertiaryCoarseCandidates.push({
+      extraCoarseCandidates.push({
         rep: extraCoarseRep,
         priority: coarseWeights[extraCoarseRep],
       });
     }
-
-    const extraDetailRep = representativeIndexForGroup(
-      cloud,
-      idxs,
-      detailWeights,
-      origRadius,
-      voxelDiagSq,
-      0.15,
-      coarseRep,
-      detailRep,
-    );
-    if (extraDetailRep >= 0) {
-      tertiaryDetailCandidates.push({
-        rep: extraDetailRep,
-        priority: detailWeights[extraDetailRep],
-      });
-    }
   }
 
-  if (selected.length < target && secondaryCandidates.length > 0) {
-    secondaryCandidates.sort((a, b) => {
+  if (selected.length < target && extraCoarseCandidates.length > 0) {
+    extraCoarseCandidates.sort((a, b) => {
       if (b.priority !== a.priority) {
         return b.priority - a.priority;
       }
@@ -805,10 +745,10 @@ function planSimplifyCloudVoxel(
     });
     for (
       let i = 0;
-      i < secondaryCandidates.length && selected.length < target;
+      i < extraCoarseCandidates.length && selected.length < target;
       i++
     ) {
-      const rep = secondaryCandidates[i].rep;
+      const rep = extraCoarseCandidates[i].rep;
       if (taken[rep]) {
         continue;
       }
@@ -816,101 +756,6 @@ function planSimplifyCloudVoxel(
       selected.push(rep);
       selectedSlotByOrig[rep] = outIdx;
       taken[rep] = 1;
-      detailSelectedCount += 1;
-    }
-  }
-
-  if (selected.length < target) {
-    tertiaryDetailCandidates.sort((a, b) => {
-      if (b.priority !== a.priority) {
-        return b.priority - a.priority;
-      }
-      return a.rep - b.rep;
-    });
-    tertiaryCoarseCandidates.sort((a, b) => {
-      if (b.priority !== a.priority) {
-        return b.priority - a.priority;
-      }
-      return a.rep - b.rep;
-    });
-
-    let detailCursor = 0;
-    let coarseCursor = 0;
-    while (
-      selected.length < target &&
-      (detailCursor < tertiaryDetailCandidates.length ||
-        coarseCursor < tertiaryCoarseCandidates.length)
-    ) {
-      const preferDetail = detailSelectedCount <= coarseSelectedCount;
-      let picked = false;
-
-      if (preferDetail) {
-        while (detailCursor < tertiaryDetailCandidates.length) {
-          const rep = tertiaryDetailCandidates[detailCursor++].rep;
-          if (taken[rep]) {
-            continue;
-          }
-          const outIdx = selected.length;
-          selected.push(rep);
-          selectedSlotByOrig[rep] = outIdx;
-          taken[rep] = 1;
-          detailSelectedCount += 1;
-          picked = true;
-          break;
-        }
-      } else {
-        while (coarseCursor < tertiaryCoarseCandidates.length) {
-          const rep = tertiaryCoarseCandidates[coarseCursor++].rep;
-          if (taken[rep]) {
-            continue;
-          }
-          const outIdx = selected.length;
-          selected.push(rep);
-          selectedSlotByOrig[rep] = outIdx;
-          taken[rep] = 1;
-          coarseSelectedCount += 1;
-          picked = true;
-          break;
-        }
-      }
-
-      if (picked) {
-        continue;
-      }
-
-      while (detailCursor < tertiaryDetailCandidates.length) {
-        const rep = tertiaryDetailCandidates[detailCursor++].rep;
-        if (taken[rep]) {
-          continue;
-        }
-        const outIdx = selected.length;
-        selected.push(rep);
-        selectedSlotByOrig[rep] = outIdx;
-        taken[rep] = 1;
-        detailSelectedCount += 1;
-        picked = true;
-        break;
-      }
-      if (picked || selected.length >= target) {
-        continue;
-      }
-
-      while (coarseCursor < tertiaryCoarseCandidates.length) {
-        const rep = tertiaryCoarseCandidates[coarseCursor++].rep;
-        if (taken[rep]) {
-          continue;
-        }
-        const outIdx = selected.length;
-        selected.push(rep);
-        selectedSlotByOrig[rep] = outIdx;
-        taken[rep] = 1;
-        coarseSelectedCount += 1;
-        picked = true;
-        break;
-      }
-      if (!picked) {
-        break;
-      }
     }
   }
 
@@ -921,95 +766,21 @@ function planSimplifyCloudVoxel(
         remain.push(i);
       }
     }
-    const remainDetail = remain.slice().sort((a, b) => {
-      const w = detailWeights[b] - detailWeights[a];
-      if (w !== 0) return w;
-      const r = origRadius[a] - origRadius[b];
-      return r !== 0 ? r : b - a;
-    });
     const remainCoarse = remain.slice().sort((a, b) => {
       const w = coarseWeights[b] - coarseWeights[a];
       if (w !== 0) return w;
       const r = origRadius[b] - origRadius[a];
       return r !== 0 ? r : b - a;
     });
-
-    let detailCursor = 0;
-    let coarseCursor = 0;
-    while (
-      selected.length < target &&
-      (detailCursor < remainDetail.length || coarseCursor < remainCoarse.length)
-    ) {
-      const preferDetail = detailSelectedCount <= coarseSelectedCount;
-      let picked = false;
-
-      if (preferDetail) {
-        while (detailCursor < remainDetail.length) {
-          const rep = remainDetail[detailCursor++];
-          if (taken[rep]) {
-            continue;
-          }
-          const outIdx = selected.length;
-          selected.push(rep);
-          selectedSlotByOrig[rep] = outIdx;
-          taken[rep] = 1;
-          detailSelectedCount += 1;
-          picked = true;
-          break;
-        }
-      } else {
-        while (coarseCursor < remainCoarse.length) {
-          const rep = remainCoarse[coarseCursor++];
-          if (taken[rep]) {
-            continue;
-          }
-          const outIdx = selected.length;
-          selected.push(rep);
-          selectedSlotByOrig[rep] = outIdx;
-          taken[rep] = 1;
-          coarseSelectedCount += 1;
-          picked = true;
-          break;
-        }
-      }
-
-      if (picked) {
+    for (let i = 0; i < remainCoarse.length && selected.length < target; i++) {
+      const rep = remainCoarse[i];
+      if (taken[rep]) {
         continue;
       }
-
-      while (detailCursor < remainDetail.length) {
-        const rep = remainDetail[detailCursor++];
-        if (taken[rep]) {
-          continue;
-        }
-        const outIdx = selected.length;
-        selected.push(rep);
-        selectedSlotByOrig[rep] = outIdx;
-        taken[rep] = 1;
-        detailSelectedCount += 1;
-        picked = true;
-        break;
-      }
-      if (picked || selected.length >= target) {
-        continue;
-      }
-
-      while (coarseCursor < remainCoarse.length) {
-        const rep = remainCoarse[coarseCursor++];
-        if (taken[rep]) {
-          continue;
-        }
-        const outIdx = selected.length;
-        selected.push(rep);
-        selectedSlotByOrig[rep] = outIdx;
-        taken[rep] = 1;
-        coarseSelectedCount += 1;
-        picked = true;
-        break;
-      }
-      if (!picked) {
-        break;
-      }
+      const outIdx = selected.length;
+      selected.push(rep);
+      selectedSlotByOrig[rep] = outIdx;
+      taken[rep] = 1;
     }
   }
 
@@ -1324,7 +1095,6 @@ module.exports = {
   childBounds,
   chooseGridDims,
   normalizeSplatTargetCount,
-  defaultVoxelTargetCount,
   constrainTargetSplatCount,
   percent95,
   planSimplifyCloudVoxel,

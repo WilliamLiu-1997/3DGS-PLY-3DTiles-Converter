@@ -29,9 +29,7 @@ const {
   computeBounds,
   computeThreeSigmaAabbDiagonalRadius,
   childBounds,
-  chooseGridDims,
   normalizeSplatTargetCount,
-  defaultVoxelTargetCount,
   constrainTargetSplatCount,
   percent95,
   planSimplifyCloudVoxel,
@@ -46,6 +44,7 @@ const DEFAULT_WORKER_SCRIPT = path.join(__dirname, 'convert-core.js');
 const TEMP_WORKSPACE_NAME = '.tmp-ply-partitions';
 const PIPELINE_STATE_FILE = 'pipeline-state.json';
 const PIPELINE_STATE_VERSION = 2;
+const PIPELINE_STAGE_BUCKETED = 'bucketed';
 const LEAF_BUCKET_DIR = 'leaf';
 const HANDOFF_BUCKET_DIR = 'handoff';
 const LEAF_BUCKET_ENCODING = 'canonical32';
@@ -128,11 +127,7 @@ function makeNodeKey(level, x, y, z) {
 
 function pointOctant(bounds, x, y, z) {
   const c = bounds.center();
-  return (
-    (x >= c[0] ? 1 : 0) |
-    (y >= c[1] ? 2 : 0) |
-    (z >= c[2] ? 4 : 0)
-  );
+  return (x >= c[0] ? 1 : 0) | (y >= c[1] ? 2 : 0) | (z >= c[2] ? 4 : 0);
 }
 
 function targetSplatCountForDepth(
@@ -202,7 +197,16 @@ function deserializeBoundsState(value) {
   return new Bounds(value.minimum.slice(), value.maximum.slice());
 }
 
-function buildNodeTreeFromCounts(counts, bounds, maxDepth, leafLimit, depth, x, y, z) {
+function buildNodeTreeFromCounts(
+  counts,
+  bounds,
+  maxDepth,
+  leafLimit,
+  depth,
+  x,
+  y,
+  z,
+) {
   const key = makeNodeKey(depth, x, y, z);
   const count = counts.get(key) || 0;
   if (count <= 0) {
@@ -304,7 +308,8 @@ function deserializeNodeMeta(data) {
     for (const childData of data.children) {
       const child = deserializeNodeMeta(childData);
       node.children.push(child);
-      const oct = ((child.x & 1) << 0) | ((child.y & 1) << 1) | ((child.z & 1) << 2);
+      const oct =
+        ((child.x & 1) << 0) | ((child.y & 1) << 1) | ((child.z & 1) << 2);
       node.childrenByOct[oct] = child;
     }
   }
@@ -375,7 +380,6 @@ function makePipelineFingerprint(inputPath, inputStat, args) {
     leafLimit: args.leafLimit,
     samplingRatePerLevel: args.samplingRatePerLevel,
     sampleMode: args.sampleMode,
-    plyBuildMode: args.plyBuildMode,
     tilingMode: args.tilingMode,
     subtreeLevels: args.subtreeLevels,
     minGeometricError: args.minGeometricError,
@@ -407,7 +411,11 @@ async function readPipelineState(tempDir) {
     return null;
   }
   const text = await fs.promises.readFile(statePath, 'utf8');
-  return JSON.parse(text);
+  const state = JSON.parse(text);
+  if (state && state.stage === 'partitioned') {
+    state.stage = PIPELINE_STAGE_BUCKETED;
+  }
+  return state;
 }
 
 async function removeFileIfExists(filePath) {
@@ -673,12 +681,6 @@ async function forEachBucketSpecRow(fileSpec, coeffCount, onRow) {
   }
 }
 
-async function forEachBucketRow(fileSpecs, coeffCount, onRow) {
-  for (const fileSpec of fileSpecs) {
-    await forEachBucketSpecRow(fileSpec, coeffCount, onRow);
-  }
-}
-
 async function forEachBucketEntryRow(entries, coeffCount, onRow) {
   for (const entry of entries) {
     await forEachBucketSpecRow(entry, coeffCount, onRow);
@@ -686,8 +688,14 @@ async function forEachBucketEntryRow(entries, coeffCount, onRow) {
 }
 
 async function loadBucketCloudFromSpecs(fileSpecs, coeffCount) {
-  const { entries, totalRows } = await collectBucketEntries(fileSpecs, coeffCount);
-  ensure(totalRows > 0, 'Cannot load an empty Gaussian cloud from bucket files.');
+  const { entries, totalRows } = await collectBucketEntries(
+    fileSpecs,
+    coeffCount,
+  );
+  ensure(
+    totalRows > 0,
+    'Cannot load an empty Gaussian cloud from bucket files.',
+  );
 
   const coeffStride = coeffCount * 3;
   const positions = new Float32Array(totalRows * 3);
@@ -746,7 +754,11 @@ async function writeCanonicalCloudFile(filePath, cloud) {
     for (let rowBase = 0; rowBase < cloud.length; rowBase += rowsPerChunk) {
       const rowCount = Math.min(rowsPerChunk, cloud.length - rowBase);
       const chunk = Buffer.allocUnsafe(rowCount * rowByteSize);
-      const view = new DataView(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+      const view = new DataView(
+        chunk.buffer,
+        chunk.byteOffset,
+        chunk.byteLength,
+      );
       for (let i = 0; i < rowCount; i++) {
         const rowIndex = rowBase + i;
         const base = i * rowByteSize;
@@ -828,15 +840,6 @@ function covarianceComponentsFromScratch(scaleLogIn, quatIn, out) {
   out[4] = r01 * r02 * s2x + r11 * r12 * s2y + r21 * r22 * s2z;
   out[5] = r02 * r02 * s2x + r12 * r12 * s2y + r22 * r22 * s2z;
   return out;
-}
-
-function threeSigmaDiagonalRadiusFromScratch(scaleLogIn, quatIn) {
-  const cov = new Float64Array(6);
-  covarianceComponentsFromScratch(scaleLogIn, quatIn, cov);
-  const ex = 3.0 * Math.sqrt(Math.max(cov[0], 1e-20));
-  const ey = 3.0 * Math.sqrt(Math.max(cov[3], 1e-20));
-  const ez = 3.0 * Math.sqrt(Math.max(cov[5], 1e-20));
-  return Math.sqrt(ex * ex + ey * ey + ez * ez);
 }
 
 function quaternionFromRotationMatrix(
@@ -993,7 +996,11 @@ function covarianceToScaleQuat(
   const dot01 = rot[0] * rot[1] + rot[3] * rot[4] + rot[6] * rot[7];
   const dot02 = rot[0] * rot[2] + rot[3] * rot[5] + rot[6] * rot[8];
   const dot12 = rot[1] * rot[2] + rot[4] * rot[5] + rot[7] * rot[8];
-  if (Math.abs(dot01) > 1e-10 || Math.abs(dot02) > 1e-10 || Math.abs(dot12) > 1e-10) {
+  if (
+    Math.abs(dot01) > 1e-10 ||
+    Math.abs(dot02) > 1e-10 ||
+    Math.abs(dot12) > 1e-10
+  ) {
     const c0x = rot[0];
     const c0y = rot[3];
     const c0z = rot[6];
@@ -1054,59 +1061,6 @@ function mergeAggregationWeight(opacity, radius, voxelDiag) {
   const alpha = Math.max(opacity, 1e-4);
   const radiusNorm = Math.max(radius / Math.max(voxelDiag, 1e-6), 0.35);
   return alpha * Math.sqrt(radiusNorm);
-}
-
-function makeVoxelGridParams(bounds, dims) {
-  const ext = bounds.extents().map((v) => Math.max(v, 1e-6));
-  const d0 = Math.max(1, dims[0]);
-  const d1 = Math.max(1, dims[1]);
-  const d2 = Math.max(1, dims[2]);
-  const voxelSize0 = ext[0] / d0;
-  const voxelSize1 = ext[1] / d1;
-  const voxelSize2 = ext[2] / d2;
-  return {
-    mins: bounds.minimum,
-    invExt0: 1.0 / ext[0],
-    invExt1: 1.0 / ext[1],
-    invExt2: 1.0 / ext[2],
-    d0,
-    d1,
-    d2,
-    d0m1: d0 - 1,
-    d1m1: d1 - 1,
-    d2m1: d2 - 1,
-    voxelDiagSq:
-      voxelSize0 * voxelSize0 +
-      voxelSize1 * voxelSize1 +
-      voxelSize2 * voxelSize2,
-    voxelDiag: Math.max(
-      Math.sqrt(
-        voxelSize0 * voxelSize0 +
-          voxelSize1 * voxelSize1 +
-          voxelSize2 * voxelSize2,
-      ),
-      1e-6,
-    ),
-  };
-}
-
-function voxelFlatForGridParams(grid, x, y, z) {
-  const uvw0 = Math.max(
-    0.0,
-    Math.min(0.999999, (x - grid.mins[0]) * grid.invExt0),
-  );
-  const uvw1 = Math.max(
-    0.0,
-    Math.min(0.999999, (y - grid.mins[1]) * grid.invExt1),
-  );
-  const uvw2 = Math.max(
-    0.0,
-    Math.min(0.999999, (z - grid.mins[2]) * grid.invExt2),
-  );
-  const iIdx = Math.min(grid.d0m1, Math.floor(uvw0 * grid.d0));
-  const jIdx = Math.min(grid.d1m1, Math.floor(uvw1 * grid.d1));
-  const kIdx = Math.min(grid.d2m1, Math.floor(uvw2 * grid.d2));
-  return iIdx + grid.d0 * (jIdx + grid.d1 * kIdx);
 }
 
 function writeScratchRowToArrays(
@@ -1173,687 +1127,6 @@ function copySlotArrays(
   }
 }
 
-function makeRepresentativeStats(groupCount, radiusBias) {
-  const fallbackRadius = new Float64Array(groupCount);
-  fallbackRadius.fill(radiusBias >= 0.0 ? Infinity : -Infinity);
-  const fallbackWeight = new Float64Array(groupCount);
-  fallbackWeight.fill(-Infinity);
-  const fallbackIndex = new Int32Array(groupCount);
-  fallbackIndex.fill(-1);
-  return {
-    counts: new Uint32Array(groupCount),
-    sumW: new Float64Array(groupCount),
-    cx: new Float64Array(groupCount),
-    cy: new Float64Array(groupCount),
-    cz: new Float64Array(groupCount),
-    fallbackIndex,
-    fallbackWeight,
-    fallbackRadius,
-  };
-}
-
-function updateRepresentativeStats(
-  stats,
-  groupIndex,
-  rowIndex,
-  x,
-  y,
-  z,
-  weight,
-  radius,
-  radiusBias,
-) {
-  stats.counts[groupIndex] += 1;
-  stats.sumW[groupIndex] += weight;
-  stats.cx[groupIndex] += x * weight;
-  stats.cy[groupIndex] += y * weight;
-  stats.cz[groupIndex] += z * weight;
-  if (
-    stats.fallbackIndex[groupIndex] < 0 ||
-    weight > stats.fallbackWeight[groupIndex] + 1e-12 ||
-    (Math.abs(weight - stats.fallbackWeight[groupIndex]) <= 1e-12 &&
-      ((radiusBias >= 0.0 && radius < stats.fallbackRadius[groupIndex]) ||
-        (radiusBias < 0.0 && radius > stats.fallbackRadius[groupIndex])))
-  ) {
-    stats.fallbackIndex[groupIndex] = rowIndex;
-    stats.fallbackWeight[groupIndex] = weight;
-    stats.fallbackRadius[groupIndex] = radius;
-  }
-}
-
-function finalizeRepresentativeCentroids(stats) {
-  const groupCount = stats.counts.length;
-  const useFallback = new Uint8Array(groupCount);
-  for (let i = 0; i < groupCount; i++) {
-    if (
-      stats.counts[i] <= 1 ||
-      !Number.isFinite(stats.sumW[i]) ||
-      stats.sumW[i] <= 0.0
-    ) {
-      useFallback[i] = 1;
-      continue;
-    }
-    stats.cx[i] /= stats.sumW[i];
-    stats.cy[i] /= stats.sumW[i];
-    stats.cz[i] /= stats.sumW[i];
-  }
-  return useFallback;
-}
-
-async function scanBucketBoundsFromEntries(entries, coeffCount) {
-  const minimum = [Infinity, Infinity, Infinity];
-  const maximum = [-Infinity, -Infinity, -Infinity];
-  let count = 0;
-  await forEachBucketEntryRow(entries, coeffCount, (view, base) => {
-    const x = view.getFloat32(base + 0, true);
-    const y = view.getFloat32(base + 4, true);
-    const z = view.getFloat32(base + 8, true);
-    if (x < minimum[0]) minimum[0] = x;
-    if (y < minimum[1]) minimum[1] = y;
-    if (z < minimum[2]) minimum[2] = z;
-    if (x > maximum[0]) maximum[0] = x;
-    if (y > maximum[1]) maximum[1] = y;
-    if (z > maximum[2]) maximum[2] = z;
-    count += 1;
-  });
-  ensure(count > 0, 'Cannot simplify an empty bucket input.');
-  return new Bounds(minimum, maximum);
-}
-
-async function chooseExactStreamingGrouping(entries, coeffCount, bounds, target, voxelTarget) {
-  let dims = chooseGridDims(bounds, voxelTarget);
-  let groupKeys = [];
-  let grid = makeVoxelGridParams(bounds, dims);
-  for (let iter = 0; iter < 24; iter++) {
-    grid = makeVoxelGridParams(bounds, dims);
-    const keySet = new Set();
-    await forEachBucketEntryRow(entries, coeffCount, (view, base) => {
-      const flat = voxelFlatForGridParams(
-        grid,
-        view.getFloat32(base + 0, true),
-        view.getFloat32(base + 4, true),
-        view.getFloat32(base + 8, true),
-      );
-      keySet.add(flat);
-    });
-    groupKeys = Array.from(keySet).sort((a, b) => a - b);
-    if (
-      groupKeys.length <= target ||
-      (grid.d0 === 1 && grid.d1 === 1 && grid.d2 === 1)
-    ) {
-      break;
-    }
-    dims = [
-      Math.max(1, Math.floor(dims[0] * 0.85)),
-      Math.max(1, Math.floor(dims[1] * 0.85)),
-      Math.max(1, Math.floor(dims[2] * 0.85)),
-    ];
-  }
-  return {
-    grid,
-    groupKeys,
-    groupIndexByFlat: new Map(groupKeys.map((flat, index) => [flat, index])),
-  };
-}
-
-async function buildExactStreamingMetadata(entries, coeffCount, grouping, totalRows) {
-  const groupCount = grouping.groupKeys.length;
-  const positions = new Float32Array(totalRows * 3);
-  const radii = new Float32Array(totalRows);
-  const coarseWeights = new Float64Array(totalRows);
-  const detailWeights = new Float64Array(totalRows);
-  const groupIds = new Int32Array(totalRows);
-  const coarseStats = makeRepresentativeStats(groupCount, -0.15);
-  const detailStats = makeRepresentativeStats(groupCount, 0.15);
-  const scratch = makeRowScratch(coeffCount);
-  let rowIndex = 0;
-
-  await forEachBucketEntryRow(entries, coeffCount, (view, base, encoding) => {
-    readBucketCoreRowIntoScratch(encoding, view, base, scratch);
-    const flat = voxelFlatForGridParams(
-      grouping.grid,
-      scratch.position[0],
-      scratch.position[1],
-      scratch.position[2],
-    );
-    const groupIndex = grouping.groupIndexByFlat.get(flat);
-    ensure(
-      groupIndex != null,
-      `Failed to resolve simplify voxel group for row ${rowIndex}.`,
-    );
-
-    const base3 = rowIndex * 3;
-    const radius = threeSigmaDiagonalRadiusFromScratch(
-      scratch.scaleLog,
-      scratch.quat,
-    );
-    const alpha = Math.max(scratch.opacity, 1e-4);
-    const radiusNorm = Math.max(radius / grouping.grid.voxelDiag, 0.35);
-    const detailWeight = alpha / Math.sqrt(radiusNorm);
-    const coarseWeight = alpha * Math.sqrt(radiusNorm);
-
-    positions[base3 + 0] = scratch.position[0];
-    positions[base3 + 1] = scratch.position[1];
-    positions[base3 + 2] = scratch.position[2];
-    radii[rowIndex] = radius;
-    coarseWeights[rowIndex] = coarseWeight;
-    detailWeights[rowIndex] = detailWeight;
-    groupIds[rowIndex] = groupIndex;
-
-    updateRepresentativeStats(
-      coarseStats,
-      groupIndex,
-      rowIndex,
-      scratch.position[0],
-      scratch.position[1],
-      scratch.position[2],
-      coarseWeight,
-      radius,
-      -0.15,
-    );
-    updateRepresentativeStats(
-      detailStats,
-      groupIndex,
-      rowIndex,
-      scratch.position[0],
-      scratch.position[1],
-      scratch.position[2],
-      detailWeight,
-      radius,
-      0.15,
-    );
-    rowIndex += 1;
-  });
-
-  return {
-    positions,
-    radii,
-    coarseWeights,
-    detailWeights,
-    groupIds,
-    coarseStats,
-    detailStats,
-  };
-}
-
-function selectRepresentativeRows(
-  positions,
-  radii,
-  weights,
-  groupIds,
-  stats,
-  useFallback,
-  voxelDiagSq,
-  radiusBias,
-) {
-  const groupCount = stats.counts.length;
-  const reps = new Int32Array(groupCount);
-  reps.fill(-1);
-  const bestCost = new Float64Array(groupCount);
-  bestCost.fill(Infinity);
-  const bestWeight = new Float64Array(groupCount);
-  const bestRadius = new Float64Array(groupCount);
-
-  for (let g = 0; g < groupCount; g++) {
-    reps[g] = stats.fallbackIndex[g];
-    bestWeight[g] = stats.fallbackWeight[g];
-    bestRadius[g] = stats.fallbackRadius[g];
-  }
-
-  const invVoxelDiagSq = 1.0 / Math.max(voxelDiagSq, 1e-12);
-  const rowCount = groupIds.length;
-  for (let rowIndex = 0; rowIndex < rowCount; rowIndex++) {
-    const groupIndex = groupIds[rowIndex];
-    if (useFallback[groupIndex]) {
-      continue;
-    }
-    const base3 = rowIndex * 3;
-    const dx = positions[base3 + 0] - stats.cx[groupIndex];
-    const dy = positions[base3 + 1] - stats.cy[groupIndex];
-    const dz = positions[base3 + 2] - stats.cz[groupIndex];
-    const radius = radii[rowIndex];
-    const weight = weights[rowIndex];
-    const cost =
-      (dx * dx + dy * dy + dz * dz) * invVoxelDiagSq +
-      radiusBias * radius * radius * invVoxelDiagSq;
-    if (
-      cost < bestCost[groupIndex] - 1e-12 ||
-      (Math.abs(cost - bestCost[groupIndex]) <= 1e-12 &&
-        (weight > bestWeight[groupIndex] + 1e-12 ||
-          (Math.abs(weight - bestWeight[groupIndex]) <= 1e-12 &&
-            ((radiusBias >= 0.0 && radius < bestRadius[groupIndex]) ||
-              (radiusBias < 0.0 && radius > bestRadius[groupIndex])))))
-    ) {
-      reps[groupIndex] = rowIndex;
-      bestCost[groupIndex] = cost;
-      bestWeight[groupIndex] = weight;
-      bestRadius[groupIndex] = radius;
-    }
-  }
-  return reps;
-}
-
-function buildExcludedRepresentativeStats(
-  positions,
-  radii,
-  coarseWeights,
-  detailWeights,
-  groupIds,
-  coarseRep,
-  detailRep,
-  groupCount,
-) {
-  const extraCoarseStats = makeRepresentativeStats(groupCount, -0.15);
-  const extraDetailStats = makeRepresentativeStats(groupCount, 0.15);
-  const rowCount = groupIds.length;
-  for (let rowIndex = 0; rowIndex < rowCount; rowIndex++) {
-    const groupIndex = groupIds[rowIndex];
-    if (rowIndex === coarseRep[groupIndex] || rowIndex === detailRep[groupIndex]) {
-      continue;
-    }
-    const base3 = rowIndex * 3;
-    const x = positions[base3 + 0];
-    const y = positions[base3 + 1];
-    const z = positions[base3 + 2];
-    const radius = radii[rowIndex];
-    updateRepresentativeStats(
-      extraCoarseStats,
-      groupIndex,
-      rowIndex,
-      x,
-      y,
-      z,
-      coarseWeights[rowIndex],
-      radius,
-      -0.15,
-    );
-    updateRepresentativeStats(
-      extraDetailStats,
-      groupIndex,
-      rowIndex,
-      x,
-      y,
-      z,
-      detailWeights[rowIndex],
-      radius,
-      0.15,
-    );
-  }
-  return {
-    extraCoarseStats,
-    extraDetailStats,
-    extraCoarseFallback: finalizeRepresentativeCentroids(extraCoarseStats),
-    extraDetailFallback: finalizeRepresentativeCentroids(extraDetailStats),
-  };
-}
-
-function buildExactStreamingSelection(meta, target, voxelDiag, voxelDiagSq) {
-  const groupCount = meta.coarseStats.counts.length;
-  const coarseUseFallback = finalizeRepresentativeCentroids(meta.coarseStats);
-  const detailUseFallback = finalizeRepresentativeCentroids(meta.detailStats);
-  const coarseRep = selectRepresentativeRows(
-    meta.positions,
-    meta.radii,
-    meta.coarseWeights,
-    meta.groupIds,
-    meta.coarseStats,
-    coarseUseFallback,
-    voxelDiagSq,
-    -0.15,
-  );
-  const detailRep = selectRepresentativeRows(
-    meta.positions,
-    meta.radii,
-    meta.detailWeights,
-    meta.groupIds,
-    meta.detailStats,
-    detailUseFallback,
-    voxelDiagSq,
-    0.15,
-  );
-  const excluded = buildExcludedRepresentativeStats(
-    meta.positions,
-    meta.radii,
-    meta.coarseWeights,
-    meta.detailWeights,
-    meta.groupIds,
-    coarseRep,
-    detailRep,
-    groupCount,
-  );
-  const extraCoarseRep = selectRepresentativeRows(
-    meta.positions,
-    meta.radii,
-    meta.coarseWeights,
-    meta.groupIds,
-    excluded.extraCoarseStats,
-    excluded.extraCoarseFallback,
-    voxelDiagSq,
-    -0.15,
-  );
-  const extraDetailRep = selectRepresentativeRows(
-    meta.positions,
-    meta.radii,
-    meta.detailWeights,
-    meta.groupIds,
-    excluded.extraDetailStats,
-    excluded.extraDetailFallback,
-    voxelDiagSq,
-    0.15,
-  );
-
-  const selected = [];
-  const selectedSlotByOrig = new Int32Array(meta.groupIds.length);
-  selectedSlotByOrig.fill(-1);
-  const taken = new Uint8Array(meta.groupIds.length);
-  const secondaryCandidates = [];
-  const tertiaryDetailCandidates = [];
-  const tertiaryCoarseCandidates = [];
-  let coarseSelectedCount = 0;
-  let detailSelectedCount = 0;
-
-  for (let groupIndex = 0; groupIndex < groupCount; groupIndex++) {
-    const coarse = coarseRep[groupIndex];
-    ensure(coarse >= 0, `Missing coarse representative for group ${groupIndex}.`);
-    const coarseSlot = selected.length;
-    selected.push(coarse);
-    selectedSlotByOrig[coarse] = coarseSlot;
-    taken[coarse] = 1;
-    coarseSelectedCount += 1;
-
-    const detail = detailRep[groupIndex];
-    if (detail >= 0 && detail !== coarse) {
-      const coarseBase3 = coarse * 3;
-      const detailBase3 = detail * 3;
-      const dx = meta.positions[detailBase3 + 0] - meta.positions[coarseBase3 + 0];
-      const dy = meta.positions[detailBase3 + 1] - meta.positions[coarseBase3 + 1];
-      const dz = meta.positions[detailBase3 + 2] - meta.positions[coarseBase3 + 2];
-      const sepNorm = Math.sqrt(dx * dx + dy * dy + dz * dz) / voxelDiag;
-      const radiusRatio =
-        Math.max(meta.radii[coarse], 1e-6) / Math.max(meta.radii[detail], 1e-6);
-      secondaryCandidates.push({
-        rep: detail,
-        priority:
-          meta.detailWeights[detail] *
-          (1.0 + sepNorm) *
-          (1.0 + Math.max(0.0, Math.log2(Math.max(radiusRatio, 1.0)))),
-      });
-    }
-
-    const extraCoarse = extraCoarseRep[groupIndex];
-    if (extraCoarse >= 0) {
-      tertiaryCoarseCandidates.push({
-        rep: extraCoarse,
-        priority: meta.coarseWeights[extraCoarse],
-      });
-    }
-
-    const extraDetail = extraDetailRep[groupIndex];
-    if (extraDetail >= 0) {
-      tertiaryDetailCandidates.push({
-        rep: extraDetail,
-        priority: meta.detailWeights[extraDetail],
-      });
-    }
-  }
-
-  if (selected.length < target && secondaryCandidates.length > 0) {
-    secondaryCandidates.sort((a, b) => {
-      if (b.priority !== a.priority) {
-        return b.priority - a.priority;
-      }
-      return a.rep - b.rep;
-    });
-    for (
-      let i = 0;
-      i < secondaryCandidates.length && selected.length < target;
-      i++
-    ) {
-      const rep = secondaryCandidates[i].rep;
-      if (taken[rep]) {
-        continue;
-      }
-      selectedSlotByOrig[rep] = selected.length;
-      selected.push(rep);
-      taken[rep] = 1;
-      detailSelectedCount += 1;
-    }
-  }
-
-  if (selected.length < target) {
-    tertiaryDetailCandidates.sort((a, b) => {
-      if (b.priority !== a.priority) {
-        return b.priority - a.priority;
-      }
-      return a.rep - b.rep;
-    });
-    tertiaryCoarseCandidates.sort((a, b) => {
-      if (b.priority !== a.priority) {
-        return b.priority - a.priority;
-      }
-      return a.rep - b.rep;
-    });
-
-    let detailCursor = 0;
-    let coarseCursor = 0;
-    while (
-      selected.length < target &&
-      (detailCursor < tertiaryDetailCandidates.length ||
-        coarseCursor < tertiaryCoarseCandidates.length)
-    ) {
-      const preferDetail = detailSelectedCount <= coarseSelectedCount;
-      let picked = false;
-
-      if (preferDetail) {
-        while (detailCursor < tertiaryDetailCandidates.length) {
-          const rep = tertiaryDetailCandidates[detailCursor++].rep;
-          if (taken[rep]) {
-            continue;
-          }
-          selectedSlotByOrig[rep] = selected.length;
-          selected.push(rep);
-          taken[rep] = 1;
-          detailSelectedCount += 1;
-          picked = true;
-          break;
-        }
-      } else {
-        while (coarseCursor < tertiaryCoarseCandidates.length) {
-          const rep = tertiaryCoarseCandidates[coarseCursor++].rep;
-          if (taken[rep]) {
-            continue;
-          }
-          selectedSlotByOrig[rep] = selected.length;
-          selected.push(rep);
-          taken[rep] = 1;
-          coarseSelectedCount += 1;
-          picked = true;
-          break;
-        }
-      }
-
-      if (picked) {
-        continue;
-      }
-
-      while (detailCursor < tertiaryDetailCandidates.length) {
-        const rep = tertiaryDetailCandidates[detailCursor++].rep;
-        if (taken[rep]) {
-          continue;
-        }
-        selectedSlotByOrig[rep] = selected.length;
-        selected.push(rep);
-        taken[rep] = 1;
-        detailSelectedCount += 1;
-        picked = true;
-        break;
-      }
-      if (picked || selected.length >= target) {
-        continue;
-      }
-
-      while (coarseCursor < tertiaryCoarseCandidates.length) {
-        const rep = tertiaryCoarseCandidates[coarseCursor++].rep;
-        if (taken[rep]) {
-          continue;
-        }
-        selectedSlotByOrig[rep] = selected.length;
-        selected.push(rep);
-        taken[rep] = 1;
-        coarseSelectedCount += 1;
-        picked = true;
-        break;
-      }
-      if (!picked) {
-        break;
-      }
-    }
-  }
-
-  if (selected.length < target) {
-    const remain = [];
-    for (let i = 0; i < taken.length; i++) {
-      if (!taken[i]) {
-        remain.push(i);
-      }
-    }
-    const remainDetail = remain.slice().sort((a, b) => {
-      const w = meta.detailWeights[b] - meta.detailWeights[a];
-      if (w !== 0) return w;
-      const r = meta.radii[a] - meta.radii[b];
-      return r !== 0 ? r : b - a;
-    });
-    const remainCoarse = remain.slice().sort((a, b) => {
-      const w = meta.coarseWeights[b] - meta.coarseWeights[a];
-      if (w !== 0) return w;
-      const r = meta.radii[b] - meta.radii[a];
-      return r !== 0 ? r : b - a;
-    });
-
-    let detailCursor = 0;
-    let coarseCursor = 0;
-    while (
-      selected.length < target &&
-      (detailCursor < remainDetail.length || coarseCursor < remainCoarse.length)
-    ) {
-      const preferDetail = detailSelectedCount <= coarseSelectedCount;
-      let picked = false;
-
-      if (preferDetail) {
-        while (detailCursor < remainDetail.length) {
-          const rep = remainDetail[detailCursor++];
-          if (taken[rep]) {
-            continue;
-          }
-          selectedSlotByOrig[rep] = selected.length;
-          selected.push(rep);
-          taken[rep] = 1;
-          detailSelectedCount += 1;
-          picked = true;
-          break;
-        }
-      } else {
-        while (coarseCursor < remainCoarse.length) {
-          const rep = remainCoarse[coarseCursor++];
-          if (taken[rep]) {
-            continue;
-          }
-          selectedSlotByOrig[rep] = selected.length;
-          selected.push(rep);
-          taken[rep] = 1;
-          coarseSelectedCount += 1;
-          picked = true;
-          break;
-        }
-      }
-
-      if (picked) {
-        continue;
-      }
-
-      while (detailCursor < remainDetail.length) {
-        const rep = remainDetail[detailCursor++];
-        if (taken[rep]) {
-          continue;
-        }
-        selectedSlotByOrig[rep] = selected.length;
-        selected.push(rep);
-        taken[rep] = 1;
-        detailSelectedCount += 1;
-        picked = true;
-        break;
-      }
-      if (picked || selected.length >= target) {
-        continue;
-      }
-
-      while (coarseCursor < remainCoarse.length) {
-        const rep = remainCoarse[coarseCursor++];
-        if (taken[rep]) {
-          continue;
-        }
-        selectedSlotByOrig[rep] = selected.length;
-        selected.push(rep);
-        taken[rep] = 1;
-        coarseSelectedCount += 1;
-        picked = true;
-        break;
-      }
-      if (!picked) {
-        break;
-      }
-    }
-  }
-
-  return {
-    selected,
-    selectedSlotByOrig,
-  };
-}
-
-function assignExactStreamingSelection(meta, selected) {
-  const groupCount = meta.coarseStats.counts.length;
-  const keptRadius = new Float32Array(selected.length);
-  const groupSlots = Array.from({ length: groupCount }, () => []);
-  for (let slot = 0; slot < selected.length; slot++) {
-    const rep = selected[slot];
-    keptRadius[slot] = meta.radii[rep];
-    groupSlots[meta.groupIds[rep]].push(slot);
-  }
-
-  const assignment = new Int32Array(meta.groupIds.length);
-  for (let rowIndex = 0; rowIndex < meta.groupIds.length; rowIndex++) {
-    const slots = groupSlots[meta.groupIds[rowIndex]];
-    ensure(slots.length > 0, `Missing selected representatives for row ${rowIndex}.`);
-    if (slots.length === 1) {
-      assignment[rowIndex] = slots[0];
-      continue;
-    }
-    const base3 = rowIndex * 3;
-    let bestSlot = slots[0];
-    let bestScore = Infinity;
-    for (let i = 0; i < slots.length; i++) {
-      const slot = slots[i];
-      const rep = selected[slot];
-      const repBase3 = rep * 3;
-      const dx = meta.positions[base3 + 0] - meta.positions[repBase3 + 0];
-      const dy = meta.positions[base3 + 1] - meta.positions[repBase3 + 1];
-      const dz = meta.positions[base3 + 2] - meta.positions[repBase3 + 2];
-      const score = Math.sqrt(dx * dx + dy * dy + dz * dz) + keptRadius[slot];
-      if (score < bestScore) {
-        bestScore = score;
-        bestSlot = slot;
-      }
-    }
-    assignment[rowIndex] = bestSlot;
-  }
-
-  return {
-    assignment,
-    keptRadius,
-  };
-}
-
 async function gatherSelectedBucketRowsToCloud(
   entries,
   coeffCount,
@@ -1904,7 +1177,10 @@ async function loadBucketSimplifyCoreFromEntries(entries, coeffCount) {
   for (const entry of entries) {
     totalRows += entry.rowCount || 0;
   }
-  ensure(totalRows > 0, 'Cannot load an empty simplify input from bucket files.');
+  ensure(
+    totalRows > 0,
+    'Cannot load an empty simplify input from bucket files.',
+  );
 
   const positions = new Float32Array(totalRows * 3);
   const scaleLog = new Float32Array(totalRows * 3);
@@ -2215,7 +1491,10 @@ async function streamSimplifyBucketFilesExact(
   bounds,
   sampleMode,
 ) {
-  const { entries, totalRows } = await collectBucketEntries(fileSpecs, coeffCount);
+  const { entries, totalRows } = await collectBucketEntries(
+    fileSpecs,
+    coeffCount,
+  );
   ensure(totalRows > 0, 'Cannot simplify an empty bucket input.');
   const target = normalizeSplatTargetCount(targetCount, totalRows);
   if (totalRows <= target) {
@@ -2225,13 +1504,16 @@ async function streamSimplifyBucketFilesExact(
     };
   }
 
-  const lightCloud = await loadBucketSimplifyCoreFromEntries(entries, coeffCount);
+  const lightCloud = await loadBucketSimplifyCoreFromEntries(
+    entries,
+    coeffCount,
+  );
   const activeBounds = bounds || computeBounds(lightCloud);
   const plan = planSimplifyCloudVoxel(
     lightCloud,
     target,
     activeBounds,
-    defaultVoxelTargetCount(target, totalRows),
+    normalizeSplatTargetCount(target, totalRows),
   );
   const selectedSlotByOrig = new Int32Array(totalRows);
   selectedSlotByOrig.fill(-1);
@@ -2364,7 +1646,14 @@ async function scanGlobalBounds(handle, filePath, header, layout) {
   return new Bounds(minimum, maximum);
 }
 
-async function buildCountsTable(handle, filePath, header, layout, rootBounds, maxDepth) {
+async function buildCountsTable(
+  handle,
+  filePath,
+  header,
+  layout,
+  rootBounds,
+  maxDepth,
+) {
   const counts = new Map();
   const increment = (level, x, y, z) => {
     const key = makeNodeKey(level, x, y, z);
@@ -2412,19 +1701,6 @@ async function buildCountsTable(handle, filePath, header, layout, rootBounds, ma
   return counts;
 }
 
-function flattenFileSpecLists(fileSpecLists) {
-  const out = [];
-  for (const list of fileSpecLists) {
-    if (!list || list.length === 0) {
-      continue;
-    }
-    for (let i = 0; i < list.length; i++) {
-      out.push(list[i]);
-    }
-  }
-  return out;
-}
-
 async function isPartitionedNodeComplete(node, ctx) {
   if (node.buildState !== 'completed' || !node.contentUri) {
     return false;
@@ -2470,7 +1746,7 @@ async function processPartitionedLeafNode(node, ctx) {
     },
   );
   node.buildState = 'completed';
-  await enqueuePipelineStateSave(ctx, 'partitioned');
+  await enqueuePipelineStateSave(ctx, PIPELINE_STAGE_BUCKETED);
 }
 
 async function processPartitionedInternalNode(node, ctx) {
@@ -2485,18 +1761,15 @@ async function processPartitionedInternalNode(node, ctx) {
     inputSpecs,
     ctx.layout.coeffCount,
   );
-  const contentTarget = resolveNodeContentTarget(
-    node,
-    ctx,
-    totalRows,
-  );
-  const { cloud: contentCloud, ownError } = await streamSimplifyBucketFilesExact(
-    entries,
-    ctx.layout.coeffCount,
-    contentTarget,
-    node.bounds,
-    ctx.params.sampleMode,
-  );
+  const contentTarget = resolveNodeContentTarget(node, ctx, totalRows);
+  const { cloud: contentCloud, ownError } =
+    await streamSimplifyBucketFilesExact(
+      entries,
+      ctx.layout.coeffCount,
+      contentTarget,
+      node.bounds,
+      ctx.params.sampleMode,
+    );
   if (node.depth > 0) {
     node.handoffPath = canonicalNodePath(ctx.tempDir, HANDOFF_BUCKET_DIR, node);
     await writeCanonicalCloudFile(node.handoffPath, contentCloud);
@@ -2506,8 +1779,7 @@ async function processPartitionedInternalNode(node, ctx) {
     node.handoffConsumed = true;
   }
 
-  node.ownError =
-    Number.isFinite(ownError) && ownError > 0.0 ? ownError : 0.0;
+  node.ownError = Number.isFinite(ownError) && ownError > 0.0 ? ownError : 0.0;
   node.contentUri = await writeContentFile(
     ctx.params,
     contentCloud,
@@ -2523,7 +1795,7 @@ async function processPartitionedInternalNode(node, ctx) {
   for (const child of node.children) {
     child.handoffConsumed = true;
   }
-  await enqueuePipelineStateSave(ctx, 'partitioned');
+  await enqueuePipelineStateSave(ctx, PIPELINE_STAGE_BUCKETED);
 
   for (const child of node.children) {
     await removeFileIfExists(child.handoffPath);
@@ -2534,7 +1806,10 @@ async function runWithConcurrency(items, limit, onItem) {
   if (!items || items.length === 0) {
     return;
   }
-  const concurrency = Math.max(1, Math.min(items.length, Math.floor(limit || 1)));
+  const concurrency = Math.max(
+    1,
+    Math.min(items.length, Math.floor(limit || 1)),
+  );
   let cursor = 0;
   const workers = Array.from({ length: concurrency }, async () => {
     while (true) {
@@ -2553,11 +1828,8 @@ function tickBuildProgress(ctx, node, status) {
     return;
   }
   const kind = node.leaf ? 'leaf' : 'internal';
-  const prefix = ctx.params && ctx.params.plyBuildMode
-    ? `${ctx.params.plyBuildMode}`
-    : 'build';
   const suffix = status ? ` ${status}` : '';
-  ctx.buildProgress.tick(`${prefix} level=${node.level} ${kind}${suffix}`);
+  ctx.buildProgress.tick(`level=${node.level} ${kind}${suffix}`);
 }
 
 async function buildPartitionedBottomUp(rootNode, ctx) {
@@ -2580,61 +1852,6 @@ async function buildPartitionedBottomUp(rootNode, ctx) {
   await enqueuePipelineStateSave(ctx, 'built');
 }
 
-async function processNodeBottomUpEntire(node, ctx) {
-  if (node.leaf) {
-    ensure(!!node.bucketPath, `Missing leaf bucket path for node ${node.key}.`);
-    const cloud = await loadBucketCloudFromSpecs(
-      [leafBucketSpec(node)],
-      ctx.layout.coeffCount,
-    );
-    node.contentUri = await writeContentFile(
-      ctx.params,
-      cloud,
-      node.level,
-      node.x,
-      node.y,
-      node.z,
-      { transferOwnership: true },
-    );
-    node.ownError = 0.0;
-    node.buildState = 'completed';
-    tickBuildProgress(ctx, node);
-    return [leafBucketSpec(node)];
-  }
-
-  const childLeafSpecs = [];
-  for (const child of node.children) {
-    childLeafSpecs.push(await processNodeBottomUpEntire(child, ctx));
-  }
-
-  const inputSpecs = flattenFileSpecLists(childLeafSpecs);
-  const { totalRows } = await collectBucketEntries(
-    inputSpecs,
-    ctx.layout.coeffCount,
-  );
-  const targetCount = resolveNodeContentTarget(node, ctx, totalRows);
-  const { cloud: lodCloud, ownError } = await streamSimplifyBucketFilesExact(
-    inputSpecs,
-    ctx.layout.coeffCount,
-    targetCount,
-    node.bounds,
-    ctx.params.sampleMode,
-  );
-  node.ownError = ownError;
-  node.contentUri = await writeContentFile(
-    ctx.params,
-    lodCloud,
-    node.level,
-    node.x,
-    node.y,
-    node.z,
-    { transferOwnership: true },
-  );
-  node.buildState = 'completed';
-  tickBuildProgress(ctx, node);
-  return inputSpecs;
-}
-
 function resolveRootGeometricError(rootNode, rootBounds, params, lodMaxDepth) {
   if (params.minGeometricError != null && params.minGeometricError > 0.0) {
     return {
@@ -2652,19 +1869,13 @@ function resolveRootGeometricError(rootNode, rootBounds, params, lodMaxDepth) {
     const diag = Math.sqrt(ex[0] * ex[0] + ex[1] * ex[1] + ex[2] * ex[2]);
     return {
       value: Math.max(rootNode.ownError, diag * 1e-6, 1e-6),
-      source:
-        params.plyBuildMode === 'entire'
-          ? 'estimated_root_entire_simplify'
-          : 'estimated_root_partitioned_simplify',
+      source: 'estimated_root_simplify',
     };
   }
 
   return {
     value: fallbackRootGeometricError(rootBounds, rootNode.count),
-    source:
-      params.plyBuildMode === 'entire'
-        ? 'estimated_root_entire_fallback'
-        : 'estimated_root_partitioned_fallback',
+    source: 'estimated_root_fallback',
   };
 }
 
@@ -2792,8 +2003,7 @@ function makeBuildSummary(
   return {
     input_splats: header.vertexCount,
     sh_degree: layout.degree,
-    ply_build_mode: args.plyBuildMode,
-    partitioned_handoff_encoding: HANDOFF_BUCKET_ENCODING,
+    handoff_encoding: HANDOFF_BUCKET_ENCODING,
     checkpoint_reused: !!checkpointInfo.reused,
     checkpoint_reused_stage: checkpointInfo.stage,
     max_depth: args.maxDepth,
@@ -2860,7 +2070,6 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
     colorSpace: args.colorSpace,
     samplingRatePerLevel: args.samplingRatePerLevel,
     sampleMode: args.sampleMode,
-    plyBuildMode: args.plyBuildMode,
     spzSh1Bits: args.spzSh1Bits,
     spzShRestBits: args.spzShRestBits,
     minGeometricError: args.minGeometricError,
@@ -2894,9 +2103,7 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
         reused: true,
         stage: pipelineState.stage || 'init',
       };
-      console.log(
-        `[info] reusing partitioned checkpoint | stage=${checkpointInfo.stage}`,
-      );
+      console.log(`[info] reusing checkpoint | stage=${checkpointInfo.stage}`);
     } else {
       pipelineState = null;
     }
@@ -2937,7 +2144,7 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
 
     if (!rootBounds || !rootNodeMeta) {
       console.log(
-        `[info] scan 1/3 | vertices=${header.vertexCount} | sh_degree=${layout.degree} | ply_build_mode=${args.plyBuildMode}`,
+        `[info] scan 1/3 | vertices=${header.vertexCount} | sh_degree=${layout.degree}`,
       );
       rootBounds = await scanGlobalBounds(handle, inputPath, header, layout);
 
@@ -2978,7 +2185,10 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
     }
 
     const treeStats = collectTreeStats(rootNodeMeta);
-    const lodMaxDepth = Math.max(0, Math.min(args.maxDepth, treeStats.maxLevel));
+    const lodMaxDepth = Math.max(
+      0,
+      Math.min(args.maxDepth, treeStats.maxLevel),
+    );
 
     const canReuseLeafBuckets =
       pipelineState.stage !== 'init' &&
@@ -2994,7 +2204,7 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
         force: true,
       });
       console.log(
-        `[info] scan 3/3 | partitioning ${treeStats.leaves.length} leaf buckets`,
+        `[info] scan 3/3 | writing ${treeStats.leaves.length} leaf buckets`,
       );
       await partitionLeafBuckets(
         handle,
@@ -3005,7 +2215,7 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
         tempDir,
       );
       pipelineState.rootNode = serializeNodeMeta(rootNodeMeta);
-      pipelineState.stage = 'partitioned';
+      pipelineState.stage = PIPELINE_STAGE_BUCKETED;
       pipelineState.updatedAt = new Date().toISOString();
       await fs.promises.writeFile(
         path.join(tempDir, PIPELINE_STATE_FILE),
@@ -3032,10 +2242,7 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
       lodMaxDepth,
       params,
       tempDir,
-      nodeConcurrency:
-        args.plyBuildMode === 'partitioned'
-          ? Math.max(1, args.buildConcurrency || 1)
-          : 1,
+      nodeConcurrency: Math.max(1, args.buildConcurrency || 1),
       pipelineState,
       rootBounds,
       rootNode: rootNodeMeta,
@@ -3048,13 +2255,9 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
     ctx.pipelineState = stateCtx.pipelineState;
 
     console.log('[info] building tiles bottom-up');
-    if (args.plyBuildMode === 'partitioned') {
-      await buildPartitionedBottomUp(rootNodeMeta, ctx);
-    } else {
-      await processNodeBottomUpEntire(rootNodeMeta, ctx);
-    }
+    await buildPartitionedBottomUp(rootNodeMeta, ctx);
     ctx.buildProgress.done(
-      `${args.plyBuildMode} nodes=${treeStats.nodes.length} levels=${treeStats.maxLevel + 1}`,
+      `nodes=${treeStats.nodes.length} levels=${treeStats.maxLevel + 1}`,
     );
     await ctx.savePromise;
 
@@ -3153,20 +2356,16 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
   } finally {
     try {
       await handle.close();
-    } catch {
-      // ignore close races
-    }
+    } catch {}
     if (params.contentWorkerPool) {
       await params.contentWorkerPool.close();
     }
     if (success) {
       try {
         await fs.promises.rm(tempDir, { recursive: true, force: true });
-      } catch {
-        // Best-effort cleanup only.
-      }
+      } catch {}
     } else {
-      console.error(`[info] checkpoint preserved: ${tempDir}`);
+      console.error('[info] checkpoint preserved in output temp workspace');
     }
   }
 }

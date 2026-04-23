@@ -6,6 +6,20 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+### Added
+
+- Added a temp-file-backed large-PLY conversion pipeline that streams binary or ASCII PLY input into leaf buckets, builds parent LODs from handoff data, and can resume from a preserved temp workspace when rerun without `--clean`.
+- Added `buildConcurrency` / `--build-concurrency` to bound per-level bottom-up tile builds in the temp-file-backed pipeline.
+- Added `handoff_encoding`, `build_concurrency`, `checkpoint_reused`, and `checkpoint_reused_stage` metadata to generated `build_summary.json` files.
+
+### Changed
+
+- Updated voxel simplification so retained splat targets also drive voxel grouping and representative selection stays coarse-biased across sampling paths, replacing the earlier expanded/detail-first merge planning.
+
+### Removed
+
+- Reduced the published package surface to the supported `convert` entry point only, removing package-root re-exports such as `convertPlyTo3DTiles`, `convertCloud`, `parseCommonGaussianPly`, `makeConversionArgs`, and `run`, plus the package `./cli` export.
+
 ## [0.1.6] - 2026-04-19
 
 ### Added

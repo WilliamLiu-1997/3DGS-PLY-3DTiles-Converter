@@ -7,9 +7,6 @@ const { isMainThread, parentPort } = require('worker_threads');
 const {
   ConversionError,
   GaussianCloud,
-  Bounds,
-  TileNode,
-  parseCommonGaussianPly,
   makeSelfTestCloud,
   writeGraphdecoLikePly,
 } = require('./parser');
@@ -22,8 +19,6 @@ const {
   usage,
   parseArgs,
   makeConversionArgs,
-  normalizeToInt,
-  normalizeToFloat,
 } = require('./args');
 
 const {
@@ -186,19 +181,6 @@ if (require.main === module && isMainThread) {
 }
 
 module.exports = {
-  ConversionError,
-  GaussianCloud,
-  Bounds,
-  TileNode,
-  GltfBuilder,
-  parseCommonGaussianPly,
-  makeSelfTestCloud,
-  writeGraphdecoLikePly,
-  parseArgs,
-  usage,
   main,
-  makeConversionArgs,
   convertPlyTo3DTiles,
-  normalizeToInt,
-  normalizeToFloat,
 };

@@ -213,46 +213,6 @@ class TileNode {
   }
 }
 
-function serializeBounds(bounds) {
-  return {
-    minimum: [bounds.minimum[0], bounds.minimum[1], bounds.minimum[2]],
-    maximum: [bounds.maximum[0], bounds.maximum[1], bounds.maximum[2]],
-  };
-}
-
-function deserializeBounds(serialized) {
-  return new Bounds(
-    [serialized.minimum[0], serialized.minimum[1], serialized.minimum[2]],
-    [serialized.maximum[0], serialized.maximum[1], serialized.maximum[2]],
-  );
-}
-
-function serializeTileNode(node) {
-  return {
-    level: node.level,
-    x: node.x,
-    y: node.y,
-    z: node.z,
-    bounds: serializeBounds(node.bounds),
-    error: node.error,
-    contentUri: node.contentUri,
-    children: node.children.map((child) => serializeTileNode(child)),
-  };
-}
-
-function deserializeTileNode(serialized) {
-  return new TileNode(
-    serialized.level,
-    serialized.x,
-    serialized.y,
-    serialized.z,
-    deserializeBounds(serialized.bounds),
-    serialized.error,
-    serialized.contentUri,
-    serialized.children.map((child) => deserializeTileNode(child)),
-  );
-}
-
 function findLineEnd(buffer, start) {
   for (let i = start; i < buffer.length; i++) {
     if (buffer[i] === 0x0a || buffer[i] === 0x0d) {
@@ -437,37 +397,6 @@ function readPlyScalar(view, offset, typeInfo) {
     return view.getFloat64(offset, true);
   }
   throw new ConversionError(`Unsupported binary reader view: ${typeInfo.view}`);
-}
-
-function writeNormalizedQuaternion(out, outOff, inputConvention, r0, r1, r2, r3) {
-  let x;
-  let y;
-  let z;
-  let w;
-  if (inputConvention === 'graphdeco') {
-    x = r1;
-    y = r2;
-    z = r3;
-    w = r0;
-  } else if (inputConvention === 'khr_native') {
-    x = r0;
-    y = r1;
-    z = r2;
-    w = r3;
-  } else {
-    throw new ConversionError(`Unknown input_convention: ${inputConvention}`);
-  }
-
-  let n = Math.sqrt(x * x + y * y + z * z + w * w);
-  if (n < 1e-12) {
-    n = 1.0;
-  }
-  const sign = w < 0.0 ? -1.0 : 1.0;
-  const inv = sign / n;
-  out[outOff + 0] = x * inv;
-  out[outOff + 1] = y * inv;
-  out[outOff + 2] = z * inv;
-  out[outOff + 3] = w * inv;
 }
 
 function writeNormalizedQuaternionToView(
@@ -1038,79 +967,6 @@ async function forEachGaussianPlyCanonicalRecord(
   );
 }
 
-async function parseCommonGaussianPly(
-  filePath,
-  inputConvention,
-  colorSpace,
-  linearScaleInput,
-) {
-  ensure(
-    colorSpace === 'lin_rec709_display' || colorSpace === 'srgb_rec709_display',
-    `Unsupported colorSpace: ${colorSpace}`,
-  );
-
-  const handle = await fs.promises.open(filePath, 'r');
-  try {
-    const header = await readPlyHeaderFromHandle(handle, filePath);
-    const layout = buildGaussianPlyLayout(
-      header.vertexProps,
-      filePath,
-      inputConvention,
-      linearScaleInput,
-    );
-    const n = header.vertexCount;
-    const positions = new Float32Array(n * 3);
-    const scaleLog = new Float32Array(n * 3);
-    const quats = new Float32Array(n * 4);
-    const opacity = new Float32Array(n);
-    const color0 = new Float32Array(n * 3);
-    const shCoeffs = new Float32Array(n * layout.coeffCount * 3);
-
-    await forEachGaussianPlyCanonicalRecord(
-      handle,
-      filePath,
-      header,
-      layout,
-      (rowIndex, _rowBuffer, rowView) => {
-        const base3 = rowIndex * 3;
-        const base4 = rowIndex * 4;
-        const coeffBase = rowIndex * layout.coeffCount * 3;
-        positions[base3 + 0] = rowView.getFloat32(0, true);
-        positions[base3 + 1] = rowView.getFloat32(4, true);
-        positions[base3 + 2] = rowView.getFloat32(8, true);
-        scaleLog[base3 + 0] = rowView.getFloat32(12, true);
-        scaleLog[base3 + 1] = rowView.getFloat32(16, true);
-        scaleLog[base3 + 2] = rowView.getFloat32(20, true);
-        quats[base4 + 0] = rowView.getFloat32(24, true);
-        quats[base4 + 1] = rowView.getFloat32(28, true);
-        quats[base4 + 2] = rowView.getFloat32(32, true);
-        quats[base4 + 3] = rowView.getFloat32(36, true);
-        opacity[rowIndex] = rowView.getFloat32(40, true);
-
-        for (let c = 0; c < layout.coeffCount * 3; c++) {
-          shCoeffs[coeffBase + c] = rowView.getFloat32((11 + c) * 4, true);
-        }
-        color0[base3 + 0] = clamp(shCoeffs[coeffBase + 0] * C0 + 0.5, 0.0, 1.0);
-        color0[base3 + 1] = clamp(shCoeffs[coeffBase + 1] * C0 + 0.5, 0.0, 1.0);
-        color0[base3 + 2] = clamp(shCoeffs[coeffBase + 2] * C0 + 0.5, 0.0, 1.0);
-      },
-    );
-
-    const cloud = new GaussianCloud(
-      positions,
-      scaleLog,
-      quats,
-      opacity,
-      shCoeffs,
-      color0,
-    );
-    cloud._shDegree = layout.degree;
-    return cloud;
-  } finally {
-    await handle.close();
-  }
-}
-
 function writeGraphdecoLikePly(filePath, cloud) {
   const n = cloud.length;
   const degree = cloud.shDegree;
@@ -1320,13 +1176,8 @@ module.exports = {
   roundHalfToEven,
   ensure,
   sigmoid,
-  serializeBounds,
-  deserializeBounds,
-  serializeTileNode,
-  deserializeTileNode,
   shDegreeFromCoeffCount,
   inferShDegreeFromRestCount,
-  parseCommonGaussianPly,
   makeSelfTestCloud,
   writeGraphdecoLikePly,
   _canonicalGaussianRowFloatCount: canonicalGaussianRowFloatCount,

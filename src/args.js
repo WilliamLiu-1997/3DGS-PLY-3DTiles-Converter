@@ -25,7 +25,6 @@ function usage() {
     '  --coordinate <json_[lat,long,height]>',
     '  --sampling-rate-per-level <0..1]',
     '  --sample-mode <sample|merge>',
-    '  --ply-build-mode <partitioned|entire>',
     '  --build-concurrency <1+>',
     '  --content-workers <0+>',
     '  --self-test',
@@ -52,7 +51,6 @@ const DEFAULT_CONVERSION_ARGS = {
   coordinate: null,
   samplingRatePerLevel: 0.5,
   sampleMode: 'merge',
-  plyBuildMode: 'partitioned',
   buildConcurrency: 2,
   contentWorkers: 4,
   clean: false,
@@ -323,11 +321,6 @@ function validateConversionArgs(args, { requireInput = false } = {}) {
   );
   assertChoice(args.tilingMode, ['explicit', 'implicit'], '--tiling-mode');
   assertChoice(args.sampleMode, ['sample', 'merge'], '--sample-mode');
-  assertChoice(
-    args.plyBuildMode,
-    ['partitioned', 'entire'],
-    '--ply-build-mode',
-  );
   if (args.transform !== null) {
     if (!Array.isArray(args.transform) || args.transform.length !== 16) {
       throw new ConversionError(
@@ -446,11 +439,6 @@ function parseArgs(argv) {
       args.spzShRestBits = value;
       continue;
     }
-    if (token === '--source-up-axis') {
-      throw new ConversionError(
-        '--source-up-axis has been removed. The converter now always uses the built-in y normalization path.',
-      );
-    }
     if (token === '--transform') {
       args.transform = requireValue(token);
       continue;
@@ -472,10 +460,6 @@ function parseArgs(argv) {
     }
     if (token === '--sample-mode') {
       args.sampleMode = requireValue(token);
-      continue;
-    }
-    if (token === '--ply-build-mode') {
-      args.plyBuildMode = requireValue(token);
       continue;
     }
     if (token === '--build-concurrency') {
@@ -583,15 +567,6 @@ function makeConversionArgs(
   if (rawTransform != null && rawCoordinate != null) {
     throw new ConversionError(
       'Please provide either transform or coordinate, not both.',
-    );
-  }
-  if (
-    Object.prototype.hasOwnProperty.call(options, 'sourceUpAxis') ||
-    Object.prototype.hasOwnProperty.call(options, 'source-up-axis') ||
-    Object.prototype.hasOwnProperty.call(options, 'source_up_axis')
-  ) {
-    throw new ConversionError(
-      'sourceUpAxis / --source-up-axis has been removed. The converter now always uses the built-in y normalization path.',
     );
   }
 
@@ -702,12 +677,6 @@ function makeConversionArgs(
       options.sample_mode,
       DEFAULT_CONVERSION_ARGS.sampleMode,
     ),
-    plyBuildMode: firstDefined(
-      options.plyBuildMode,
-      options['ply-build-mode'],
-      options.ply_build_mode,
-      DEFAULT_CONVERSION_ARGS.plyBuildMode,
-    ),
     buildConcurrency: normalizeToInt(
       firstDefined(
         options.buildConcurrency,
@@ -747,6 +716,9 @@ function makeConversionArgs(
       DEFAULT_CONVERSION_ARGS.help,
     ),
   };
+  delete merged.sourceUpAxis;
+  delete merged['source-up-axis'];
+  delete merged.source_up_axis;
 
   merged.transform =
     merged.coordinate != null
