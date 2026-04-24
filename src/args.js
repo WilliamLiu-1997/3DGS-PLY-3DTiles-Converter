@@ -24,8 +24,7 @@ function usage() {
     '  --coordinate <json_[lat,long,height]>',
     '  --sampling-rate-per-level <0..1]',
     '  --sample-mode <sample|merge>',
-    '  --build-concurrency <1+>',
-    '  --content-workers <0+>',
+    '  --memory-budget <gb>',
     '  --open-inspector',
     '  --self-test',
     '  --self-test-count <int>',
@@ -51,8 +50,7 @@ const DEFAULT_CONVERSION_ARGS = {
   coordinate: null,
   samplingRatePerLevel: 0.5,
   sampleMode: 'merge',
-  buildConcurrency: 4,
-  contentWorkers: 4,
+  memoryBudget: 2,
   openInspector: false,
   clean: false,
   selfTest: false,
@@ -303,11 +301,8 @@ function validateConversionArgs(args, { requireInput = false } = {}) {
   if (args.samplingRatePerLevel <= 0.0 || args.samplingRatePerLevel > 1.0) {
     throw new ConversionError('--sampling-rate-per-level must be in (0, 1]');
   }
-  if (args.contentWorkers < 0) {
-    throw new ConversionError('--content-workers must be >= 0');
-  }
-  if (args.buildConcurrency < 1) {
-    throw new ConversionError('--build-concurrency must be >= 1');
+  if (!Number.isFinite(args.memoryBudget) || args.memoryBudget <= 0.0) {
+    throw new ConversionError('--memory-budget must be > 0 GB');
   }
 
   assertChoice(
@@ -463,26 +458,13 @@ function parseArgs(argv) {
       args.sampleMode = requireValue(token);
       continue;
     }
-    if (token === '--build-concurrency') {
+    if (token === '--memory-budget') {
       const raw = requireValue(token);
-      const value = Number.parseInt(raw, 10);
-      if (!Number.isInteger(value)) {
-        throw new ConversionError(
-          `Invalid integer for --build-concurrency: ${raw}`,
-        );
+      const value = Number.parseFloat(raw);
+      if (!Number.isFinite(value)) {
+        throw new ConversionError(`Invalid number for --memory-budget: ${raw}`);
       }
-      args.buildConcurrency = value;
-      continue;
-    }
-    if (token === '--content-workers') {
-      const raw = requireValue(token);
-      const value = Number.parseInt(raw, 10);
-      if (!Number.isInteger(value)) {
-        throw new ConversionError(
-          `Invalid integer for --content-workers: ${raw}`,
-        );
-      }
-      args.contentWorkers = value;
+      args.memoryBudget = value;
       continue;
     }
     if (token === '--open-inspector') {
@@ -682,23 +664,16 @@ function makeConversionArgs(
       options.sample_mode,
       DEFAULT_CONVERSION_ARGS.sampleMode,
     ),
-    buildConcurrency: normalizeToInt(
+    memoryBudget: normalizeToFloat(
       firstDefined(
-        options.buildConcurrency,
-        options['build-concurrency'],
-        options.build_concurrency,
-        DEFAULT_CONVERSION_ARGS.buildConcurrency,
+        options.memoryBudget,
+        options['memory-budget'],
+        options.memory_budget,
+        options.memoryBudgetGb,
+        options.memory_budget_gb,
+        DEFAULT_CONVERSION_ARGS.memoryBudget,
       ),
-      '--build-concurrency',
-    ),
-    contentWorkers: normalizeToInt(
-      firstDefined(
-        options.contentWorkers,
-        options['content-workers'],
-        options.content_workers,
-        DEFAULT_CONVERSION_ARGS.contentWorkers,
-      ),
-      '--content-workers',
+      '--memory-budget',
     ),
     openInspector: firstDefined(
       options.openInspector,
@@ -730,6 +705,12 @@ function makeConversionArgs(
   delete merged.sourceUpAxis;
   delete merged['source-up-axis'];
   delete merged.source_up_axis;
+  delete merged.buildConcurrency;
+  delete merged['build-concurrency'];
+  delete merged.build_concurrency;
+  delete merged.contentWorkers;
+  delete merged['content-workers'];
+  delete merged.content_workers;
 
   merged.transform =
     merged.coordinate != null

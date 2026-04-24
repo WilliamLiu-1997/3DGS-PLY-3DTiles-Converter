@@ -9,8 +9,8 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 ### Added
 
 - Added a temp-file-backed large-PLY conversion pipeline that streams binary or ASCII PLY input into leaf buckets, builds parent LODs from handoff data, and can resume from a preserved temp workspace when rerun without `--clean`.
-- Added `buildConcurrency` / `--build-concurrency` to bound per-level bottom-up tile builds in the temp-file-backed pipeline.
-- Added `handoff_encoding`, `build_concurrency`, `checkpoint_reused`, and `checkpoint_reused_stage` metadata to generated `build_summary.json` files.
+- Added `memoryBudget` / `--memory-budget` to control the partition and bottom-up build memory budget in GB and derive partition write concurrency, bottom-up build concurrency, and SPZ/GLB worker count.
+- Added `handoff_encoding`, `memory_budget_gb`, `build_concurrency`, `content_workers`, `partition_write_concurrency`, `checkpoint_reused`, and `checkpoint_reused_stage` metadata to generated `build_summary.json` files.
 
 ### Changed
 
@@ -20,13 +20,19 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 - Reduced bottom-up build overhead in the temp-file-backed pipeline by throttling checkpoint rewrites across node levels, batch-cleaning consumed handoff buckets per level, and linking leaf handoff buckets to existing leaf bucket files when possible instead of rewriting the same canonical payload.
 - Streamed unsimplified bucket-backed content directly into SPZ/GLB output with content-worker support, avoiding full `GaussianCloud` materialization when no simplification is needed.
 - Reduced large binary PLY conversion time by staging position-only scan data, using shallow typed-array count tables, tracking bucket row counts in node metadata, overlapping handoff cleanup, prefetching binary PLY chunks, and double-buffering partition write arenas.
-- Changed the default `buildConcurrency` from `2` to `4`.
-- Reduced partition write bottlenecks by increasing the partition buffer budget to 256 MB, compacting scattered rows into larger per-leaf writes, limiting active leaf file handles, and writing leaf buckets with bounded concurrency.
+- Reduced bottom-up tile build time by using the configurable memory budget, scheduling nodes by estimated memory use, lowering the SPZ worker threshold for bucket-backed content, and reusing safe node-center translations to avoid an extra bounds scan before packing GLB content.
+- Reduced internal-node bottom-up build time by moving exact bucket simplification, handoff materialization, and SPZ/GLB packing into the same budget-derived worker pool used for content generation.
+- Reduced SPZ/GLB and simplification overhead by batching GLB writes, avoiding per-row quaternion packing allocations, using a faster level-9 gzip memory setting, and reusing planning-time radius data through merge and exact own-error passes when it fits the scratch budget.
+- Reduced partition write bottlenecks by using the configurable memory budget for partition buffers, compacting scattered rows into larger per-leaf writes, limiting active leaf file handles, writing leaf buckets with bounded concurrency, and using a budgeted partition lookup table.
+- Reduced scan/count and simplify overhead by staging positions in memory when they fit the memory budget, sizing stream chunks from the budget, combining merge covariance work with the first SH merge pass, and skipping fallback row materialization when it is unnecessary.
+- Capped bottom-up node scheduling and SPZ/GLB content workers at eight workers, then derive per-worker scratch/cache and partition write concurrency from `memoryBudget`.
+- Added `memory_budget_plan`, `timings_ms`, and `peak_rss_bytes` diagnostics to generated `build_summary.json` files.
 - Added progress reporting for the large-PLY leaf bucket partitioning scan.
 
 ### Removed
 
 - Reduced the published package surface to the supported `convert` entry point only, removing package-root re-exports such as `convertPlyTo3DTiles`, `convertCloud`, `parseCommonGaussianPly`, `makeConversionArgs`, and `run`, plus the package `./cli` export.
+- Removed `buildConcurrency` / `--build-concurrency` and `contentWorkers` / `--content-workers`; conversion now derives those internal concurrency values from `memoryBudget`.
 
 ## [0.1.6] - 2026-04-19
 

@@ -24,6 +24,7 @@ const {
 const {
   convertPartitionedPlyTo3DTiles,
   _writeBucketGlbTaskOutput,
+  _writeSimplifiedBucketGlbTaskOutput,
 } = require('./partitioned-ply');
 
 async function openTilesetInspector(outputDir) {
@@ -101,6 +102,9 @@ async function runWorkerTask(task) {
   }
   if (task.kind === 'pack-bucket-spz') {
     return _writeBucketGlbTaskOutput(task);
+  }
+  if (task.kind === 'simplify-bucket-spz') {
+    return _writeSimplifiedBucketGlbTaskOutput(task);
   }
   throw new ConversionError(`Unknown worker task kind: ${task.kind}`);
 }

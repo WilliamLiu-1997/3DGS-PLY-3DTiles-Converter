@@ -46,13 +46,13 @@ node ./bin/3dgs-ply-3dtiles-converter.js --self-test <output_dir>
 Output is written under:
 
 - `tileset.json` (main tileset root, written as compact single-line JSON)
-- `build_summary.json` (conversion metadata, including `source`, `root_transform`, `root_coordinate`, and `root_transform_source` when global placement is used, written as compact single-line JSON)
+- `build_summary.json` (conversion metadata, timing diagnostics, `memory_budget_plan`, `peak_rss_bytes`, and placement fields such as `root_transform`, `root_coordinate`, and `root_transform_source`, written as compact single-line JSON)
 - `tiles/{level}/{x}/{y}/{z}.glb` (tile content)
 - `subtrees/{level}/{x}/{y}/{z}.subtree` (when `--tiling-mode implicit`)
 
 Generated `tileset.json` files declare the top-level `3DTILES_content_gltf` tileset extension metadata that CesiumJS uses to detect `KHR_gaussian_splatting` and `KHR_gaussian_splatting_compression_spz_2` glTF tile content.
 
-Large PLY conversion through `convert(...)` now uses a temp-file-backed pipeline. That path writes canonical leaf/handoff buckets, builds parent LODs from handoff data, uses exact streaming simplify so internal nodes do not need a full in-memory SH payload up front, processes each level with bounded concurrency, and automatically resumes from its temp workspace if the same output directory is rerun without `--clean`.
+Large PLY conversion through `convert(...)` now uses a temp-file-backed pipeline. That path writes canonical leaf/handoff buckets, builds parent LODs from handoff data, uses exact streaming simplify so internal nodes do not need a full in-memory SH payload up front, and processes each level with memory-budgeted concurrency. Successful conversions remove the temp workspace; failed conversions preserve it so the same output directory can resume when rerun without `--clean`.
 
 ## API usage
 
@@ -65,8 +65,7 @@ const { convert } = require('3dgs-ply-3dtiles-converter');
     leafLimit: 5000,
     spzSh1Bits: 8,
     spzShRestBits: 8,
-    buildConcurrency: 4,
-    contentWorkers: 4,
+    memoryBudget: 2,
   });
   console.log(result.outputDir, result.splatCount);
 })();
@@ -90,6 +89,7 @@ Examples:
 - CLI `--max-depth 5` equals API `{ maxDepth: 5 }`
 - CLI `--spz-sh1-bits 6` equals API `{ spzSh1Bits: 6 }`
 - CLI `--sample-mode merge` equals API `{ sampleMode: 'merge' }`
+- CLI `--memory-budget 4` equals API `{ memoryBudget: 4 }`
 - CLI `--coordinate "[31.2304,121.4737,30]"` equals API `{ coordinate: [31.2304, 121.4737, 30] }`
 
 ### Common positional args
@@ -118,8 +118,7 @@ Examples:
 | Root coordinate         | vec3    | `--coordinate`              | `coordinate`           | `null`                | `[lat, long, height]`                       | Generates `tileset.root.transform` from WGS84 degrees/meters as a standard ENU frame in 3D Tiles tile coordinates. The API also accepts object forms such as `{ lat, lon, height }` and `{ latitude, longitude, altitude }`. Mutually exclusive with `transform`. |
 | Sampling rate per level | number  | `--sampling-rate-per-level` | `samplingRatePerLevel` | `0.5`                 | `(0,1]`                                     | LOD sampling ratio between levels.                                                                                                                                                                                                                                |
 | Sampling mode           | string  | `--sample-mode`             | `sampleMode`           | `merge`               | `sample`, `merge`                           | `sample` keeps representative splats; `merge` merges assigned splats into the target count. Voxel representative picks are always coarse-biased.                                                                                                                  |
-| Build concurrency       | integer | `--build-concurrency`       | `buildConcurrency`     | `4`                   | `>= 1`                                      | Parallel node builds per level. Lower values reduce peak memory.                                                                                                                                                                                                  |
-| Content workers         | integer | `--content-workers`         | `contentWorkers`       | `4`                   | `>= 0`                                      | Parallel SPZ/GLB workers. `0` disables worker pool.                                                                                                                                                                                                               |
+| Memory budget           | number  | `--memory-budget`           | `memoryBudget`         | `2`                   | `> 0` GB                                    | Shared memory budget, in GB, used to size scan/bucket buffers, partition lookup and arena buffers, simplify scratch buffers, partition write concurrency, bottom-up build concurrency, and SPZ/GLB worker count.                                                     |
 | Open inspector          | boolean | `--open-inspector`          | `openInspector`        | `false`               | `true`/`false`                              | Opens the generated `tileset.json` in `3dtiles-inspector` after conversion completes. The local inspector server keeps running until stopped.                                                                                                                     |
 | Self-test               | boolean | `--self-test`               | `selfTest`             | `false`               | `true`/`false`                              | Generates synthetic cloud and writes sample PLY.                                                                                                                                                                                                                  |
 | Self-test count         | integer | `--self-test-count`         | `selfTestCount`        | `1000000`             | integer                                     | Number of synthetic splats.                                                                                                                                                                                                                                       |

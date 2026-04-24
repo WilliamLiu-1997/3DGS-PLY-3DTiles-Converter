@@ -30,6 +30,13 @@ const IS_LITTLE_ENDIAN = (() => {
   return probe[0] === 0x02;
 })();
 
+function streamChunkBytesFromOptions(options = {}) {
+  const value = options && Number.isFinite(options.chunkBytes)
+    ? Math.floor(options.chunkBytes)
+    : STREAM_READ_CHUNK_SIZE;
+  return Math.max(1, value);
+}
+
 const PLY_KIND_SKIP = 0;
 const PLY_KIND_POSITION = 1;
 const PLY_KIND_SH0 = 2;
@@ -744,6 +751,7 @@ async function forEachBinaryGaussianPlyPosition(
   header,
   layout,
   onPosition,
+  options = {},
 ) {
   const positionProps = layout.binaryPositionProps;
   ensure(
@@ -755,7 +763,7 @@ async function forEachBinaryGaussianPlyPosition(
   );
   const rowsPerChunk = Math.max(
     1,
-    Math.floor(STREAM_READ_CHUNK_SIZE / layout.sourceRecordSize),
+    Math.floor(streamChunkBytesFromOptions(options) / layout.sourceRecordSize),
   );
   const chunkBytes = rowsPerChunk * layout.sourceRecordSize;
   const chunks = [Buffer.allocUnsafe(chunkBytes), Buffer.allocUnsafe(chunkBytes)];
@@ -852,10 +860,11 @@ async function forEachBinaryGaussianPlyCanonicalRecord(
   header,
   layout,
   onRecord,
+  options = {},
 ) {
   const rowsPerChunk = Math.max(
     1,
-    Math.floor(STREAM_READ_CHUNK_SIZE / layout.sourceRecordSize),
+    Math.floor(streamChunkBytesFromOptions(options) / layout.sourceRecordSize),
   );
   const chunkBytes = rowsPerChunk * layout.sourceRecordSize;
   const chunks = [Buffer.allocUnsafe(chunkBytes), Buffer.allocUnsafe(chunkBytes)];
@@ -965,9 +974,10 @@ async function forEachAsciiGaussianPlyPosition(
   header,
   layout,
   onPosition,
+  options = {},
 ) {
   const expected = header.vertexCount * layout.fieldCount;
-  const chunk = Buffer.allocUnsafe(STREAM_READ_CHUNK_SIZE);
+  const chunk = Buffer.allocUnsafe(streamChunkBytesFromOptions(options));
   let fileOffset = header.dataOffset;
   let tokenCarry = '';
   let rowIndex = 0;
@@ -1041,9 +1051,10 @@ async function forEachAsciiGaussianPlyCanonicalRecord(
   header,
   layout,
   onRecord,
+  options = {},
 ) {
   const expected = header.vertexCount * layout.fieldCount;
-  const chunk = Buffer.allocUnsafe(STREAM_READ_CHUNK_SIZE);
+  const chunk = Buffer.allocUnsafe(streamChunkBytesFromOptions(options));
   const rowBuffer = Buffer.allocUnsafe(layout.canonicalByteSize);
   const rowView = new DataView(
     rowBuffer.buffer,
@@ -1146,6 +1157,7 @@ async function forEachGaussianPlyPosition(
   header,
   layout,
   onPosition,
+  options = {},
 ) {
   if (header.format === 'binary_little_endian') {
     await forEachBinaryGaussianPlyPosition(
@@ -1154,6 +1166,7 @@ async function forEachGaussianPlyPosition(
       header,
       layout,
       onPosition,
+      options,
     );
     return;
   }
@@ -1163,6 +1176,7 @@ async function forEachGaussianPlyPosition(
     header,
     layout,
     onPosition,
+    options,
   );
 }
 
@@ -1172,6 +1186,7 @@ async function forEachGaussianPlyCanonicalRecord(
   header,
   layout,
   onRecord,
+  options = {},
 ) {
   if (header.format === 'binary_little_endian') {
     await forEachBinaryGaussianPlyCanonicalRecord(
@@ -1180,6 +1195,7 @@ async function forEachGaussianPlyCanonicalRecord(
       header,
       layout,
       onRecord,
+      options,
     );
     return;
   }
@@ -1189,6 +1205,7 @@ async function forEachGaussianPlyCanonicalRecord(
     header,
     layout,
     onRecord,
+    options,
   );
 }
 

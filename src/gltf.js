@@ -101,6 +101,23 @@ function make3DTilesGltfRootMatrix(translation) {
   return mat4ToGltfColumnMajorList(m);
 }
 
+function writeAllBuffersSync(fd, buffers) {
+  const pending = buffers.filter((buffer) => buffer && buffer.length > 0);
+  let index = 0;
+  while (index < pending.length) {
+    const written = fs.writevSync(fd, pending.slice(index));
+    ensure(written > 0, 'Failed to write GLB output.');
+    let remaining = written;
+    while (index < pending.length && remaining >= pending[index].length) {
+      remaining -= pending[index].length;
+      index += 1;
+    }
+    if (remaining > 0 && index < pending.length) {
+      pending[index] = pending[index].subarray(remaining);
+    }
+  }
+}
+
 class GltfBuilder {
   constructor() {
     this.bufferParts = [];
@@ -362,19 +379,15 @@ class GltfBuilder {
       binHeader.write('BIN', 4, 'ascii');
       binHeader[7] = 0x00;
 
-      fs.writeSync(fd, glbHeader);
-      fs.writeSync(fd, jsonHeader);
-      fs.writeSync(fd, jsonChunk);
+      const chunks = [glbHeader, jsonHeader, jsonChunk];
       if (jsonPadLength > 0) {
-        fs.writeSync(fd, Buffer.alloc(jsonPadLength, 0x20));
+        chunks.push(Buffer.alloc(jsonPadLength, 0x20));
       }
-      fs.writeSync(fd, binHeader);
-      for (const part of this.bufferParts) {
-        fs.writeSync(fd, part);
-      }
+      chunks.push(binHeader, ...this.bufferParts);
       if (binPadLength > 0) {
-        fs.writeSync(fd, Buffer.alloc(binPadLength));
+        chunks.push(Buffer.alloc(binPadLength));
       }
+      writeAllBuffersSync(fd, chunks);
     } finally {
       fs.closeSync(fd);
     }

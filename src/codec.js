@@ -8,6 +8,7 @@ const SPZ_STREAM_VERSION = 3;
 const SPZ_FRACTIONAL_BITS = 12;
 const SPZ_FIXED24_LIMIT = (1 << 23) - 1;
 const SPZ_HEADER_BYTES = 16;
+const GZIP_SPZ_OPTIONS = { level: 9, memLevel: 9 };
 
 function spzExtraDimForDegree(degree) {
   const mapping = { 0: 0, 1: 3, 2: 8, 3: 15 };
@@ -136,7 +137,7 @@ function quantizeSpzExtraSh(coeff, bucket, halfBucket, invBucket) {
 }
 
 function gzipSpzPacket(packet, byteLength = packet.length) {
-  return zlib.gzipSync(packet.subarray(0, byteLength), { level: 9 });
+  return zlib.gzipSync(packet.subarray(0, byteLength), GZIP_SPZ_OPTIONS);
 }
 
 const SQRT_HALF = Math.sqrt(0.5);
@@ -178,15 +179,38 @@ function packQuaternionSmallestThreeInto(quats, idx, out, outOff) {
   if (aw > lv) {
     largest = 3;
   }
-  const vals = [x, y, z, w];
-  const negate = vals[largest] < 0.0;
+  const negate =
+    largest === 0 ? x < 0.0 :
+    largest === 1 ? y < 0.0 :
+    largest === 2 ? z < 0.0 :
+    w < 0.0;
   let comp = largest;
-  const invS = SQRT_HALF;
-  for (let i = 0; i < 4; i++) {
-    if (i === largest) continue;
-    const v = vals[i];
+
+  if (largest !== 0) {
+    const v = x;
     const negbit = (v < 0.0) ^ negate ? 1 : 0;
-    let mag = Math.floor(MAG_SCALE * (Math.abs(v) / invS) + 0.5);
+    let mag = Math.floor(MAG_SCALE * (Math.abs(v) / SQRT_HALF) + 0.5);
+    if (mag > MAG_SCALE) mag = MAG_SCALE;
+    comp = (comp << 10) | (negbit << 9) | mag;
+  }
+  if (largest !== 1) {
+    const v = y;
+    const negbit = (v < 0.0) ^ negate ? 1 : 0;
+    let mag = Math.floor(MAG_SCALE * (Math.abs(v) / SQRT_HALF) + 0.5);
+    if (mag > MAG_SCALE) mag = MAG_SCALE;
+    comp = (comp << 10) | (negbit << 9) | mag;
+  }
+  if (largest !== 2) {
+    const v = z;
+    const negbit = (v < 0.0) ^ negate ? 1 : 0;
+    let mag = Math.floor(MAG_SCALE * (Math.abs(v) / SQRT_HALF) + 0.5);
+    if (mag > MAG_SCALE) mag = MAG_SCALE;
+    comp = (comp << 10) | (negbit << 9) | mag;
+  }
+  if (largest !== 3) {
+    const v = w;
+    const negbit = (v < 0.0) ^ negate ? 1 : 0;
+    let mag = Math.floor(MAG_SCALE * (Math.abs(v) / SQRT_HALF) + 0.5);
     if (mag > MAG_SCALE) mag = MAG_SCALE;
     comp = (comp << 10) | (negbit << 9) | mag;
   }
