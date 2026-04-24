@@ -45,7 +45,6 @@ const {
   computeBounds,
   computeThreeSigmaAabbDiagonalRadiusAt,
   computeThreeSigmaAabbDiagonalRadius,
-  childBounds,
   normalizeSplatTargetCount,
   constrainTargetSplatCount,
   planSimplifyCloudVoxel,
@@ -53,14 +52,12 @@ const {
   geometricErrorScaleForDepth,
   rootGeometricErrorFromMinLevel,
   writeThreeSigmaExtentComponents,
-  buildSubtreeArtifact,
-  writeSubtreeFile,
 } = require('./builder');
 
 const DEFAULT_WORKER_SCRIPT = path.join(__dirname, 'convert-core.js');
 const TEMP_WORKSPACE_NAME = '.tmp-ply-partitions';
 const PIPELINE_STATE_FILE = 'pipeline-state.json';
-const PIPELINE_STATE_VERSION = 5;
+const PIPELINE_STATE_VERSION = 7;
 const PIPELINE_STAGE_BUCKETED = 'bucketed';
 const LEAF_BUCKET_DIR = 'leaf';
 const HANDOFF_BUCKET_DIR = 'handoff';
@@ -79,12 +76,10 @@ const SPZ_BUCKET_ASYNC_WRITE_THRESHOLD = 4096;
 const MERGE_SH_COEFF_BLOCK = 12;
 const PIPELINE_STATE_SAVE_INTERVAL_MS = 5000;
 const PIPELINE_STATE_SAVE_NODE_INTERVAL = 512;
-const SHALLOW_COUNT_MAX_LEVEL = 6;
-const UINT32_MAX_COUNT = 0xffffffff;
-const COUNT_KEY_MAX_PACKED_LEVEL = 16;
-const COUNT_KEY_LEVEL_FACTOR = 281474976710656; // 2 ** 48
-const COUNT_KEY_X_FACTOR = 4294967296; // 2 ** 32
-const COUNT_KEY_Y_FACTOR = 65536; // 2 ** 16
+const TILING_STRATEGY_KD_TREE = 'kd_tree';
+const ADAPTIVE_SPLIT_HISTOGRAM_BINS = 64;
+const ADAPTIVE_MAX_LONG_WIDTH_RATIO = 2.0;
+const ADAPTIVE_SPLIT_EPSILON = 1e-9;
 const IS_LITTLE_ENDIAN = (() => {
   const probe = new Uint8Array(new Uint16Array([0x0102]).buffer);
   return probe[0] === 0x02;
@@ -111,7 +106,6 @@ const MAX_PARTITION_WRITE_CONCURRENCY = 256;
 const MIN_STREAM_CHUNK_BYTES = 1 * BYTES_PER_MB;
 const MAX_STREAM_CHUNK_BYTES = 64 * BYTES_PER_MB;
 const MAX_PARTITION_ARENA_BYTES = 512 * BYTES_PER_MB;
-const MAX_PARTITION_LOOKUP_BYTES = 256 * BYTES_PER_MB;
 const MAX_SIMPLIFY_SCRATCH_BYTES = 512 * BYTES_PER_MB;
 const MAX_BUCKET_ENTRY_CACHE_BYTES = 512 * BYTES_PER_MB;
 const MAX_DERIVED_WORKERS = 8;
@@ -142,9 +136,10 @@ function applyTilesetGltfContentExtensions(tileset) {
 }
 
 function memoryBudgetBytesFromArgs(args) {
-  const budgetGb = args && Number.isFinite(args.memoryBudget)
-    ? args.memoryBudget
-    : DEFAULT_MEMORY_BUDGET_BYTES / BYTES_PER_GB;
+  const budgetGb =
+    args && Number.isFinite(args.memoryBudget)
+      ? args.memoryBudget
+      : DEFAULT_MEMORY_BUDGET_BYTES / BYTES_PER_GB;
   return Math.max(1, Math.floor(budgetGb * BYTES_PER_GB));
 }
 
@@ -153,9 +148,10 @@ function clampInteger(value, min, max) {
 }
 
 function availableWorkerLimit() {
-  const detected = typeof os.availableParallelism === 'function'
-    ? os.availableParallelism()
-    : os.cpus().length;
+  const detected =
+    typeof os.availableParallelism === 'function'
+      ? os.availableParallelism()
+      : os.cpus().length;
   return Math.max(1, Math.min(MAX_DERIVED_WORKERS, detected || 1));
 }
 
@@ -188,24 +184,7 @@ function derivePartitionWriteConcurrency(memoryBudgetBytes) {
   );
 }
 
-function derivePartitionLookupDepth(maxDepth, budgetBytes) {
-  if (!Number.isInteger(maxDepth) || maxDepth <= 0 || budgetBytes < 4) {
-    return 0;
-  }
-  let depth = 0;
-  for (let candidate = 1; candidate <= maxDepth; candidate++) {
-    const side = 2 ** candidate;
-    const cells = side * side * side;
-    const bytes = cells * Int32Array.BYTES_PER_ELEMENT;
-    if (!Number.isSafeInteger(cells) || bytes > budgetBytes) {
-      break;
-    }
-    depth = candidate;
-  }
-  return depth;
-}
-
-function makeMemoryBudgetPlan(args, { header = null, layout = null, treeStats = null } = {}) {
+function makeMemoryBudgetPlan(args, { header = null, layout = null } = {}) {
   const budgetBytes = memoryBudgetBytesFromArgs(args);
   const runtimeReserveBytes = Math.min(
     Math.floor(budgetBytes * RUNTIME_RESERVE_FRACTION),
@@ -214,11 +193,10 @@ function makeMemoryBudgetPlan(args, { header = null, layout = null, treeStats = 
   const usableBudgetBytes = Math.max(1, budgetBytes - runtimeReserveBytes);
   const buildConcurrency = deriveBuildConcurrency(usableBudgetBytes);
   const contentWorkers = deriveContentWorkerCount(usableBudgetBytes);
-  const partitionWriteConcurrency =
-    Math.min(
-      derivePartitionWriteConcurrency(usableBudgetBytes),
-      Math.max(1, contentWorkers * 8),
-    );
+  const partitionWriteConcurrency = Math.min(
+    derivePartitionWriteConcurrency(usableBudgetBytes),
+    Math.max(1, contentWorkers * 8),
+  );
   const streamChunkMax = Math.max(
     1,
     Math.min(MAX_STREAM_CHUNK_BYTES, Math.floor(usableBudgetBytes / 4)),
@@ -230,15 +208,16 @@ function makeMemoryBudgetPlan(args, { header = null, layout = null, treeStats = 
   );
   const bucketChunkBytes = streamChunkBytes;
   const rowByteSize = layout ? layout.canonicalByteSize : null;
-  const partitionArenaBytes = rowByteSize == null
-    ? null
-    : Math.max(
-        rowByteSize,
-        Math.min(
-          MAX_PARTITION_ARENA_BYTES,
-          Math.floor(usableBudgetBytes / (PARTITION_ARENA_COUNT * 2)),
-        ),
-      );
+  const partitionArenaBytes =
+    rowByteSize == null
+      ? null
+      : Math.max(
+          rowByteSize,
+          Math.min(
+            MAX_PARTITION_ARENA_BYTES,
+            Math.floor(usableBudgetBytes / (PARTITION_ARENA_COUNT * 2)),
+          ),
+        );
   const positionBytes = header
     ? header.vertexCount * POSITION_ROW_BYTE_SIZE
     : null;
@@ -252,16 +231,6 @@ function makeMemoryBudgetPlan(args, { header = null, layout = null, treeStats = 
     Math.min(POSITION_TMP_BUFFER_BYTES, positionTmpBufferMax),
     positionTmpBufferMax,
   );
-  const partitionLookupBudgetBytes = Math.min(
-    MAX_PARTITION_LOOKUP_BYTES,
-    Math.floor(usableBudgetBytes / 8),
-  );
-  const partitionLookupDepth = treeStats
-    ? derivePartitionLookupDepth(
-        treeStats.maxLevel,
-        partitionLookupBudgetBytes,
-      )
-    : null;
   const simplifyScratchMax = Math.max(
     1,
     Math.min(
@@ -297,13 +266,13 @@ function makeMemoryBudgetPlan(args, { header = null, layout = null, treeStats = 
     scanChunkBytes: streamChunkBytes,
     bucketChunkBytes,
     positionBytes,
-    inMemoryPositions: positionBytes == null
-      ? null
-      : positionBytes <= usableBudgetBytes && positionFloatCount <= 0x7fffffff,
+    inMemoryPositions:
+      positionBytes == null
+        ? null
+        : positionBytes <= usableBudgetBytes &&
+          positionFloatCount <= 0x7fffffff,
     positionTmpBufferBytes,
     partitionArenaBytes,
-    partitionLookupBudgetBytes,
-    partitionLookupDepth,
     simplifyScratchBytes,
     bucketEntryCacheBytes,
   };
@@ -320,9 +289,6 @@ function serializeMemoryBudgetPlan(plan) {
     scan_chunk_bytes: plan.scanChunkBytes,
     bucket_chunk_bytes: plan.bucketChunkBytes,
     partition_arena_bytes: plan.partitionArenaBytes,
-    partition_lookup_budget_bytes: plan.partitionLookupBudgetBytes,
-    partition_lookup_depth: plan.partitionLookupDepth,
-    partition_lookup_bytes: plan.partitionLookupBytes || 0,
     in_memory_positions: plan.inMemoryPositions,
     position_bytes: plan.positionBytes,
     position_tmp_buffer_bytes: plan.positionTmpBufferBytes,
@@ -388,63 +354,28 @@ function makeNodeKey(level, x, y, z) {
   return `${level}/${x}/${y}/${z}`;
 }
 
-function makeCountKey(level, x, y, z) {
-  if (level <= COUNT_KEY_MAX_PACKED_LEVEL) {
-    return (
-      level * COUNT_KEY_LEVEL_FACTOR +
-      x * COUNT_KEY_X_FACTOR +
-      y * COUNT_KEY_Y_FACTOR +
-      z
-    );
-  }
-  return makeNodeKey(level, x, y, z);
-}
-
-function packShallowCountIndex(level, x, y, z) {
-  if (level === 0) {
-    return 0;
-  }
-  return (x << (2 * level)) | (y << level) | z;
-}
-
-class CountsTable {
-  constructor(maxDepth, totalRows) {
-    this.shallowMaxLevel =
-      totalRows <= UINT32_MAX_COUNT
-        ? Math.min(maxDepth, SHALLOW_COUNT_MAX_LEVEL)
-        : -1;
-    this.shallow = [];
-    for (let level = 0; level <= this.shallowMaxLevel; level++) {
-      this.shallow[level] = new Uint32Array(1 << (3 * level));
-    }
-    this.deep = new Map();
-  }
-
-  increment(level, x, y, z) {
-    if (level <= this.shallowMaxLevel) {
-      this.shallow[level][packShallowCountIndex(level, x, y, z)] += 1;
-      return;
-    }
-    const key = makeCountKey(level, x, y, z);
-    this.deep.set(key, (this.deep.get(key) || 0) + 1);
-  }
-
-  getCount(level, x, y, z) {
-    if (level <= this.shallowMaxLevel) {
-      return this.shallow[level][packShallowCountIndex(level, x, y, z)] || 0;
-    }
-    return this.deep.get(makeCountKey(level, x, y, z)) || 0;
-  }
-}
-
-function pointOctant(bounds, x, y, z) {
+function defaultSplitPointForBounds(bounds) {
   const min = bounds.minimum;
   const max = bounds.maximum;
+  return [
+    (min[0] + max[0]) * 0.5,
+    (min[1] + max[1]) * 0.5,
+    (min[2] + max[2]) * 0.5,
+  ];
+}
+
+function pointOctant(bounds, x, y, z, splitPoint = null, splitAxes = null) {
+  const split = splitPoint || defaultSplitPointForBounds(bounds);
+  const axes = splitAxes || [true, true, true];
   return (
-    (x >= (min[0] + max[0]) * 0.5 ? 1 : 0) |
-    (y >= (min[1] + max[1]) * 0.5 ? 2 : 0) |
-    (z >= (min[2] + max[2]) * 0.5 ? 4 : 0)
+    (axes[0] && x >= split[0] ? 1 : 0) |
+    (axes[1] && y >= split[1] ? 2 : 0) |
+    (axes[2] && z >= split[2] ? 4 : 0)
   );
+}
+
+function pointOctantForNode(node, x, y, z) {
+  return pointOctant(node.bounds, x, y, z, node.splitPoint, node.splitAxes);
 }
 
 function targetSplatCountForDepth(
@@ -521,32 +452,42 @@ function cloneBounds(bounds) {
   return new Bounds(bounds.minimum.slice(), bounds.maximum.slice());
 }
 
-function buildNodeTreeFromCounts(
-  counts,
-  bounds,
-  maxDepth,
-  leafLimit,
-  depth,
+function normalizeSplitPoint(splitPoint) {
+  return Array.isArray(splitPoint) && splitPoint.length === 3
+    ? splitPoint.map((value) => Number(value))
+    : null;
+}
+
+function normalizeSplitAxes(splitAxes) {
+  return Array.isArray(splitAxes) && splitAxes.length === 3
+    ? splitAxes.map((value) => !!value)
+    : null;
+}
+
+function makePartitionTreeNode({
+  level,
   x,
   y,
   z,
-) {
-  const key = makeNodeKey(depth, x, y, z);
-  const count = counts.getCount(depth, x, y, z);
-  if (count <= 0) {
-    return null;
-  }
-
-  const node = {
-    key,
-    level: depth,
-    depth,
+  bounds,
+  count,
+  leaf = true,
+  splitPoint = null,
+  splitAxes = null,
+}) {
+  return {
+    key: makeNodeKey(level, x, y, z),
+    level,
+    depth: level,
     x,
     y,
     z,
     count,
     bounds,
-    leaf: depth >= maxDepth || count <= leafLimit,
+    leaf,
+    splitPoint: normalizeSplitPoint(splitPoint),
+    splitAxes: normalizeSplitAxes(splitAxes),
+    tilingStrategy: TILING_STRATEGY_KD_TREE,
     children: [],
     childrenByOct: new Array(8).fill(null),
     occupiedChildCount: 0,
@@ -559,29 +500,6 @@ function buildNodeTreeFromCounts(
     ownError: null,
     buildState: 'pending',
   };
-
-  if (!node.leaf) {
-    for (let oct = 0; oct < 8; oct++) {
-      const child = buildNodeTreeFromCounts(
-        counts,
-        childBounds(bounds, oct),
-        maxDepth,
-        leafLimit,
-        depth + 1,
-        (x << 1) | (oct & 1),
-        (y << 1) | ((oct >> 1) & 1),
-        (z << 1) | ((oct >> 2) & 1),
-      );
-      if (!child) {
-        continue;
-      }
-      node.children.push(child);
-      node.childrenByOct[oct] = child;
-    }
-    node.occupiedChildCount = node.children.length;
-  }
-
-  return node;
 }
 
 function serializeNodeMeta(node) {
@@ -595,6 +513,9 @@ function serializeNodeMeta(node) {
     count: node.count,
     bounds: serializeBoundsState(node.bounds),
     leaf: node.leaf,
+    splitPoint: node.splitPoint ? node.splitPoint.slice() : null,
+    splitAxes: node.splitAxes ? node.splitAxes.slice() : null,
+    tilingStrategy: node.tilingStrategy || TILING_STRATEGY_KD_TREE,
     occupiedChildCount: node.occupiedChildCount,
     bucketPath: node.bucketPath,
     contentUri: node.contentUri,
@@ -619,6 +540,9 @@ function deserializeNodeMeta(data) {
     count: data.count,
     bounds: deserializeBoundsState(data.bounds),
     leaf: data.leaf,
+    splitPoint: normalizeSplitPoint(data.splitPoint),
+    splitAxes: normalizeSplitAxes(data.splitAxes),
+    tilingStrategy: data.tilingStrategy || TILING_STRATEGY_KD_TREE,
     children: [],
     childrenByOct: new Array(8).fill(null),
     occupiedChildCount: data.occupiedChildCount || 0,
@@ -680,7 +604,7 @@ function collectTreeStats(node) {
 function resolveLeafNodeForPoint(root, x, y, z) {
   let node = root;
   while (!node.leaf) {
-    const oct = pointOctant(node.bounds, x, y, z);
+    const oct = pointOctantForNode(node, x, y, z);
     const child = node.childrenByOct[oct];
     ensure(
       !!child,
@@ -689,94 +613,6 @@ function resolveLeafNodeForPoint(root, x, y, z) {
     node = child;
   }
   return node;
-}
-
-function makePartitionNodeLookup(root, rootBounds, depth) {
-  if (!Number.isInteger(depth) || depth <= 0 || !root || !rootBounds) {
-    return null;
-  }
-
-  const side = 2 ** depth;
-  const cellCount = side * side * side;
-  if (!Number.isSafeInteger(cellCount) || cellCount <= 0) {
-    return null;
-  }
-
-  const table = new Int32Array(cellCount);
-  table.fill(-1);
-  const nodes = [];
-  const nodeIndex = new Map();
-  const indexForNode = (node) => {
-    let index = nodeIndex.get(node);
-    if (index != null) {
-      return index;
-    }
-    index = nodes.length;
-    nodes.push(node);
-    nodeIndex.set(node, index);
-    return index;
-  };
-
-  const fillBlock = (node, x0, y0, z0, size) => {
-    const index = indexForNode(node);
-    for (let z = z0; z < z0 + size; z++) {
-      const zBase = side * side * z;
-      for (let y = y0; y < y0 + size; y++) {
-        const base = zBase + side * y + x0;
-        table.fill(index, base, base + size);
-      }
-    }
-  };
-
-  const visit = (node, level, x0, y0, z0, size) => {
-    if (node.leaf || level >= depth || size <= 1) {
-      fillBlock(node, x0, y0, z0, Math.max(1, size));
-      return;
-    }
-
-    const childSize = size >> 1;
-    for (const child of node.children) {
-      const oct =
-        ((child.x & 1) << 0) | ((child.y & 1) << 1) | ((child.z & 1) << 2);
-      visit(
-        child,
-        level + 1,
-        x0 + (oct & 1 ? childSize : 0),
-        y0 + (oct & 2 ? childSize : 0),
-        z0 + (oct & 4 ? childSize : 0),
-        childSize,
-      );
-    }
-  };
-
-  visit(root, 0, 0, 0, 0, side);
-
-  const min = rootBounds.minimum;
-  const ext = rootBounds.extents().map((value) => Math.max(value, 1e-12));
-  const inv0 = 1.0 / ext[0];
-  const inv1 = 1.0 / ext[1];
-  const inv2 = 1.0 / ext[2];
-  return {
-    depth,
-    cellCount,
-    bytes: table.byteLength,
-    resolveStartNode(x, y, z) {
-      const ix = Math.min(
-        side - 1,
-        Math.max(0, Math.floor((x - min[0]) * inv0 * side)),
-      );
-      const iy = Math.min(
-        side - 1,
-        Math.max(0, Math.floor((y - min[1]) * inv1 * side)),
-      );
-      const iz = Math.min(
-        side - 1,
-        Math.max(0, Math.floor((z - min[2]) * inv2 * side)),
-      );
-      const index = table[ix + side * (iy + side * iz)];
-      return index >= 0 ? nodes[index] : root;
-    },
-  };
 }
 
 function resetNodeArtifacts(node) {
@@ -804,10 +640,11 @@ function makePipelineFingerprint(inputPath, inputStat, args) {
     linearScaleInput: args.linearScaleInput,
     maxDepth: args.maxDepth,
     leafLimit: args.leafLimit,
+    tilingStrategy: TILING_STRATEGY_KD_TREE,
+    kdTreeSplitHistogramBins: ADAPTIVE_SPLIT_HISTOGRAM_BINS,
+    kdTreeMaxLongWidthRatio: ADAPTIVE_MAX_LONG_WIDTH_RATIO,
     samplingRatePerLevel: args.samplingRatePerLevel,
     sampleMode: args.sampleMode,
-    tilingMode: args.tilingMode,
-    subtreeLevels: args.subtreeLevels,
     minGeometricError: args.minGeometricError,
     colorSpace: args.colorSpace,
     spzSh1Bits: args.spzSh1Bits,
@@ -1184,7 +1021,8 @@ async function partitionLeafBuckets(
   const memoryPlan = options.memoryPlan || null;
   const memoryBudgetBytes = memoryPlan
     ? memoryPlan.usableBudgetBytes
-    : Number.isFinite(options.memoryBudgetBytes) && options.memoryBudgetBytes > 0
+    : Number.isFinite(options.memoryBudgetBytes) &&
+        options.memoryBudgetBytes > 0
       ? Math.floor(options.memoryBudgetBytes)
       : DEFAULT_MEMORY_BUDGET_BYTES;
   const writeConcurrency =
@@ -1194,20 +1032,16 @@ async function partitionLeafBuckets(
         ? memoryPlan.partitionWriteConcurrency
         : derivePartitionWriteConcurrency(memoryBudgetBytes);
   // Budget two read arenas plus two worst-case compaction buffers during flush.
-  const arenaByteSize = memoryPlan && memoryPlan.partitionArenaBytes != null
-    ? memoryPlan.partitionArenaBytes
-    : Math.max(
-        rowByteSize,
-        Math.min(
-          MAX_PARTITION_ARENA_BYTES,
-          Math.floor(memoryBudgetBytes / (PARTITION_ARENA_COUNT * 2)),
-        ),
-      );
-  const lookup = makePartitionNodeLookup(
-    rootNode,
-    rootNode.bounds,
-    memoryPlan ? memoryPlan.partitionLookupDepth : 0,
-  );
+  const arenaByteSize =
+    memoryPlan && memoryPlan.partitionArenaBytes != null
+      ? memoryPlan.partitionArenaBytes
+      : Math.max(
+          rowByteSize,
+          Math.min(
+            MAX_PARTITION_ARENA_BYTES,
+            Math.floor(memoryBudgetBytes / (PARTITION_ARENA_COUNT * 2)),
+          ),
+        );
   const arenas = Array.from({ length: PARTITION_ARENA_COUNT }, () => ({
     buffer: Buffer.allocUnsafe(arenaByteSize),
     offset: 0,
@@ -1428,8 +1262,7 @@ async function partitionLeafBuckets(
         const x = rowFloats ? rowFloats[0] : rowView.getFloat32(0, true);
         const y = rowFloats ? rowFloats[1] : rowView.getFloat32(4, true);
         const z = rowFloats ? rowFloats[2] : rowView.getFloat32(8, true);
-        const startNode = lookup ? lookup.resolveStartNode(x, y, z) : rootNode;
-        const leaf = resolveLeafNodeForPoint(startNode, x, y, z);
+        const leaf = resolveLeafNodeForPoint(rootNode, x, y, z);
         if (!leaf.bucketPath) {
           leaf.bucketPath = canonicalNodePath(tempDir, LEAF_BUCKET_DIR, leaf);
         }
@@ -1473,8 +1306,6 @@ async function partitionLeafBuckets(
   return {
     rowCount: processedRows,
     leafCount: touchedLeaves.length,
-    lookupDepth: lookup ? lookup.depth : 0,
-    lookupBytes: lookup ? lookup.bytes : 0,
   };
 }
 
@@ -1740,10 +1571,11 @@ async function packBucketEntriesToSpz(
     entries,
     coeffCount,
     (view, base, encoding, _filePath, floatView, floatBase) => {
-      if (floatView && (
-        encoding === LEAF_BUCKET_ENCODING ||
-        encoding === HANDOFF_BUCKET_ENCODING
-      )) {
+      if (
+        floatView &&
+        (encoding === LEAF_BUCKET_ENCODING ||
+          encoding === HANDOFF_BUCKET_ENCODING)
+      ) {
         const src = floatView;
         const off = floatBase;
         const localX = translation
@@ -2649,9 +2481,10 @@ function resolveMergeShCoeffBlock(coeffStride, selectedCount, scratchBytes) {
     return 0;
   }
   const fixedBytes = selectedCount * 6 * Float64Array.BYTES_PER_ELEMENT;
-  const available = Number.isFinite(scratchBytes) && scratchBytes > fixedBytes
-    ? scratchBytes - fixedBytes
-    : MERGE_SH_COEFF_BLOCK * selectedCount * Float64Array.BYTES_PER_ELEMENT;
+  const available =
+    Number.isFinite(scratchBytes) && scratchBytes > fixedBytes
+      ? scratchBytes - fixedBytes
+      : MERGE_SH_COEFF_BLOCK * selectedCount * Float64Array.BYTES_PER_ELEMENT;
   const byBudget = Math.floor(
     available / Math.max(1, selectedCount * Float64Array.BYTES_PER_ELEMENT),
   );
@@ -3066,9 +2899,7 @@ async function computeExactStreamingOwnErrorFromEntries(
         const dz = scratch.position[2] - outputCloud.positions[dstBase3 + 2];
         const radius = rowRadiusOrScratch(inputRadius, rowIndex, scratch);
         errors[rowIndex] =
-          Math.sqrt(dx * dx + dy * dy + dz * dz) +
-          radius +
-          outputRadius[slot];
+          Math.sqrt(dx * dx + dy * dy + dz * dz) + radius + outputRadius[slot];
         rowIndex += 1;
       },
       { chunkBytes: options.bucketChunkBytes },
@@ -3164,7 +2995,10 @@ async function streamSimplifyBucketEntriesExact(
     coeffCount,
     options.bucketEntryCacheBytes,
   );
-  const totalRows = activeEntries.reduce((sum, entry) => sum + entry.rowCount, 0);
+  const totalRows = activeEntries.reduce(
+    (sum, entry) => sum + entry.rowCount,
+    0,
+  );
   ensure(totalRows > 0, 'Cannot simplify an empty bucket input.');
   const target = normalizeSplatTargetCount(targetCount, totalRows);
   const inputRadiusBytes = totalRows * Float32Array.BYTES_PER_ELEMENT;
@@ -3356,11 +3190,11 @@ async function writeBucketGlbTaskOutput(task) {
   ensure(task.pointCount > 0, 'Cannot write empty bucket content.');
   const translation =
     task.translation ||
-    (await computeBucketEntriesBounds(
-      task.entries,
-      task.coeffCount,
-      { bucketChunkBytes: task.bucketChunkBytes },
-    )).center();
+    (
+      await computeBucketEntriesBounds(task.entries, task.coeffCount, {
+        bucketChunkBytes: task.bucketChunkBytes,
+      })
+    ).center();
   const spzBytes = await packBucketEntriesToSpz(
     task.entries,
     task.coeffCount,
@@ -3382,7 +3216,10 @@ async function writeBucketGlbTaskOutput(task) {
 }
 
 async function writeSimplifiedBucketGlbTaskOutput(task) {
-  ensure(task && task.outPath, 'Missing simplified bucket GLB task output path.');
+  ensure(
+    task && task.outPath,
+    'Missing simplified bucket GLB task output path.',
+  );
   ensure(task.pointCount > 0, 'Cannot simplify an empty bucket content task.');
   const bounds = deserializeBoundsState(task.bounds);
   const { cloud, ownError } = await streamSimplifyBucketEntriesExact(
@@ -3664,39 +3501,6 @@ async function scanGlobalBoundsAndStagePositionsInMemory(
   };
 }
 
-function addPositionToCounts(counts, rootBounds, maxDepth, x, y, z) {
-  let minX = rootBounds.minimum[0];
-  let minY = rootBounds.minimum[1];
-  let minZ = rootBounds.minimum[2];
-  let maxX = rootBounds.maximum[0];
-  let maxY = rootBounds.maximum[1];
-  let maxZ = rootBounds.maximum[2];
-  let ix = 0;
-  let iy = 0;
-  let iz = 0;
-
-  counts.increment(0, 0, 0, 0);
-  for (let depth = 0; depth < maxDepth; depth++) {
-    const cx = (minX + maxX) * 0.5;
-    const cy = (minY + maxY) * 0.5;
-    const cz = (minZ + maxZ) * 0.5;
-    const bx = x >= cx ? 1 : 0;
-    const by = y >= cy ? 1 : 0;
-    const bz = z >= cz ? 1 : 0;
-    ix = (ix << 1) | bx;
-    iy = (iy << 1) | by;
-    iz = (iz << 1) | bz;
-    counts.increment(depth + 1, ix, iy, iz);
-
-    if (bx) minX = cx;
-    else maxX = cx;
-    if (by) minY = cy;
-    else maxY = cy;
-    if (bz) minZ = cz;
-    else maxZ = cz;
-  }
-}
-
 async function readExactFromHandle(handle, buffer, length, position, message) {
   let offset = 0;
   while (offset < length) {
@@ -3713,17 +3517,230 @@ async function readExactFromHandle(handle, buffer, length, position, message) {
   }
 }
 
-async function buildCountsTableFromPositionFile(
-  positionsPath,
-  vertexCount,
-  rootBounds,
-  maxDepth,
-  options = {},
-) {
-  const counts = new CountsTable(maxDepth, vertexCount);
+function collectAdaptiveSplitCandidates(node, maxDepth, leafLimit, out) {
+  if (node.leaf) {
+    if (
+      !node.splitExhausted &&
+      node.level < maxDepth &&
+      node.count > 1 &&
+      (node.count > leafLimit ||
+        boundsLongWidthAspect(node.bounds) > ADAPTIVE_MAX_LONG_WIDTH_RATIO)
+    ) {
+      out.push(node);
+    }
+    return;
+  }
+  for (const child of node.children) {
+    collectAdaptiveSplitCandidates(child, maxDepth, leafLimit, out);
+  }
+}
+
+function makeAdaptiveSplitStats(node) {
+  return {
+    node,
+    count: 0,
+    histograms: [
+      new Float64Array(ADAPTIVE_SPLIT_HISTOGRAM_BINS),
+      new Float64Array(ADAPTIVE_SPLIT_HISTOGRAM_BINS),
+      new Float64Array(ADAPTIVE_SPLIT_HISTOGRAM_BINS),
+    ],
+    minimum: [Infinity, Infinity, Infinity],
+    maximum: [-Infinity, -Infinity, -Infinity],
+    splitPoint: null,
+    splitAxes: null,
+    childCounts: null,
+    childMinimums: null,
+    childMaximums: null,
+  };
+}
+
+function boundsFromMinMax(minimum, maximum, fallbackBounds) {
+  if (
+    minimum.every((value) => Number.isFinite(value)) &&
+    maximum.every((value) => Number.isFinite(value))
+  ) {
+    return new Bounds(minimum.slice(), maximum.slice());
+  }
+  return cloneBounds(fallbackBounds);
+}
+
+function longWidthAspectFromExtents(extents) {
+  const ranked = extents
+    .map((extent, axis) => ({
+      axis,
+      extent: Number.isFinite(extent) ? Math.max(0.0, extent) : 0.0,
+    }))
+    .sort((a, b) => b.extent - a.extent);
+  const longest = ranked[0];
+  const width = ranked[1];
+  const epsilon = Math.max(
+    ADAPTIVE_SPLIT_EPSILON,
+    longest.extent * ADAPTIVE_SPLIT_EPSILON,
+  );
+  return {
+    aspect:
+      longest.extent > epsilon
+        ? longest.extent / Math.max(width.extent, epsilon)
+        : 1.0,
+    longestAxis: longest.axis,
+    widthAxis: width.axis,
+    longestExtent: longest.extent,
+    widthExtent: width.extent,
+  };
+}
+
+function boundsLongWidthAspect(bounds) {
+  return longWidthAspectFromExtents(bounds.extents()).aspect;
+}
+
+function updateAdaptiveSplitStats(stats, x, y, z) {
+  const values = [x, y, z];
+  const bounds = stats.node.bounds;
+  stats.count += 1;
+  for (let axis = 0; axis < 3; axis++) {
+    const value = values[axis];
+    if (value < stats.minimum[axis]) stats.minimum[axis] = value;
+    if (value > stats.maximum[axis]) stats.maximum[axis] = value;
+
+    const min = bounds.minimum[axis];
+    const extent = bounds.maximum[axis] - min;
+    let bin = 0;
+    if (Number.isFinite(extent) && extent > 0.0) {
+      bin = Math.floor(
+        ((value - min) / extent) * ADAPTIVE_SPLIT_HISTOGRAM_BINS,
+      );
+      bin = Math.max(0, Math.min(ADAPTIVE_SPLIT_HISTOGRAM_BINS - 1, bin));
+    }
+    stats.histograms[axis][bin] += 1;
+  }
+}
+
+function chooseAdaptiveAxisSplit(stats, axis) {
+  const total = stats.count;
+  if (total <= 1) {
+    return null;
+  }
+
+  const bounds = stats.node.bounds;
+  const boundMin = bounds.minimum[axis];
+  const boundMax = bounds.maximum[axis];
+  const boundExtent = boundMax - boundMin;
+  const observedMin = stats.minimum[axis];
+  const observedMax = stats.maximum[axis];
+  const observedExtent = observedMax - observedMin;
+  const epsilon = Math.max(
+    ADAPTIVE_SPLIT_EPSILON,
+    Math.abs(boundExtent) * ADAPTIVE_SPLIT_EPSILON,
+  );
+  if (
+    !Number.isFinite(boundExtent) ||
+    !Number.isFinite(observedExtent) ||
+    boundExtent <= epsilon ||
+    observedExtent <= epsilon
+  ) {
+    return null;
+  }
+
+  const histogram = stats.histograms[axis];
+  let lower = 0;
+  let bestBoundary = -1;
+  let bestBalance = Infinity;
+  for (let boundary = 1; boundary < ADAPTIVE_SPLIT_HISTOGRAM_BINS; boundary++) {
+    lower += histogram[boundary - 1];
+    if (lower <= 0 || lower >= total) {
+      continue;
+    }
+    const balance = Math.abs(lower - total * 0.5);
+    if (balance < bestBalance) {
+      bestBalance = balance;
+      bestBoundary = boundary;
+    }
+  }
+
+  if (bestBoundary > 0) {
+    const split =
+      boundMin + (boundExtent * bestBoundary) / ADAPTIVE_SPLIT_HISTOGRAM_BINS;
+    if (split > boundMin + epsilon && split < boundMax - epsilon) {
+      return split;
+    }
+  }
+
+  const fallback = (observedMin + observedMax) * 0.5;
+  if (fallback > boundMin + epsilon && fallback < boundMax - epsilon) {
+    return fallback;
+  }
+  return null;
+}
+
+function chooseAdaptiveSplit(stats) {
+  if (stats.count <= 1) {
+    return false;
+  }
+
+  const observedExtents = [
+    stats.maximum[0] - stats.minimum[0],
+    stats.maximum[1] - stats.minimum[1],
+    stats.maximum[2] - stats.minimum[2],
+  ];
+  const maxObservedExtent = Math.max(
+    observedExtents[0],
+    observedExtents[1],
+    observedExtents[2],
+  );
+  if (!Number.isFinite(maxObservedExtent) || maxObservedExtent <= 0.0) {
+    return false;
+  }
+
+  const axesByExtent = observedExtents
+    .map((extent, axis) => ({
+      axis,
+      extent: Number.isFinite(extent) ? Math.max(0.0, extent) : 0.0,
+    }))
+    .sort((a, b) => b.extent - a.extent);
+
+  for (const candidate of axesByExtent) {
+    const axis = candidate.axis;
+    const split = chooseAdaptiveAxisSplit(stats, axis);
+    if (split == null) {
+      continue;
+    }
+    const splitPoint = defaultSplitPointForBounds(stats.node.bounds);
+    const splitAxes = [false, false, false];
+    splitPoint[axis] = split;
+    splitAxes[axis] = true;
+    stats.splitPoint = splitPoint;
+    stats.splitAxes = splitAxes;
+    return true;
+  }
+
+  return false;
+}
+
+function updateAdaptiveChildStats(stats, oct, x, y, z) {
+  stats.childCounts[oct] += 1;
+  const minimum = stats.childMinimums[oct];
+  const maximum = stats.childMaximums[oct];
+  if (x < minimum[0]) minimum[0] = x;
+  if (y < minimum[1]) minimum[1] = y;
+  if (z < minimum[2]) minimum[2] = z;
+  if (x > maximum[0]) maximum[0] = x;
+  if (y > maximum[1]) maximum[1] = y;
+  if (z > maximum[2]) maximum[2] = z;
+}
+
+async function forEachStagedPosition(source, callback) {
+  if (source.positions) {
+    const positions = source.positions;
+    for (let rowIndex = 0; rowIndex < source.vertexCount; rowIndex++) {
+      const base = rowIndex * 3;
+      callback(positions[base + 0], positions[base + 1], positions[base + 2]);
+    }
+    return;
+  }
+
   const targetChunkBytes =
-    Number.isFinite(options.chunkBytes) && options.chunkBytes > 0
-      ? Math.floor(options.chunkBytes)
+    Number.isFinite(source.chunkBytes) && source.chunkBytes > 0
+      ? Math.floor(source.chunkBytes)
       : 8 * 1024 * 1024;
   const rowsPerChunk = Math.max(
     1,
@@ -3734,18 +3751,22 @@ async function buildCountsTableFromPositionFile(
     IS_LITTLE_ENDIAN && (chunk.byteOffset & 3) === 0
       ? new Float32Array(chunk.buffer, chunk.byteOffset, rowsPerChunk * 3)
       : null;
-  const handle = await fs.promises.open(positionsPath, 'r');
+  const handle = await fs.promises.open(source.positionsPath, 'r');
   try {
     let fileOffset = 0;
-    for (let rowBase = 0; rowBase < vertexCount; rowBase += rowsPerChunk) {
-      const rowCount = Math.min(rowsPerChunk, vertexCount - rowBase);
+    for (
+      let rowBase = 0;
+      rowBase < source.vertexCount;
+      rowBase += rowsPerChunk
+    ) {
+      const rowCount = Math.min(rowsPerChunk, source.vertexCount - rowBase);
       const byteCount = rowCount * POSITION_ROW_BYTE_SIZE;
       await readExactFromHandle(
         handle,
         chunk,
         byteCount,
         fileOffset,
-        `Staged position file ended early: ${positionsPath}`,
+        `Staged position file ended early: ${source.positionsPath}`,
       );
       fileOffset += byteCount;
 
@@ -3764,35 +3785,153 @@ async function buildCountsTableFromPositionFile(
           y = chunk.readFloatLE(base + 4);
           z = chunk.readFloatLE(base + 8);
         }
-        addPositionToCounts(counts, rootBounds, maxDepth, x, y, z);
+        callback(x, y, z);
       }
     }
   } finally {
     await handle.close();
   }
-
-  return counts;
 }
 
-function buildCountsTableFromPositionArray(
-  positions,
-  vertexCount,
+async function buildAdaptiveNodeTreeFromPositions(
+  source,
   rootBounds,
   maxDepth,
+  leafLimit,
 ) {
-  const counts = new CountsTable(maxDepth, vertexCount);
-  for (let rowIndex = 0; rowIndex < vertexCount; rowIndex++) {
-    const base = rowIndex * 3;
-    addPositionToCounts(
-      counts,
-      rootBounds,
-      maxDepth,
-      positions[base + 0],
-      positions[base + 1],
-      positions[base + 2],
-    );
+  const root = makePartitionTreeNode({
+    level: 0,
+    x: 0,
+    y: 0,
+    z: 0,
+    bounds: cloneBounds(rootBounds),
+    count: source.vertexCount,
+    leaf: true,
+  });
+
+  if (maxDepth <= 0 || source.vertexCount <= 1) {
+    return root;
   }
-  return counts;
+
+  for (let depth = 0; depth < maxDepth; depth++) {
+    const candidates = [];
+    collectAdaptiveSplitCandidates(root, maxDepth, leafLimit, candidates);
+    if (candidates.length === 0) {
+      break;
+    }
+
+    const statsByNode = new Map();
+    for (const node of candidates) {
+      statsByNode.set(node, makeAdaptiveSplitStats(node));
+    }
+
+    await forEachStagedPosition(source, (x, y, z) => {
+      const leaf = resolveLeafNodeForPoint(root, x, y, z);
+      const stats = statsByNode.get(leaf);
+      if (stats) {
+        updateAdaptiveSplitStats(stats, x, y, z);
+      }
+    });
+
+    const splittableStats = [];
+    for (const stats of statsByNode.values()) {
+      stats.node.count = stats.count;
+      const tightBounds = boundsFromMinMax(
+        stats.minimum,
+        stats.maximum,
+        stats.node.bounds,
+      );
+      if (!chooseAdaptiveSplit(stats)) {
+        stats.node.bounds = tightBounds;
+        stats.node.splitExhausted = true;
+        continue;
+      }
+      stats.node.bounds = tightBounds;
+      stats.node.splitPoint = stats.splitPoint;
+      stats.node.splitAxes = stats.splitAxes;
+      stats.childCounts = new Float64Array(8);
+      stats.childMinimums = Array.from({ length: 8 }, () => [
+        Infinity,
+        Infinity,
+        Infinity,
+      ]);
+      stats.childMaximums = Array.from({ length: 8 }, () => [
+        -Infinity,
+        -Infinity,
+        -Infinity,
+      ]);
+      splittableStats.push(stats);
+    }
+
+    if (splittableStats.length === 0) {
+      break;
+    }
+
+    const splittableByNode = new Map();
+    for (const stats of splittableStats) {
+      splittableByNode.set(stats.node, stats);
+    }
+
+    await forEachStagedPosition(source, (x, y, z) => {
+      const leaf = resolveLeafNodeForPoint(root, x, y, z);
+      const stats = splittableByNode.get(leaf);
+      if (!stats) {
+        return;
+      }
+      const oct = pointOctantForNode(leaf, x, y, z);
+      updateAdaptiveChildStats(stats, oct, x, y, z);
+    });
+
+    let splitNodeCount = 0;
+    for (const stats of splittableStats) {
+      const node = stats.node;
+      const occupied = [];
+      for (let oct = 0; oct < 8; oct++) {
+        const count = stats.childCounts[oct];
+        if (count > 0) {
+          occupied.push({ oct, count });
+        }
+      }
+
+      if (occupied.length <= 1) {
+        node.splitPoint = null;
+        node.splitAxes = null;
+        node.leaf = true;
+        node.splitExhausted = true;
+        continue;
+      }
+
+      node.leaf = false;
+      node.children = [];
+      node.childrenByOct = new Array(8).fill(null);
+      node.occupiedChildCount = occupied.length;
+      for (const entry of occupied) {
+        const oct = entry.oct;
+        const child = makePartitionTreeNode({
+          level: node.level + 1,
+          x: node.x * 2 + (oct & 1),
+          y: node.y * 2 + ((oct >> 1) & 1),
+          z: node.z * 2 + ((oct >> 2) & 1),
+          bounds: boundsFromMinMax(
+            stats.childMinimums[oct],
+            stats.childMaximums[oct],
+            node.bounds,
+          ),
+          count: entry.count,
+          leaf: true,
+        });
+        node.children.push(child);
+        node.childrenByOct[oct] = child;
+      }
+      splitNodeCount += 1;
+    }
+
+    if (splitNodeCount === 0) {
+      break;
+    }
+  }
+
+  return root;
 }
 
 async function isPartitionedNodeComplete(node, ctx) {
@@ -3994,10 +4133,7 @@ async function runWithConcurrencyBudget(
   const pending = items.map((item, index) => ({
     item,
     index,
-    estimated: Math.max(
-      1,
-      Math.floor(estimateBytes ? estimateBytes(item) : 1),
-    ),
+    estimated: Math.max(1, Math.floor(estimateBytes ? estimateBytes(item) : 1)),
   }));
   let activeCount = 0;
   let activeBytes = 0;
@@ -4257,42 +4393,6 @@ function tileToJson(node) {
   return obj;
 }
 
-async function writeAllSubtrees(
-  nodesByKey,
-  subtreesDir,
-  availableLevels,
-  subtreeLevels,
-) {
-  const nodes = Array.from(nodesByKey.values())
-    .filter((node) => node.level % subtreeLevels === 0)
-    .sort((a, b) => {
-      if (a.level !== b.level) return a.level - b.level;
-      if (a.x !== b.x) return a.x - b.x;
-      if (a.y !== b.y) return a.y - b.y;
-      return a.z - b.z;
-    });
-
-  for (const node of nodes) {
-    const subtreePath = path.join(
-      subtreesDir,
-      String(node.level),
-      String(node.x),
-      String(node.y),
-      `${node.z}.subtree`,
-    );
-    const { subtree, blob } = buildSubtreeArtifact(
-      node.level,
-      node.x,
-      node.y,
-      node.z,
-      availableLevels,
-      subtreeLevels,
-      (level, x, y, z) => nodesByKey.has(makeNodeKey(level, x, y, z)),
-    );
-    writeSubtreeFile(subtreePath, subtree, blob);
-  }
-}
-
 function makeBuildSummary(
   args,
   header,
@@ -4303,8 +4403,6 @@ function makeBuildSummary(
   nodeCount,
   maxLevel,
   availableLevels,
-  subtreeLevels,
-  implicitRootGeometricError,
   checkpointInfo,
   memoryPlan,
   timingsMs = {},
@@ -4347,16 +4445,16 @@ function makeBuildSummary(
     memory_budget_plan: serializeMemoryBudgetPlan(resolvedMemoryPlan),
     build_concurrency: resolvedMemoryPlan.buildConcurrency,
     content_workers: resolvedMemoryPlan.contentWorkers,
-    partition_write_concurrency:
-      resolvedMemoryPlan.partitionWriteConcurrency,
+    partition_write_concurrency: resolvedMemoryPlan.partitionWriteConcurrency,
     timings_ms: timingsMs,
     peak_rss_bytes:
       Number.isFinite(peakRssBytes) && peakRssBytes > 0
         ? Math.floor(peakRssBytes)
         : null,
     sampling_rate_per_level: args.samplingRatePerLevel,
-    tiling_mode: args.tilingMode,
-    subtree_levels: args.tilingMode === 'implicit' ? subtreeLevels : null,
+    tiling_strategy: TILING_STRATEGY_KD_TREE,
+    kd_tree_split_histogram_bins: ADAPTIVE_SPLIT_HISTOGRAM_BINS,
+    kd_tree_max_long_width_ratio: ADAPTIVE_MAX_LONG_WIDTH_RATIO,
     content_codec: 'spz_stream',
     spz_version: SPZ_STREAM_VERSION,
     spz_sh1_bits: args.spzSh1Bits,
@@ -4377,8 +4475,6 @@ function makeBuildSummary(
     available_levels: availableLevels,
     effective_max_depth: effectiveMaxDepth,
     root_geometric_error_source: rootGeometricErrorSource,
-    implicit_root_geometric_error:
-      args.tilingMode === 'implicit' ? implicitRootGeometricError : null,
     root_geometric_error: rootNode.error,
     min_geometric_error:
       rootGeometricError *
@@ -4441,6 +4537,10 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
   if (fs.existsSync(path.join(outputDirAbs, 'viewer.html'))) {
     fs.unlinkSync(path.join(outputDirAbs, 'viewer.html'));
   }
+  fs.rmSync(path.join(outputDirAbs, 'subtrees'), {
+    recursive: true,
+    force: true,
+  });
 
   const inputStat = await fs.promises.stat(inputPath);
   const fingerprint = makePipelineFingerprint(inputPath, inputStat, args);
@@ -4503,7 +4603,6 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
 
     if (!rootBounds || !rootNodeMeta) {
       const positionsPath = path.join(tempDir, POSITION_TMP_FILE);
-      let counts = null;
       try {
         console.log(
           `[info] scan 1/4 | vertices=${header.vertexCount} | sh_degree=${layout.degree} | staging positions`,
@@ -4520,15 +4619,20 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
           rootBounds = staged.bounds;
           timingsMs.scan_positions_ms = elapsedMsSince(scanStartedAt);
 
-          console.log('[info] scan 2/4 | building count tree from memory');
-          const countsStartedAt = Date.now();
-          counts = buildCountsTableFromPositionArray(
-            staged.positions,
-            header.vertexCount,
+          console.log(
+            '[info] scan 2/4 | building count-balanced k-d tiling tree from memory',
+          );
+          const tilingStartedAt = Date.now();
+          rootNodeMeta = await buildAdaptiveNodeTreeFromPositions(
+            {
+              positions: staged.positions,
+              vertexCount: header.vertexCount,
+            },
             rootBounds,
             args.maxDepth,
+            args.leafLimit,
           );
-          timingsMs.build_counts_ms = elapsedMsSince(countsStartedAt);
+          timingsMs.build_tiling_tree_ms = elapsedMsSince(tilingStartedAt);
           staged.positions = null;
         } else {
           rootBounds = await scanGlobalBoundsAndWritePositions(
@@ -4544,32 +4648,26 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
           );
           timingsMs.scan_positions_ms = elapsedMsSince(scanStartedAt);
 
-          console.log('[info] scan 2/4 | building count tree from positions');
-          const countsStartedAt = Date.now();
-          counts = await buildCountsTableFromPositionFile(
-            positionsPath,
-            header.vertexCount,
+          console.log(
+            '[info] scan 2/4 | building count-balanced k-d tiling tree from positions',
+          );
+          const tilingStartedAt = Date.now();
+          rootNodeMeta = await buildAdaptiveNodeTreeFromPositions(
+            {
+              positionsPath,
+              vertexCount: header.vertexCount,
+              chunkBytes: memoryPlan.scanChunkBytes,
+            },
             rootBounds,
             args.maxDepth,
-            { chunkBytes: memoryPlan.scanChunkBytes },
+            args.leafLimit,
           );
-          timingsMs.build_counts_ms = elapsedMsSince(countsStartedAt);
+          timingsMs.build_tiling_tree_ms = elapsedMsSince(tilingStartedAt);
         }
       } finally {
         await removeFileIfExists(positionsPath);
       }
-
-      rootNodeMeta = buildNodeTreeFromCounts(
-        counts,
-        rootBounds,
-        args.maxDepth,
-        args.leafLimit,
-        0,
-        0,
-        0,
-        0,
-      );
-      ensure(!!rootNodeMeta, 'Failed to build root node from PLY counts.');
+      ensure(!!rootNodeMeta, 'Failed to build k-d tiling tree.');
       pipelineState.rootBounds = serializeBoundsState(rootBounds);
       pipelineState.rootNode = serializeNodeMeta(rootNodeMeta);
       pipelineState.layout = {
@@ -4586,7 +4684,7 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
     }
 
     const treeStats = collectTreeStats(rootNodeMeta);
-    memoryPlan = makeMemoryBudgetPlan(args, { header, layout, treeStats });
+    memoryPlan = makeMemoryBudgetPlan(args, { header, layout });
     params.bucketChunkBytes = memoryPlan.bucketChunkBytes;
     const lodMaxDepth = Math.max(
       0,
@@ -4627,8 +4725,6 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
           writeConcurrency: partitionWriteConcurrency,
         },
       );
-      memoryPlan.partitionLookupDepth = partitionResult.lookupDepth;
-      memoryPlan.partitionLookupBytes = partitionResult.lookupBytes;
       timingsMs.partition_ms = elapsedMsSince(partitionStartedAt);
       partitionProgress.done(`rows=${partitionResult.rowCount}`);
       pipelineState.rootNode = serializeNodeMeta(rootNodeMeta);
@@ -4702,50 +4798,12 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
       nodesByKey,
     );
 
-    let tileset;
     const availableLevels = treeStats.maxLevel + 1;
-    const effectiveSubtreeLevels = Math.max(
-      1,
-      Math.min(args.subtreeLevels, Math.max(1, availableLevels)),
-    );
-    if (args.tilingMode === 'explicit') {
-      tileset = applyTilesetGltfContentExtensions({
-        asset: makeTilesetAsset(),
-        geometricError: rootTileNode.error,
-        root: applyRootTransform(tileToJson(rootTileNode), args.transform),
-      });
-    } else if (args.tilingMode === 'implicit') {
-      const subtreesDir = path.join(outputDirAbs, 'subtrees');
-      await writeAllSubtrees(
-        nodesByKey,
-        subtreesDir,
-        availableLevels,
-        effectiveSubtreeLevels,
-      );
-      tileset = applyTilesetGltfContentExtensions({
-        asset: makeTilesetAsset(),
-        geometricError: rootGeometricError,
-        root: applyRootTransform(
-          {
-            boundingVolume: {
-              box: applyContentBoxTransform(rootBounds.toBoxArray()),
-            },
-            refine: 'REPLACE',
-            geometricError: rootGeometricError,
-            content: { uri: 'tiles/{level}/{x}/{y}/{z}.glb' },
-            implicitTiling: {
-              subdivisionScheme: 'OCTREE',
-              availableLevels,
-              subtreeLevels: effectiveSubtreeLevels,
-              subtrees: { uri: 'subtrees/{level}/{x}/{y}/{z}.subtree' },
-            },
-          },
-          args.transform,
-        ),
-      });
-    } else {
-      throw new ConversionError(`Unknown tiling mode: ${args.tilingMode}`);
-    }
+    const tileset = applyTilesetGltfContentExtensions({
+      asset: makeTilesetAsset(),
+      geometricError: rootTileNode.error,
+      root: applyRootTransform(tileToJson(rootTileNode), args.transform),
+    });
 
     const writeMetadataStartedAt = Date.now();
     await fs.promises.writeFile(
@@ -4767,8 +4825,6 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
           nodesByKey.size,
           treeStats.maxLevel,
           availableLevels,
-          effectiveSubtreeLevels,
-          args.tilingMode === 'implicit' ? rootGeometricError : null,
           checkpointInfo,
           memoryPlan,
           {

@@ -1,11 +1,8 @@
-const fs = require('fs');
 const path = require('path');
 const { Worker } = require('worker_threads');
 
 const { ConversionError, Bounds, roundHalfToEven } = require('./parser');
 
-const SUBTREE_MAGIC = 0x74627573;
-const SUBTREE_VERSION = 1;
 const SOURCE_REPOSITORY = '3DGS-PLY-3DTiles-Converter';
 const DEFAULT_WORKER_SCRIPT = path.join(__dirname, 'convert-core.js');
 
@@ -471,28 +468,6 @@ function computeBounds(cloud) {
     if (max2 > maximum[2]) maximum[2] = max2;
   }
   return new Bounds(minimum, maximum);
-}
-
-function childBounds(parent, octant) {
-  const c = parent.center();
-  const mn = parent.minimum.slice();
-  const mx = parent.maximum.slice();
-  if (octant & 1) {
-    mn[0] = c[0];
-  } else {
-    mx[0] = c[0];
-  }
-  if (octant & 2) {
-    mn[1] = c[1];
-  } else {
-    mx[1] = c[1];
-  }
-  if (octant & 4) {
-    mn[2] = c[2];
-  } else {
-    mx[2] = c[2];
-  }
-  return new Bounds(mn, mx);
 }
 
 function chooseGridDims(bounds, targetCount) {
@@ -1041,223 +1016,6 @@ function rootGeometricErrorFromMinLevel(
   return minGeometricError / finestScale;
 }
 
-function padLength(length, alignment) {
-  const rem = length % alignment;
-  return rem === 0 ? 0 : alignment - rem;
-}
-
-function morton3(x, y, z) {
-  let result = 0;
-  const v = x | y | z;
-  if (v === 0) return 0;
-  const maxBits = 32 - Math.clz32(v);
-  for (let bit = 0; bit < maxBits; bit++) {
-    result |= ((x >> bit) & 1) << (3 * bit);
-    result |= ((y >> bit) & 1) << (3 * bit + 1);
-    result |= ((z >> bit) & 1) << (3 * bit + 2);
-  }
-  return result;
-}
-
-function subtreeNodeCount(levels) {
-  let total = 0;
-  let width = 1;
-  for (let i = 0; i < levels; i++) {
-    total += width;
-    width *= 8;
-  }
-  return total;
-}
-
-const MORTON_COORD_CACHE = new Map();
-
-function iterMortonCoords(depth) {
-  const cached = MORTON_COORD_CACHE.get(depth);
-  if (cached) {
-    return cached;
-  }
-  if (depth === 0) {
-    const root = [[0, 0, 0]];
-    MORTON_COORD_CACHE.set(depth, root);
-    return root;
-  }
-  const side = 1 << depth;
-  const out = [];
-  for (let z = 0; z < side; z++) {
-    for (let y = 0; y < side; y++) {
-      for (let x = 0; x < side; x++) {
-        out.push([x, y, z]);
-      }
-    }
-  }
-  out.sort((a, b) => morton3(a[0], a[1], a[2]) - morton3(b[0], b[1], b[2]));
-  MORTON_COORD_CACHE.set(depth, out);
-  return out;
-}
-
-function writeUint64LE(buffer, value, offset) {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new ConversionError(`Invalid UINT64 value: ${value}`);
-  }
-  const low = value >>> 0;
-  const high = Math.floor(value / 4294967296) >>> 0;
-  buffer.writeUInt32LE(low, offset);
-  buffer.writeUInt32LE(high, offset + 4);
-}
-
-function packBitsLsb(bits) {
-  const out = new Uint8Array(Math.ceil(bits.length / 8));
-  for (let i = 0; i < bits.length; i++) {
-    if (bits[i]) {
-      out[i >> 3] |= 1 << (i & 7);
-    }
-  }
-  return out;
-}
-
-function buildSubtreeArtifact(
-  level,
-  x,
-  y,
-  z,
-  availableLevels,
-  subtreeLevels,
-  hasNode,
-) {
-  const tileBits = new Uint8Array(subtreeNodeCount(subtreeLevels));
-  const childSubtreeBits = new Uint8Array(8 ** subtreeLevels);
-  let tileBitCount = 0;
-  let childSubtreeCount = 0;
-  let tileOff = 0;
-  let childOff = 0;
-
-  for (let relDepth = 0; relDepth < subtreeLevels; relDepth++) {
-    const globalLevel = level + relDepth;
-    for (const [lx, ly, lz] of iterMortonCoords(relDepth)) {
-      const gx = (x << relDepth) | lx;
-      const gy = (y << relDepth) | ly;
-      const gz = (z << relDepth) | lz;
-      const exists =
-        globalLevel < availableLevels && hasNode(globalLevel, gx, gy, gz)
-          ? 1
-          : 0;
-      tileBits[tileOff++] = exists;
-      tileBitCount += exists;
-    }
-  }
-
-  const childGlobal = level + subtreeLevels;
-  for (const [lx, ly, lz] of iterMortonCoords(subtreeLevels)) {
-    const gx = (x << subtreeLevels) | lx;
-    const gy = (y << subtreeLevels) | ly;
-    const gz = (z << subtreeLevels) | lz;
-    const exists =
-      childGlobal < availableLevels && hasNode(childGlobal, gx, gy, gz) ? 1 : 0;
-    childSubtreeBits[childOff++] = exists;
-    childSubtreeCount += exists;
-  }
-
-  const blobParts = [];
-  let blobLen = 0;
-  const bufferViews = [];
-  const addBufferView = (data) => {
-    const pad = (8 - (blobLen % 8)) % 8;
-    if (pad > 0) {
-      blobParts.push(Buffer.alloc(pad));
-      blobLen += pad;
-    }
-    const byteOffset = blobLen;
-    const buf = Buffer.from(data);
-    blobParts.push(buf);
-    blobLen += buf.length;
-    const bv = { buffer: 0, byteOffset, byteLength: buf.length };
-    bufferViews.push(bv);
-    return bufferViews.length - 1;
-  };
-
-  const availabilityObj = (bits, count) => {
-    if (count === bits.length) {
-      return { constant: 1 };
-    }
-    if (count === 0) {
-      return { constant: 0 };
-    }
-    const packed = packBitsLsb(bits);
-    return {
-      bitstream: addBufferView(packed),
-      availableCount: count,
-    };
-  };
-
-  const tileAvailability = availabilityObj(tileBits, tileBitCount);
-  const subtree = {
-    tileAvailability,
-    contentAvailability: [
-      tileAvailability.constant != null
-        ? { constant: tileAvailability.constant }
-        : {
-            bitstream: tileAvailability.bitstream,
-            availableCount: tileAvailability.availableCount,
-          },
-    ],
-    childSubtreeAvailability: availabilityObj(
-      childSubtreeBits,
-      childSubtreeCount,
-    ),
-  };
-
-  let blob = null;
-  if (bufferViews.length > 0) {
-    subtree.buffers = [{ uri: '', byteLength: blobLen }];
-    subtree.bufferViews = bufferViews;
-    blob = Buffer.alloc(blobLen);
-    let blobOffset = 0;
-    for (const part of blobParts) {
-      part.copy(blob, blobOffset);
-      blobOffset += part.length;
-    }
-  }
-
-  return { subtree, blob };
-}
-
-function buildSubtreeBinaryBuffer(subtree, blob) {
-  let subtreeJson = subtree;
-  let binaryChunk = Buffer.alloc(0);
-
-  if (blob && blob.length > 0) {
-    const binaryPad = padLength(blob.length, 8);
-    binaryChunk =
-      binaryPad > 0 ? Buffer.concat([blob, Buffer.alloc(binaryPad)]) : blob;
-    const { uri: _uri, ...restBuf0 } = subtree.buffers[0];
-    const newBuf0 = { ...restBuf0, byteLength: binaryChunk.length };
-    subtreeJson = {
-      ...subtree,
-      buffers: [newBuf0, ...subtree.buffers.slice(1)],
-    };
-  }
-
-  const jsonChunk = Buffer.from(JSON.stringify(subtreeJson), 'utf8');
-  const jsonPad = padLength(jsonChunk.length, 8);
-  const jsonChunkPadded =
-    jsonPad > 0
-      ? Buffer.concat([jsonChunk, Buffer.alloc(jsonPad, 0x20)])
-      : jsonChunk;
-
-  const header = Buffer.alloc(24);
-  header.writeUInt32LE(SUBTREE_MAGIC, 0);
-  header.writeUInt32LE(SUBTREE_VERSION, 4);
-  writeUint64LE(header, jsonChunkPadded.length, 8);
-  writeUint64LE(header, binaryChunk.length, 16);
-
-  return Buffer.concat([header, jsonChunkPadded, binaryChunk]);
-}
-
-function writeSubtreeFile(subtreePath, subtree, blob) {
-  fs.mkdirSync(path.dirname(subtreePath), { recursive: true });
-  fs.writeFileSync(subtreePath, buildSubtreeBinaryBuffer(subtree, blob));
-}
-
 module.exports = {
   SOURCE_REPOSITORY,
   ConsoleProgressBar,
@@ -1265,7 +1023,6 @@ module.exports = {
   computeBounds,
   computeThreeSigmaAabbDiagonalRadiusAt,
   computeThreeSigmaAabbDiagonalRadius,
-  childBounds,
   chooseGridDims,
   normalizeSplatTargetCount,
   constrainTargetSplatCount,
@@ -1275,6 +1032,4 @@ module.exports = {
   geometricErrorScaleForDepth,
   rootGeometricErrorFromMinLevel,
   writeThreeSigmaExtentComponents,
-  buildSubtreeArtifact,
-  writeSubtreeFile,
 };

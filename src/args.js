@@ -15,8 +15,6 @@ function usage() {
     '  --color-space <lin_rec709_display|srgb_rec709_display>',
     '  --max-depth <int>',
     '  --leaf-limit <int>',
-    '  --tiling-mode <explicit|implicit>',
-    '  --subtree-levels <int>',
     '  --min-geometric-error <number>',
     '  --spz-sh1-bits <1..8>',
     '  --spz-sh-rest-bits <1..8>',
@@ -41,8 +39,6 @@ const DEFAULT_CONVERSION_ARGS = {
   colorSpace: 'srgb_rec709_display',
   maxDepth: 5,
   leafLimit: 5000,
-  tilingMode: 'explicit',
-  subtreeLevels: 2,
   minGeometricError: null,
   spzSh1Bits: 8,
   spzShRestBits: 8,
@@ -289,9 +285,6 @@ function validateConversionArgs(args, { requireInput = false } = {}) {
   if (args.leafLimit < 1) {
     throw new ConversionError('--leaf-limit must be >= 1');
   }
-  if (args.subtreeLevels < 1) {
-    throw new ConversionError('--subtree-levels must be >= 1');
-  }
   if (args.spzSh1Bits < 1 || args.spzSh1Bits > 8) {
     throw new ConversionError('--spz-sh1-bits must be in [1, 8]');
   }
@@ -315,7 +308,6 @@ function validateConversionArgs(args, { requireInput = false } = {}) {
     ['lin_rec709_display', 'srgb_rec709_display'],
     '--color-space',
   );
-  assertChoice(args.tilingMode, ['explicit', 'implicit'], '--tiling-mode');
   assertChoice(args.sampleMode, ['sample', 'merge'], '--sample-mode');
   if (args.transform !== null) {
     if (!Array.isArray(args.transform) || args.transform.length !== 16) {
@@ -387,21 +379,6 @@ function parseArgs(argv) {
         throw new ConversionError(`Invalid integer for --leaf-limit: ${raw}`);
       }
       args.leafLimit = value;
-      continue;
-    }
-    if (token === '--tiling-mode') {
-      args.tilingMode = requireValue(token);
-      continue;
-    }
-    if (token === '--subtree-levels') {
-      const raw = requireValue(token);
-      const value = Number.parseInt(raw, 10);
-      if (!Number.isInteger(value)) {
-        throw new ConversionError(
-          `Invalid integer for --subtree-levels: ${raw}`,
-        );
-      }
-      args.subtreeLevels = value;
       continue;
     }
     if (token === '--min-geometric-error') {
@@ -607,21 +584,6 @@ function makeConversionArgs(
         DEFAULT_CONVERSION_ARGS.leafLimit,
       ),
       '--leaf-limit',
-    ),
-    tilingMode: firstDefined(
-      options.tilingMode,
-      options['tiling-mode'],
-      options.tiling_mode,
-      DEFAULT_CONVERSION_ARGS.tilingMode,
-    ),
-    subtreeLevels: normalizeToInt(
-      firstDefined(
-        options.subtreeLevels,
-        options['subtree-levels'],
-        options.subtree_levels,
-        DEFAULT_CONVERSION_ARGS.subtreeLevels,
-      ),
-      '--subtree-levels',
     ),
     minGeometricError: firstDefined(
       options.minGeometricError,
