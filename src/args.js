@@ -24,10 +24,11 @@ function usage() {
     '  --sampling-rate-per-level <0..1]',
     '  --sample-mode <sample|merge>',
     '  --memory-budget <gb>',
-    '  --open-inspector',
+    '  --obb / --aabb',
+    '  --open-inspector / --no-open-inspector',
     '  --self-test',
     '  --self-test-count <int>',
-    '  --clean',
+    '  --clean / --continue',
     '  --help',
   ].join('\n');
 }
@@ -49,8 +50,9 @@ const DEFAULT_CONVERSION_ARGS = {
   samplingRatePerLevel: 0.5,
   sampleMode: 'merge',
   memoryBudget: 2,
-  openInspector: false,
-  clean: false,
+  orientedBoundingBoxes: true,
+  openInspector: true,
+  clean: true,
   selfTest: false,
   selfTestCount: 1000000,
   help: false,
@@ -306,6 +308,9 @@ function validateConversionArgs(args, { requireInput = false } = {}) {
   if (!Number.isFinite(args.memoryBudget) || args.memoryBudget <= 0.0) {
     throw new ConversionError('--memory-budget must be > 0 GB');
   }
+  if (typeof args.orientedBoundingBoxes !== 'boolean') {
+    throw new ConversionError('--obb / --aabb must normalize to boolean');
+  }
 
   assertChoice(
     args.inputConvention,
@@ -464,8 +469,20 @@ function parseArgs(argv) {
       args.memoryBudget = value;
       continue;
     }
+    if (token === '--obb') {
+      args.orientedBoundingBoxes = true;
+      continue;
+    }
+    if (token === '--aabb') {
+      args.orientedBoundingBoxes = false;
+      continue;
+    }
     if (token === '--open-inspector') {
       args.openInspector = true;
+      continue;
+    }
+    if (token === '--no-open-inspector') {
+      args.openInspector = false;
       continue;
     }
     if (token === '--self-test') {
@@ -485,6 +502,10 @@ function parseArgs(argv) {
     }
     if (token === '--clean') {
       args.clean = true;
+      continue;
+    }
+    if (token === '--continue') {
+      args.clean = false;
       continue;
     }
     if (token.startsWith('--')) {
@@ -553,6 +574,17 @@ function makeConversionArgs(
       'Please provide either transform or coordinate, not both.',
     );
   }
+
+  const noOpenInspector = firstDefined(
+    options.noOpenInspector,
+    options['no-open-inspector'],
+    options.no_open_inspector,
+  );
+  const continueRequested = firstDefined(
+    options['continue'],
+    options.continueBuild,
+    options.continue_build,
+  );
 
   const merged = {
     ...DEFAULT_CONVERSION_ARGS,
@@ -666,13 +698,28 @@ function makeConversionArgs(
       ),
       '--memory-budget',
     ),
-    openInspector: firstDefined(
-      options.openInspector,
-      options['open-inspector'],
-      options.open_inspector,
-      DEFAULT_CONVERSION_ARGS.openInspector,
+    orientedBoundingBoxes: firstDefined(
+      options.orientedBoundingBoxes,
+      options['oriented-bounding-boxes'],
+      options.oriented_bounding_boxes,
+      options.obb,
+      options.useObb,
+      options.use_obb,
+      DEFAULT_CONVERSION_ARGS.orientedBoundingBoxes,
     ),
-    clean: firstDefined(options.clean, DEFAULT_CONVERSION_ARGS.clean),
+    openInspector:
+      noOpenInspector === true
+        ? false
+        : firstDefined(
+            options.openInspector,
+            options['open-inspector'],
+            options.open_inspector,
+            DEFAULT_CONVERSION_ARGS.openInspector,
+          ),
+    clean:
+      continueRequested === true
+        ? false
+        : firstDefined(options.clean, DEFAULT_CONVERSION_ARGS.clean),
     selfTest: firstDefined(
       options.selfTest,
       options['self-test'],

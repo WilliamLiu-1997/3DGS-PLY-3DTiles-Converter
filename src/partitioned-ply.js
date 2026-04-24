@@ -12,7 +12,6 @@ const {
   _canonicalGaussianRowByteSize,
   _readPlyHeaderFromHandle,
   _buildGaussianPlyLayout,
-  _forEachGaussianPlyPosition,
   _forEachGaussianPlyCanonicalRecord,
 } = require('./parser');
 
@@ -57,7 +56,7 @@ const {
 const DEFAULT_WORKER_SCRIPT = path.join(__dirname, 'convert-core.js');
 const TEMP_WORKSPACE_NAME = '.tmp-ply-partitions';
 const PIPELINE_STATE_FILE = 'pipeline-state.json';
-const PIPELINE_STATE_VERSION = 8;
+const PIPELINE_STATE_VERSION = 13;
 const PIPELINE_STAGE_BUCKETED = 'bucketed';
 const LEAF_BUCKET_DIR = 'leaf';
 const HANDOFF_BUCKET_DIR = 'handoff';
@@ -70,7 +69,7 @@ const SCAN_PROGRESS_ROW_INTERVAL = 8192;
 const PARTITION_PROGRESS_ROW_INTERVAL = 8192;
 const TILING_TREE_PROGRESS_ROW_INTERVAL = 65536;
 const POSITION_TMP_FILE = 'positions.tmp';
-const POSITION_ROW_BYTE_SIZE = 12;
+const POSITION_ROW_BYTE_SIZE = 16;
 const POSITION_INDEX_ROW_BYTE_SIZE = Uint32Array.BYTES_PER_ELEMENT;
 const POSITION_TMP_BUFFER_BYTES = 256 * 1024;
 const WRITEV_BATCH_CHUNKS = 1024;
@@ -83,6 +82,15 @@ const TILING_STRATEGY_KD_TREE = 'kd_tree';
 const ROUTE_MODE_KD = 'kd';
 const ROUTE_MODE_AXIS_SEGMENTS = 'axis_segments';
 const LONG_TILE_SPLIT_MODE = 'virtual_equal_length_axis_segments';
+const KD_TREE_SPLIT_DIRECTION = 'root_pca_basis_axis';
+const KD_TREE_SPLIT_DIRECTION_AABB = 'aabb_axis';
+const KD_TREE_COVARIANCE_WEIGHTING = 'unweighted_splat_centers';
+const KD_TREE_SPLIT_PLANE = 'visual_weighted_projection_histogram_median';
+const KD_TREE_SPLIT_BALANCE = 'root_pca_axis_visual_weighted';
+const KD_TREE_SPLIT_BALANCE_AABB = 'aabb_axis_visual_weighted';
+const TILE_BOUNDING_VOLUME_MODE_ROOT_PCA_OBB = 'root_pca_obb';
+const TILE_BOUNDING_VOLUME_MODE_AABB = 'aabb';
+const SPLIT_WEIGHT_FORMULA = 'max(opacity,1e-4)*radius3sigma^2';
 const ADAPTIVE_SPLIT_HISTOGRAM_BINS = 64;
 const ADAPTIVE_DENSE_CHILD_BUCKET_LIMIT = 4096;
 const ADAPTIVE_MAX_LONG_WIDTH_RATIO = 2.0;
@@ -241,7 +249,7 @@ function makeMemoryBudgetPlan(args, { header = null, layout = null } = {}) {
     positionTilingBytes == null || positionScanBytes == null
       ? null
       : Math.max(positionTilingBytes, positionScanBytes);
-  const positionFloatCount = header ? header.vertexCount * 3 : null;
+  const positionFloatCount = header ? header.vertexCount * 4 : null;
   const positionTmpBufferMax = Math.max(
     POSITION_ROW_BYTE_SIZE,
     Math.min(8 * BYTES_PER_MB, Math.floor(usableBudgetBytes / 16)),
@@ -344,6 +352,32 @@ function elapsedMsSince(startMs) {
   return Math.max(0, Date.now() - startMs);
 }
 
+function useOrientedBoundingBoxes(args) {
+  return !args || args.orientedBoundingBoxes !== false;
+}
+
+function tileBoundingVolumeModeForArgs(args) {
+  return useOrientedBoundingBoxes(args)
+    ? TILE_BOUNDING_VOLUME_MODE_ROOT_PCA_OBB
+    : TILE_BOUNDING_VOLUME_MODE_AABB;
+}
+
+function kdTreeSplitDirectionForArgs(args) {
+  return useOrientedBoundingBoxes(args)
+    ? KD_TREE_SPLIT_DIRECTION
+    : KD_TREE_SPLIT_DIRECTION_AABB;
+}
+
+function kdTreeSplitBalanceForArgs(args) {
+  return useOrientedBoundingBoxes(args)
+    ? KD_TREE_SPLIT_BALANCE
+    : KD_TREE_SPLIT_BALANCE_AABB;
+}
+
+function splitBasisLabelForArgs(args) {
+  return useOrientedBoundingBoxes(args) ? 'root-basis' : 'AABB-axis';
+}
+
 function applyRootTransform(root, transform) {
   if (!transform) {
     return root;
@@ -406,8 +440,29 @@ function pointOctantForNode(node, x, y, z) {
   return pointOctant(node.bounds, x, y, z, node.splitPoint, node.splitAxes);
 }
 
+function dotDirection(direction, x, y, z) {
+  return direction[0] * x + direction[1] * y + direction[2] * z;
+}
+
+function pointPlaneSlot(splitDirection, splitOffset, x, y, z) {
+  return dotDirection(splitDirection, x, y, z) >= splitOffset ? 1 : 0;
+}
+
+function pointKdSlotForNode(node, x, y, z) {
+  if (node.splitDirection && Number.isFinite(node.splitOffset)) {
+    return pointPlaneSlot(node.splitDirection, node.splitOffset, x, y, z);
+  }
+  return pointOctantForNode(node, x, y, z);
+}
+
 function coordinateForAxis(axis, x, y, z) {
   return axis === 1 ? y : axis === 2 ? z : x;
+}
+
+function coordinateForDirectionOrAxis(direction, axis, x, y, z) {
+  return direction
+    ? dotDirection(direction, x, y, z)
+    : coordinateForAxis(axis, x, y, z);
 }
 
 function pointSegmentForNode(node, x, y, z) {
@@ -426,8 +481,15 @@ function pointSegmentForNode(node, x, y, z) {
   if (!Number.isFinite(extent) || extent <= 0.0 || segmentCount <= 1) {
     return 0;
   }
+  const coordinate = coordinateForDirectionOrAxis(
+    node.segmentDirection,
+    axis,
+    x,
+    y,
+    z,
+  );
   const slot = Math.floor(
-    ((coordinateForAxis(axis, x, y, z) - min) / extent) * segmentCount,
+    ((coordinate - min) / extent) * segmentCount,
   );
   return Math.max(0, Math.min(segmentCount - 1, slot));
 }
@@ -506,6 +568,19 @@ function cloneBounds(bounds) {
   return new Bounds(bounds.minimum.slice(), bounds.maximum.slice());
 }
 
+function normalizeBoxArray(box) {
+  if (!Array.isArray(box) || box.length !== 12) {
+    return null;
+  }
+  const out = box.map((value) => Number(value));
+  return out.every((value) => Number.isFinite(value)) ? out : null;
+}
+
+function normalizeOrientedBox(box) {
+  const normalized = normalizeBoxArray(box);
+  return normalized && normalized.length === 12 ? normalized : null;
+}
+
 function normalizeSplitPoint(splitPoint) {
   return Array.isArray(splitPoint) && splitPoint.length === 3
     ? splitPoint.map((value) => Number(value))
@@ -516,6 +591,34 @@ function normalizeSplitAxes(splitAxes) {
   return Array.isArray(splitAxes) && splitAxes.length === 3
     ? splitAxes.map((value) => !!value)
     : null;
+}
+
+function normalizeVector3(values) {
+  if (!Array.isArray(values) && !ArrayBuffer.isView(values)) {
+    return null;
+  }
+  if (values.length !== 3) {
+    return null;
+  }
+  const out = Array.from(values, Number);
+  const length = Math.sqrt(
+    out[0] * out[0] + out[1] * out[1] + out[2] * out[2],
+  );
+  if (!Number.isFinite(length) || length <= ADAPTIVE_SPLIT_EPSILON) {
+    return null;
+  }
+  out[0] /= length;
+  out[1] /= length;
+  out[2] /= length;
+  return out;
+}
+
+function normalizeSplitDirection(splitDirection) {
+  return normalizeVector3(splitDirection);
+}
+
+function normalizeSplitOffset(splitOffset) {
+  return Number.isFinite(splitOffset) ? Number(splitOffset) : null;
 }
 
 function usesSegmentRouting(node) {
@@ -538,14 +641,18 @@ function makePartitionTreeNode({
   y,
   z,
   bounds,
+  orientedBox = null,
   count,
   leaf = true,
   splitPoint = null,
   splitAxes = null,
+  splitDirection = null,
+  splitOffset = null,
   childSlot = null,
   virtual = false,
   routeMode = ROUTE_MODE_KD,
   segmentAxis = null,
+  segmentDirection = null,
   segmentCount = null,
   segmentMin = null,
   segmentMax = null,
@@ -561,12 +668,16 @@ function makePartitionTreeNode({
     childSlot,
     count,
     bounds,
+    orientedBox: normalizeOrientedBox(orientedBox),
     leaf,
     virtual: !!virtual,
     routeMode,
     splitPoint: normalizeSplitPoint(splitPoint),
     splitAxes: normalizeSplitAxes(splitAxes),
+    splitDirection: normalizeSplitDirection(splitDirection),
+    splitOffset: normalizeSplitOffset(splitOffset),
     segmentAxis,
+    segmentDirection: normalizeSplitDirection(segmentDirection),
     segmentCount,
     segmentMin,
     segmentMax,
@@ -599,6 +710,9 @@ function serializeNodeMeta(node) {
     count: node.count,
     bounds: serializeBoundsState(node.bounds),
   };
+  if (node.orientedBox) {
+    meta.orientedBox = node.orientedBox.slice();
+  }
   if (node.depth !== node.level) {
     meta.depth = node.depth;
   }
@@ -621,8 +735,17 @@ function serializeNodeMeta(node) {
   if (node.splitAxes) {
     meta.splitAxes = node.splitAxes.slice();
   }
+  if (node.splitDirection) {
+    meta.splitDirection = node.splitDirection.slice();
+  }
+  if (Number.isFinite(node.splitOffset)) {
+    meta.splitOffset = node.splitOffset;
+  }
   if (Number.isInteger(node.segmentAxis)) {
     meta.segmentAxis = node.segmentAxis;
+  }
+  if (node.segmentDirection) {
+    meta.segmentDirection = node.segmentDirection.slice();
   }
   if (Number.isInteger(node.segmentCount) && node.segmentCount > 0) {
     meta.segmentCount = node.segmentCount;
@@ -690,12 +813,16 @@ function deserializeNodeMeta(data) {
     childSlot: Number.isInteger(data.childSlot) ? data.childSlot : null,
     count: data.count,
     bounds: deserializeBoundsState(data.bounds),
+    orientedBox: normalizeOrientedBox(data.orientedBox),
     leaf: data.leaf !== false,
     virtual: !!data.virtual,
     routeMode: data.routeMode ?? ROUTE_MODE_KD,
     splitPoint: normalizeSplitPoint(data.splitPoint),
     splitAxes: normalizeSplitAxes(data.splitAxes),
+    splitDirection: normalizeSplitDirection(data.splitDirection),
+    splitOffset: normalizeSplitOffset(data.splitOffset),
     segmentAxis: Number.isInteger(data.segmentAxis) ? data.segmentAxis : null,
+    segmentDirection: normalizeSplitDirection(data.segmentDirection),
     segmentCount:
       Number.isInteger(data.segmentCount) && data.segmentCount > 0
         ? data.segmentCount
@@ -798,7 +925,7 @@ function resolveLeafNodeForPoint(root, x, y, z) {
       slot = pointSegmentForNode(node, x, y, z);
       child = ensureChildrenBySegment(node).get(slot);
     } else {
-      slot = pointOctantForNode(node, x, y, z);
+      slot = pointKdSlotForNode(node, x, y, z);
       child = node.childrenByOct[slot];
     }
     ensure(
@@ -836,6 +963,13 @@ function makePipelineFingerprint(inputPath, inputStat, args) {
     maxDepth: args.maxDepth,
     leafLimit: args.leafLimit,
     tilingStrategy: TILING_STRATEGY_KD_TREE,
+    kdTreeSplitDirection: kdTreeSplitDirectionForArgs(args),
+    kdTreeCovarianceWeighting: KD_TREE_COVARIANCE_WEIGHTING,
+    kdTreeSplitPlane: KD_TREE_SPLIT_PLANE,
+    kdTreeSplitBalance: kdTreeSplitBalanceForArgs(args),
+    orientedBoundingBoxes: useOrientedBoundingBoxes(args),
+    tileBoundingVolumeMode: tileBoundingVolumeModeForArgs(args),
+    splitWeightFormula: SPLIT_WEIGHT_FORMULA,
     kdTreeSplitHistogramBins: ADAPTIVE_SPLIT_HISTOGRAM_BINS,
     kdTreeMaxLongWidthRatio: ADAPTIVE_MAX_LONG_WIDTH_RATIO,
     kdTreeLongTileSplitMode: LONG_TILE_SPLIT_MODE,
@@ -3842,6 +3976,35 @@ function updatePositionBounds(minimum, maximum, x, y, z) {
   if (z > maximum[2]) maximum[2] = z;
 }
 
+function normalizeSplitWeight(weight) {
+  return Number.isFinite(weight) && weight > 0.0 ? weight : 1.0;
+}
+
+function splitWeightFromScratch(scratch, extentScratch) {
+  writeThreeSigmaExtentComponents(
+    scratch.scaleLog,
+    0,
+    scratch.quat,
+    0,
+    extentScratch,
+    0,
+  );
+  const radiusSquared =
+    extentScratch[0] * extentScratch[0] +
+    extentScratch[1] * extentScratch[1] +
+    extentScratch[2] * extentScratch[2];
+  const opacity = Math.max(
+    Number.isFinite(scratch.opacity) ? scratch.opacity : 0.0,
+    1e-4,
+  );
+  return normalizeSplitWeight(
+    opacity *
+      (Number.isFinite(radiusSquared) && radiusSquared > 0.0
+        ? radiusSquared
+        : 1.0),
+  );
+}
+
 async function scanGlobalBoundsAndWritePositions(
   handle,
   filePath,
@@ -3864,10 +4027,12 @@ async function scanGlobalBoundsAndWritePositions(
   const buffer = Buffer.allocUnsafe(rowsPerBuffer * POSITION_ROW_BYTE_SIZE);
   const floatView =
     IS_LITTLE_ENDIAN && (buffer.byteOffset & 3) === 0
-      ? new Float32Array(buffer.buffer, buffer.byteOffset, rowsPerBuffer * 3)
+      ? new Float32Array(buffer.buffer, buffer.byteOffset, rowsPerBuffer * 4)
       : null;
   let bufferedRows = 0;
   let count = 0;
+  const scratch = makeRowScratch(0);
+  const extentScratch = new Float32Array(3);
   const progress = options.progress || null;
   const updateProgress = (force = false) => {
     if (!progress) {
@@ -3905,27 +4070,42 @@ async function scanGlobalBoundsAndWritePositions(
   };
 
   try {
-    await _forEachGaussianPlyPosition(
+    await _forEachGaussianPlyCanonicalRecord(
       handle,
       filePath,
       header,
       layout,
-      (_rowIndex, x, y, z) => {
+      (_rowIndex, _rowBuffer, rowView, rowFloats) => {
+        readBucketCoreRowIntoScratch(
+          LEAF_BUCKET_ENCODING,
+          rowView,
+          0,
+          scratch,
+          rowFloats,
+          0,
+        );
+        const x = scratch.position[0];
+        const y = scratch.position[1];
+        const z = scratch.position[2];
+        const weight = splitWeightFromScratch(scratch, extentScratch);
         const fx = Math.fround(x);
         const fy = Math.fround(y);
         const fz = Math.fround(z);
+        const fw = Math.fround(weight);
         updatePositionBounds(minimum, maximum, fx, fy, fz);
 
         if (floatView) {
-          const base = bufferedRows * 3;
+          const base = bufferedRows * 4;
           floatView[base + 0] = fx;
           floatView[base + 1] = fy;
           floatView[base + 2] = fz;
+          floatView[base + 3] = fw;
         } else {
           const base = bufferedRows * POSITION_ROW_BYTE_SIZE;
           buffer.writeFloatLE(fx, base + 0);
           buffer.writeFloatLE(fy, base + 4);
           buffer.writeFloatLE(fz, base + 8);
+          buffer.writeFloatLE(fw, base + 12);
         }
 
         bufferedRows += 1;
@@ -3961,7 +4141,10 @@ async function scanGlobalBoundsAndStagePositionsInMemory(
   const minimum = [Infinity, Infinity, Infinity];
   const maximum = [-Infinity, -Infinity, -Infinity];
   const positions = new Float32Array(header.vertexCount * 3);
+  const weights = new Float32Array(header.vertexCount);
   let count = 0;
+  const scratch = makeRowScratch(0);
+  const extentScratch = new Float32Array(3);
   const progress = options.progress || null;
   const updateProgress = (force = false) => {
     if (!progress) {
@@ -3973,12 +4156,24 @@ async function scanGlobalBoundsAndStagePositionsInMemory(
     progress.update(count);
   };
 
-  await _forEachGaussianPlyPosition(
+  await _forEachGaussianPlyCanonicalRecord(
     handle,
     filePath,
     header,
     layout,
-    (rowIndex, x, y, z) => {
+    (rowIndex, _rowBuffer, rowView, rowFloats) => {
+      readBucketCoreRowIntoScratch(
+        LEAF_BUCKET_ENCODING,
+        rowView,
+        0,
+        scratch,
+        rowFloats,
+        0,
+      );
+      const x = scratch.position[0];
+      const y = scratch.position[1];
+      const z = scratch.position[2];
+      const weight = splitWeightFromScratch(scratch, extentScratch);
       const fx = Math.fround(x);
       const fy = Math.fround(y);
       const fz = Math.fround(z);
@@ -3988,6 +4183,7 @@ async function scanGlobalBoundsAndStagePositionsInMemory(
       positions[base + 0] = fx;
       positions[base + 1] = fy;
       positions[base + 2] = fz;
+      weights[rowIndex] = Math.fround(weight);
       count += 1;
       updateProgress();
     },
@@ -4003,6 +4199,7 @@ async function scanGlobalBoundsAndStagePositionsInMemory(
   return {
     bounds: new Bounds(minimum, maximum),
     positions,
+    weights,
   };
 }
 
@@ -4040,19 +4237,31 @@ function collectAdaptiveSplitCandidates(node, maxDepth, leafLimit, out) {
   }
 }
 
-function makeAdaptiveSplitStats(node) {
+function makeAdaptiveSplitStats(node, basisAxes = null) {
+  const normalizedBasisAxes = basisAxes ? normalizeBasisAxes(basisAxes) : null;
   return {
     node,
     count: 0,
-    histograms: [
-      new Float64Array(ADAPTIVE_SPLIT_HISTOGRAM_BINS),
-      new Float64Array(ADAPTIVE_SPLIT_HISTOGRAM_BINS),
-      new Float64Array(ADAPTIVE_SPLIT_HISTOGRAM_BINS),
-    ],
+    totalWeight: 0.0,
+    mean: [0.0, 0.0, 0.0],
+    covarianceM2: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     minimum: [Infinity, Infinity, Infinity],
     maximum: [-Infinity, -Infinity, -Infinity],
     splitPoint: null,
     splitAxes: null,
+    splitDirection: null,
+    splitOffset: null,
+    projectionMin: null,
+    projectionMax: null,
+    projectionHistogram: null,
+    projectionTotalWeight: 0.0,
+    basisAxes: normalizedBasisAxes,
+    basisProjectionMinimum: normalizedBasisAxes
+      ? [Infinity, Infinity, Infinity]
+      : null,
+    basisProjectionMaximum: normalizedBasisAxes
+      ? [-Infinity, -Infinity, -Infinity]
+      : null,
     action: null,
     childStats: null,
   };
@@ -4104,88 +4313,536 @@ function aspectSegmentCount(aspect) {
   return Math.max(2, Math.ceil(aspect / ADAPTIVE_MAX_LONG_WIDTH_RATIO));
 }
 
-function updateAdaptiveSplitStats(stats, x, y, z) {
-  const bounds = stats.node.bounds;
-  const boundMin = bounds.minimum;
-  const boundMax = bounds.maximum;
+function updatePositionMomentStats(stats, x, y, z) {
   const minimum = stats.minimum;
   const maximum = stats.maximum;
-  const histograms = stats.histograms;
-  stats.count += 1;
+  const nextCount = stats.count + 1;
+  const mean = stats.mean;
+  const dx = x - mean[0];
+  const dy = y - mean[1];
+  const dz = z - mean[2];
+  const invCount = 1.0 / nextCount;
+
+  mean[0] += dx * invCount;
+  mean[1] += dy * invCount;
+  mean[2] += dz * invCount;
+
+  const dx2 = x - mean[0];
+  const dy2 = y - mean[1];
+  const dz2 = z - mean[2];
+  const m2 = stats.covarianceM2;
+  m2[0] += dx * dx2;
+  m2[1] += dx * dy2;
+  m2[2] += dx * dz2;
+  m2[3] += dy * dy2;
+  m2[4] += dy * dz2;
+  m2[5] += dz * dz2;
+
+  stats.count = nextCount;
 
   if (x < minimum[0]) minimum[0] = x;
   if (x > maximum[0]) maximum[0] = x;
-  let extent = boundMax[0] - boundMin[0];
-  let bin = 0;
-  if (Number.isFinite(extent) && extent > 0.0) {
-    bin = Math.floor(
-      ((x - boundMin[0]) / extent) * ADAPTIVE_SPLIT_HISTOGRAM_BINS,
-    );
-    bin = Math.max(0, Math.min(ADAPTIVE_SPLIT_HISTOGRAM_BINS - 1, bin));
-  }
-  histograms[0][bin] += 1;
 
   if (y < minimum[1]) minimum[1] = y;
   if (y > maximum[1]) maximum[1] = y;
-  extent = boundMax[1] - boundMin[1];
-  bin = 0;
-  if (Number.isFinite(extent) && extent > 0.0) {
-    bin = Math.floor(
-      ((y - boundMin[1]) / extent) * ADAPTIVE_SPLIT_HISTOGRAM_BINS,
-    );
-    bin = Math.max(0, Math.min(ADAPTIVE_SPLIT_HISTOGRAM_BINS - 1, bin));
-  }
-  histograms[1][bin] += 1;
 
   if (z < minimum[2]) minimum[2] = z;
   if (z > maximum[2]) maximum[2] = z;
-  extent = boundMax[2] - boundMin[2];
-  bin = 0;
-  if (Number.isFinite(extent) && extent > 0.0) {
-    bin = Math.floor(
-      ((z - boundMin[2]) / extent) * ADAPTIVE_SPLIT_HISTOGRAM_BINS,
-    );
-    bin = Math.max(0, Math.min(ADAPTIVE_SPLIT_HISTOGRAM_BINS - 1, bin));
-  }
-  histograms[2][bin] += 1;
 }
 
-function chooseAdaptiveAxisSplit(stats, axis) {
-  const total = stats.count;
-  if (total <= 1) {
-    return null;
+function updateAdaptiveSplitStats(stats, x, y, z, weight = 1.0) {
+  updatePositionMomentStats(stats, x, y, z);
+  stats.totalWeight += normalizeSplitWeight(weight);
+  if (stats.basisAxes) {
+    for (let axis = 0; axis < 3; axis++) {
+      const projection = dotDirection(stats.basisAxes[axis], x, y, z);
+      if (projection < stats.basisProjectionMinimum[axis]) {
+        stats.basisProjectionMinimum[axis] = projection;
+      }
+      if (projection > stats.basisProjectionMaximum[axis]) {
+        stats.basisProjectionMaximum[axis] = projection;
+      }
+    }
+  }
+}
+
+function eigenDecompositionSymmetric3x3(matrix) {
+  const a = matrix.slice();
+  const vectors = [
+    1.0, 0.0, 0.0,
+    0.0, 1.0, 0.0,
+    0.0, 0.0, 1.0,
+  ];
+  const index = (row, col) => row * 3 + col;
+
+  for (let sweep = 0; sweep < 16; sweep++) {
+    let p = 0;
+    let q = 1;
+    let largest = Math.abs(a[index(0, 1)]);
+    const xz = Math.abs(a[index(0, 2)]);
+    if (xz > largest) {
+      p = 0;
+      q = 2;
+      largest = xz;
+    }
+    const yz = Math.abs(a[index(1, 2)]);
+    if (yz > largest) {
+      p = 1;
+      q = 2;
+      largest = yz;
+    }
+    if (largest <= ADAPTIVE_SPLIT_EPSILON) {
+      break;
+    }
+
+    const app = a[index(p, p)];
+    const aqq = a[index(q, q)];
+    const apq = a[index(p, q)];
+    if (!Number.isFinite(apq) || Math.abs(apq) <= ADAPTIVE_SPLIT_EPSILON) {
+      break;
+    }
+
+    const tau = (aqq - app) / (2.0 * apq);
+    const t =
+      tau >= 0.0
+        ? 1.0 / (tau + Math.sqrt(1.0 + tau * tau))
+        : -1.0 / (-tau + Math.sqrt(1.0 + tau * tau));
+    const c = 1.0 / Math.sqrt(1.0 + t * t);
+    const s = t * c;
+
+    for (let k = 0; k < 3; k++) {
+      if (k === p || k === q) {
+        continue;
+      }
+      const akp = a[index(k, p)];
+      const akq = a[index(k, q)];
+      const newKp = c * akp - s * akq;
+      const newKq = s * akp + c * akq;
+      a[index(k, p)] = newKp;
+      a[index(p, k)] = newKp;
+      a[index(k, q)] = newKq;
+      a[index(q, k)] = newKq;
+    }
+
+    a[index(p, p)] = app - t * apq;
+    a[index(q, q)] = aqq + t * apq;
+    a[index(p, q)] = 0.0;
+    a[index(q, p)] = 0.0;
+
+    for (let k = 0; k < 3; k++) {
+      const vkp = vectors[index(k, p)];
+      const vkq = vectors[index(k, q)];
+      vectors[index(k, p)] = c * vkp - s * vkq;
+      vectors[index(k, q)] = s * vkp + c * vkq;
+    }
   }
 
-  const bounds = stats.node.bounds;
-  const boundMin = bounds.minimum[axis];
-  const boundMax = bounds.maximum[axis];
-  const boundExtent = boundMax - boundMin;
-  const observedMin = stats.minimum[axis];
-  const observedMax = stats.maximum[axis];
-  const observedExtent = observedMax - observedMin;
+  const entries = [0, 1, 2]
+    .map((axis) => ({
+      value: a[index(axis, axis)],
+      vector: [
+        vectors[index(0, axis)],
+        vectors[index(1, axis)],
+        vectors[index(2, axis)],
+      ],
+    }))
+    .sort((lhs, rhs) => rhs.value - lhs.value);
+
+  return {
+    values: entries.map((entry) => entry.value),
+    vectors: entries.map((entry) => entry.vector),
+  };
+}
+
+function projectionRangeForBounds(bounds, direction) {
+  const min = bounds.minimum;
+  const max = bounds.maximum;
+  let projectionMin = Infinity;
+  let projectionMax = -Infinity;
+  for (let ix = 0; ix < 2; ix++) {
+    const x = ix === 0 ? min[0] : max[0];
+    for (let iy = 0; iy < 2; iy++) {
+      const y = iy === 0 ? min[1] : max[1];
+      for (let iz = 0; iz < 2; iz++) {
+        const z = iz === 0 ? min[2] : max[2];
+        const projection = dotDirection(direction, x, y, z);
+        if (projection < projectionMin) projectionMin = projection;
+        if (projection > projectionMax) projectionMax = projection;
+      }
+    }
+  }
+  return { minimum: projectionMin, maximum: projectionMax };
+}
+
+function defaultBasisAxes() {
+  return [
+    [1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0],
+  ];
+}
+
+function normalizeBasisAxes(axes) {
+  if (!Array.isArray(axes) || axes.length !== 3) {
+    return defaultBasisAxes();
+  }
+  const normalized = axes.map((axis) => normalizeVector3(axis));
+  return normalized.every((axis) => !!axis) ? normalized : defaultBasisAxes();
+}
+
+function projectedAspectInfoForBasis(bounds, basisAxes) {
+  const axes = normalizeBasisAxes(basisAxes);
+  const ranked = axes
+    .map((direction, axis) => {
+      const range = projectionRangeForBounds(bounds, direction);
+      const extent = range.maximum - range.minimum;
+      return {
+        axis,
+        direction,
+        range,
+        extent: Number.isFinite(extent) ? Math.max(0.0, extent) : 0.0,
+      };
+    })
+    .sort((a, b) => b.extent - a.extent);
+  const longest = ranked[0];
+  const width = ranked[1];
   const epsilon = Math.max(
     ADAPTIVE_SPLIT_EPSILON,
-    Math.abs(boundExtent) * ADAPTIVE_SPLIT_EPSILON,
+    longest.extent * ADAPTIVE_SPLIT_EPSILON,
+  );
+  return {
+    aspect:
+      longest.extent > epsilon
+        ? longest.extent / Math.max(width.extent, epsilon)
+        : 1.0,
+    axis: longest.axis,
+    direction: longest.direction,
+    range: longest.range,
+    longestExtent: longest.extent,
+    widthExtent: width.extent,
+  };
+}
+
+function projectedAspectInfoFromStats(stats, bounds, basisAxes) {
+  if (
+    stats &&
+    stats.basisAxes &&
+    stats.basisProjectionMinimum &&
+    stats.basisProjectionMaximum
+  ) {
+    const ranked = stats.basisAxes
+      .map((direction, axis) => {
+        const minimum = stats.basisProjectionMinimum[axis];
+        const maximum = stats.basisProjectionMaximum[axis];
+        const extent = maximum - minimum;
+        return {
+          axis,
+          direction,
+          range: { minimum, maximum },
+          extent: Number.isFinite(extent) ? Math.max(0.0, extent) : 0.0,
+        };
+      })
+      .sort((a, b) => b.extent - a.extent);
+    const longest = ranked[0];
+    const width = ranked[1];
+    const epsilon = Math.max(
+      ADAPTIVE_SPLIT_EPSILON,
+      longest.extent * ADAPTIVE_SPLIT_EPSILON,
+    );
+    return {
+      aspect:
+        longest.extent > epsilon
+          ? longest.extent / Math.max(width.extent, epsilon)
+          : 1.0,
+      axis: longest.axis,
+      direction: longest.direction,
+      range: longest.range,
+      longestExtent: longest.extent,
+      widthExtent: width.extent,
+    };
+  }
+  return projectedAspectInfoForBasis(bounds, basisAxes);
+}
+
+function cross3(lhs, rhs) {
+  return [
+    lhs[1] * rhs[2] - lhs[2] * rhs[1],
+    lhs[2] * rhs[0] - lhs[0] * rhs[2],
+    lhs[0] * rhs[1] - lhs[1] * rhs[0],
+  ];
+}
+
+function dot3(lhs, rhs) {
+  return lhs[0] * rhs[0] + lhs[1] * rhs[1] + lhs[2] * rhs[2];
+}
+
+function subtractProjection(vector, axis) {
+  const scale = dot3(vector, axis);
+  return [
+    vector[0] - axis[0] * scale,
+    vector[1] - axis[1] * scale,
+    vector[2] - axis[2] * scale,
+  ];
+}
+
+function fallbackAxisLeastAlignedWith(axis) {
+  const absX = Math.abs(axis[0]);
+  const absY = Math.abs(axis[1]);
+  const absZ = Math.abs(axis[2]);
+  if (absX <= absY && absX <= absZ) {
+    return [1.0, 0.0, 0.0];
+  }
+  if (absY <= absX && absY <= absZ) {
+    return [0.0, 1.0, 0.0];
+  }
+  return [0.0, 0.0, 1.0];
+}
+
+function stableOrientedAxis(axis) {
+  const normalized = normalizeVector3(axis);
+  if (!normalized) {
+    return null;
+  }
+  let strongestAxis = 0;
+  let strongestAbs = Math.abs(normalized[0]);
+  for (let i = 1; i < 3; i++) {
+    const absValue = Math.abs(normalized[i]);
+    if (absValue > strongestAbs) {
+      strongestAxis = i;
+      strongestAbs = absValue;
+    }
+  }
+  if (normalized[strongestAxis] < 0.0) {
+    normalized[0] = -normalized[0];
+    normalized[1] = -normalized[1];
+    normalized[2] = -normalized[2];
+  }
+  return normalized;
+}
+
+function orthonormalBasisFromMomentStats(stats) {
+  const m2 = stats.covarianceM2 || [];
+  const maxAbs = Math.max(
+    Math.abs(m2[0] || 0.0),
+    Math.abs(m2[1] || 0.0),
+    Math.abs(m2[2] || 0.0),
+    Math.abs(m2[3] || 0.0),
+    Math.abs(m2[4] || 0.0),
+    Math.abs(m2[5] || 0.0),
+  );
+  if (!Number.isFinite(maxAbs) || maxAbs <= ADAPTIVE_SPLIT_EPSILON) {
+    return [
+      [1.0, 0.0, 0.0],
+      [0.0, 1.0, 0.0],
+      [0.0, 0.0, 1.0],
+    ];
+  }
+
+  const decomposition = eigenDecompositionSymmetric3x3([
+    m2[0], m2[1], m2[2],
+    m2[1], m2[3], m2[4],
+    m2[2], m2[4], m2[5],
+  ]);
+  const axis0 =
+    stableOrientedAxis(decomposition.vectors[0]) || [1.0, 0.0, 0.0];
+  let axis1 = stableOrientedAxis(
+    subtractProjection(decomposition.vectors[1], axis0),
+  );
+  if (!axis1) {
+    axis1 = stableOrientedAxis(
+      subtractProjection(fallbackAxisLeastAlignedWith(axis0), axis0),
+    );
+  }
+  if (!axis1) {
+    axis1 = [0.0, 1.0, 0.0];
+  }
+  let axis2 = normalizeVector3(cross3(axis0, axis1));
+  if (!axis2) {
+    axis2 = stableOrientedAxis(
+      subtractProjection(fallbackAxisLeastAlignedWith(axis1), axis1),
+    );
+  }
+  axis2 = axis2 || [0.0, 0.0, 1.0];
+  return [axis0, axis1, axis2];
+}
+
+function makeOrientedBoxStats(node) {
+  return {
+    node,
+    count: 0,
+    mean: [0.0, 0.0, 0.0],
+    covarianceM2: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    minimum: [Infinity, Infinity, Infinity],
+    maximum: [-Infinity, -Infinity, -Infinity],
+    axes: null,
+    projectionMinimum: [Infinity, Infinity, Infinity],
+    projectionMaximum: [-Infinity, -Infinity, -Infinity],
+  };
+}
+
+function cloneBasisAxes(axes) {
+  return axes.map((axis) => axis.slice());
+}
+
+function prepareOrientedBoxStats(stats, basisAxes = null) {
+  stats.axes = basisAxes
+    ? cloneBasisAxes(basisAxes)
+    : orthonormalBasisFromMomentStats(stats);
+  stats.projectionMinimum = [Infinity, Infinity, Infinity];
+  stats.projectionMaximum = [-Infinity, -Infinity, -Infinity];
+}
+
+function updateOrientedBoxProjectionStats(stats, x, y, z) {
+  const axes = stats.axes;
+  if (!axes) {
+    return;
+  }
+  for (let axis = 0; axis < 3; axis++) {
+    const projection = dotDirection(axes[axis], x, y, z);
+    if (projection < stats.projectionMinimum[axis]) {
+      stats.projectionMinimum[axis] = projection;
+    }
+    if (projection > stats.projectionMaximum[axis]) {
+      stats.projectionMaximum[axis] = projection;
+    }
+  }
+}
+
+function orientedBoxFromProjectionStats(stats, fallbackBounds) {
+  if (!stats || !stats.axes || stats.count <= 0) {
+    return fallbackBounds ? fallbackBounds.toBoxArray() : null;
+  }
+  const center = [0.0, 0.0, 0.0];
+  const halfAxes = [];
+  for (let axis = 0; axis < 3; axis++) {
+    const min = stats.projectionMinimum[axis];
+    const max = stats.projectionMaximum[axis];
+    if (!Number.isFinite(min) || !Number.isFinite(max)) {
+      return fallbackBounds ? fallbackBounds.toBoxArray() : null;
+    }
+    const midpoint = (min + max) * 0.5;
+    const halfExtent = Math.max((max - min) * 0.5, 1e-6);
+    const direction = stats.axes[axis];
+    center[0] += direction[0] * midpoint;
+    center[1] += direction[1] * midpoint;
+    center[2] += direction[2] * midpoint;
+    halfAxes.push([
+      direction[0] * halfExtent,
+      direction[1] * halfExtent,
+      direction[2] * halfExtent,
+    ]);
+  }
+  return [
+    center[0],
+    center[1],
+    center[2],
+    halfAxes[0][0],
+    halfAxes[0][1],
+    halfAxes[0][2],
+    halfAxes[1][0],
+    halfAxes[1][1],
+    halfAxes[1][2],
+    halfAxes[2][0],
+    halfAxes[2][1],
+    halfAxes[2][2],
+  ];
+}
+
+function makeKdSplitAction(stats, tightBounds, basisAxes = null) {
+  const basisInfo = projectedAspectInfoFromStats(stats, tightBounds, basisAxes);
+  const splitDirection = basisInfo.direction;
+  if (!splitDirection || !basisInfo.range) {
+    return null;
+  }
+  const projectionRange = basisInfo.range;
+  const projectionExtent = projectionRange.maximum - projectionRange.minimum;
+  const epsilon = Math.max(
+    ADAPTIVE_SPLIT_EPSILON,
+    Math.abs(projectionExtent) * ADAPTIVE_SPLIT_EPSILON,
   );
   if (
-    !Number.isFinite(boundExtent) ||
-    !Number.isFinite(observedExtent) ||
-    boundExtent <= epsilon ||
-    observedExtent <= epsilon
+    !Number.isFinite(projectionExtent) ||
+    projectionExtent <= epsilon ||
+    !Number.isFinite(projectionRange.minimum) ||
+    !Number.isFinite(projectionRange.maximum)
+  ) {
+    return null;
+  }
+  return {
+    kind: ROUTE_MODE_KD,
+    basisAxis: basisInfo.axis,
+    splitDirection,
+    splitOffset: null,
+    projectionMin: projectionRange.minimum,
+    projectionMax: projectionRange.maximum,
+  };
+}
+
+function resetAdaptiveProjectionStats(stats) {
+  const action = stats.action;
+  ensure(
+    action && action.kind === ROUTE_MODE_KD,
+    `Missing k-d projection action for node ${stats.node.key}.`,
+  );
+  stats.projectionMin = action.projectionMin;
+  stats.projectionMax = action.projectionMax;
+  stats.projectionHistogram = new Float64Array(ADAPTIVE_SPLIT_HISTOGRAM_BINS);
+  stats.projectionTotalWeight = 0.0;
+}
+
+function updateAdaptiveProjectionStats(stats, x, y, z, weight = 1.0) {
+  const action = stats.action;
+  const direction = action ? action.splitDirection : null;
+  if (!direction || !stats.projectionHistogram) {
+    return;
+  }
+  const min = stats.projectionMin;
+  const max = stats.projectionMax;
+  const extent = max - min;
+  if (!Number.isFinite(extent) || extent <= 0.0) {
+    return;
+  }
+  const projection = dotDirection(direction, x, y, z);
+  const splitWeight = normalizeSplitWeight(weight);
+  let bin = Math.floor(
+    ((projection - min) / extent) * ADAPTIVE_SPLIT_HISTOGRAM_BINS,
+  );
+  bin = Math.max(0, Math.min(ADAPTIVE_SPLIT_HISTOGRAM_BINS - 1, bin));
+  stats.projectionHistogram[bin] += splitWeight;
+  stats.projectionTotalWeight += splitWeight;
+}
+
+function chooseProjectionSplitOffset(stats) {
+  const action = stats.action;
+  const histogram = stats.projectionHistogram;
+  if (!action || !histogram) {
+    return null;
+  }
+  const min = stats.projectionMin;
+  const max = stats.projectionMax;
+  const extent = max - min;
+  const epsilon = Math.max(
+    ADAPTIVE_SPLIT_EPSILON,
+    Math.abs(extent) * ADAPTIVE_SPLIT_EPSILON,
+  );
+  if (
+    !Number.isFinite(extent) ||
+    extent <= epsilon ||
+    !Number.isFinite(stats.projectionTotalWeight) ||
+    stats.projectionTotalWeight <= 0.0
   ) {
     return null;
   }
 
-  const histogram = stats.histograms[axis];
-  let lower = 0;
+  let lower = 0.0;
   let bestBoundary = -1;
   let bestBalance = Infinity;
   for (let boundary = 1; boundary < ADAPTIVE_SPLIT_HISTOGRAM_BINS; boundary++) {
     lower += histogram[boundary - 1];
-    if (lower <= 0 || lower >= total) {
+    if (lower <= 0.0 || lower >= stats.projectionTotalWeight) {
       continue;
     }
-    const balance = Math.abs(lower - total * 0.5);
+    const balance = Math.abs(lower - stats.projectionTotalWeight * 0.5);
     if (balance < bestBalance) {
       bestBalance = balance;
       bestBoundary = boundary;
@@ -4194,87 +4851,64 @@ function chooseAdaptiveAxisSplit(stats, axis) {
 
   if (bestBoundary > 0) {
     const split =
-      boundMin + (boundExtent * bestBoundary) / ADAPTIVE_SPLIT_HISTOGRAM_BINS;
-    if (split > boundMin + epsilon && split < boundMax - epsilon) {
+      min + (extent * bestBoundary) / ADAPTIVE_SPLIT_HISTOGRAM_BINS;
+    if (split > min + epsilon && split < max - epsilon) {
       return split;
     }
   }
 
-  const fallback = (observedMin + observedMax) * 0.5;
-  if (fallback > boundMin + epsilon && fallback < boundMax - epsilon) {
-    return fallback;
+  const meanProjection = dotDirection(
+    action.splitDirection,
+    stats.mean[0],
+    stats.mean[1],
+    stats.mean[2],
+  );
+  if (meanProjection > min + epsilon && meanProjection < max - epsilon) {
+    return meanProjection;
   }
   return null;
 }
 
-function chooseAdaptiveSplit(stats) {
-  if (stats.count <= 1) {
-    return false;
-  }
-
-  const observedExtents = [
-    stats.maximum[0] - stats.minimum[0],
-    stats.maximum[1] - stats.minimum[1],
-    stats.maximum[2] - stats.minimum[2],
-  ];
-  const maxObservedExtent = Math.max(
-    observedExtents[0],
-    observedExtents[1],
-    observedExtents[2],
-  );
-  if (!Number.isFinite(maxObservedExtent) || maxObservedExtent <= 0.0) {
-    return false;
-  }
-
-  const axesByExtent = observedExtents
-    .map((extent, axis) => ({
-      axis,
-      extent: Number.isFinite(extent) ? Math.max(0.0, extent) : 0.0,
-    }))
-    .sort((a, b) => b.extent - a.extent);
-
-  for (const candidate of axesByExtent) {
-    const axis = candidate.axis;
-    const split = chooseAdaptiveAxisSplit(stats, axis);
-    if (split == null) {
-      continue;
-    }
-    const splitPoint = defaultSplitPointForBounds(stats.node.bounds);
-    const splitAxes = [false, false, false];
-    splitPoint[axis] = split;
-    splitAxes[axis] = true;
-    stats.splitPoint = splitPoint;
-    stats.splitAxes = splitAxes;
+function finalizeKdSplitAction(stats) {
+  const action = stats.action;
+  if (!action || action.kind !== ROUTE_MODE_KD) {
     return true;
   }
-
-  return false;
-}
-
-function makeKdSplitAction(stats) {
-  if (!chooseAdaptiveSplit(stats)) {
-    return null;
+  const splitOffset = chooseProjectionSplitOffset(stats);
+  if (!Number.isFinite(splitOffset)) {
+    return false;
   }
-  return {
-    kind: ROUTE_MODE_KD,
-    splitPoint: stats.splitPoint,
-    splitAxes: stats.splitAxes,
-  };
+  action.splitOffset = splitOffset;
+  stats.splitDirection = action.splitDirection.slice();
+  stats.splitOffset = splitOffset;
+  return true;
 }
 
-function makeVirtualSegmentSplitAction(node, tightBounds) {
+function makeVirtualSegmentSplitAction(
+  node,
+  tightBounds,
+  basisAxes = null,
+  projectedAspectInfo = null,
+) {
   if (node.level <= 0 || node.aspectSplitExhausted) {
     return null;
   }
 
-  const aspectInfo = longWidthAspectFromExtents(tightBounds.extents());
+  const aspectInfo = projectedAspectInfo || (basisAxes
+    ? projectedAspectInfoForBasis(tightBounds, basisAxes)
+    : longWidthAspectFromExtents(tightBounds.extents()));
   if (aspectInfo.aspect <= ADAPTIVE_MAX_LONG_WIDTH_RATIO) {
     return null;
   }
 
-  const axis = aspectInfo.longestAxis;
-  const segmentMin = tightBounds.minimum[axis];
-  const segmentMax = tightBounds.maximum[axis];
+  const axis = basisAxes ? aspectInfo.axis : aspectInfo.longestAxis;
+  const segmentDirection = basisAxes ? aspectInfo.direction : null;
+  const segmentMin = basisAxes
+    ? aspectInfo.range.minimum
+    : tightBounds.minimum[axis];
+  const segmentMax = basisAxes
+    ? aspectInfo.range.maximum
+    : tightBounds.maximum[axis];
   const segmentExtent = segmentMax - segmentMin;
   const epsilon = Math.max(
     ADAPTIVE_SPLIT_EPSILON,
@@ -4296,27 +4930,45 @@ function makeVirtualSegmentSplitAction(node, tightBounds) {
   return {
     kind: ROUTE_MODE_AXIS_SEGMENTS,
     axis,
+    segmentDirection,
     segmentCount,
     segmentMin,
     segmentMax,
   };
 }
 
-function chooseAdaptiveSplitAction(stats, tightBounds, maxDepth, leafLimit) {
+function chooseAdaptiveSplitAction(
+  stats,
+  tightBounds,
+  maxDepth,
+  leafLimit,
+  basisAxes = null,
+) {
   const node = stats.node;
+  const projectedAspectInfo = basisAxes
+    ? projectedAspectInfoFromStats(stats, tightBounds, basisAxes)
+    : null;
   const aspectCandidate =
     node.level > 0 &&
     !node.aspectSplitExhausted &&
-    boundsLongWidthAspect(tightBounds) > ADAPTIVE_MAX_LONG_WIDTH_RATIO;
+    (projectedAspectInfo
+      ? projectedAspectInfo.aspect
+      : boundsLongWidthAspect(tightBounds)) >
+      ADAPTIVE_MAX_LONG_WIDTH_RATIO;
   if (aspectCandidate) {
-    const action = makeVirtualSegmentSplitAction(node, tightBounds);
+    const action = makeVirtualSegmentSplitAction(
+      node,
+      tightBounds,
+      basisAxes,
+      projectedAspectInfo,
+    );
     if (action) {
       return action;
     }
   }
 
   if (!node.splitExhausted && node.depth < maxDepth && node.count > leafLimit) {
-    const action = makeKdSplitAction(stats);
+    const action = makeKdSplitAction(stats, tightBounds, basisAxes);
     if (action) {
       return action;
     }
@@ -4334,16 +4986,78 @@ function chooseAdaptiveSplitAction(stats, tightBounds, maxDepth, leafLimit) {
   };
 }
 
+function clearNodeSplitRouting(node) {
+  node.splitPoint = null;
+  node.splitAxes = null;
+  node.splitDirection = null;
+  node.splitOffset = null;
+  node.segmentAxis = null;
+  node.segmentDirection = null;
+  node.segmentCount = null;
+  node.segmentMin = null;
+  node.segmentMax = null;
+  node.routeMode = ROUTE_MODE_KD;
+}
+
+function applyAdaptiveSplitActionToNode(node, action) {
+  if (action.kind === ROUTE_MODE_KD) {
+    node.splitPoint = null;
+    node.splitAxes = null;
+    node.splitDirection = action.splitDirection.slice();
+    node.splitOffset = action.splitOffset;
+    node.routeMode = ROUTE_MODE_KD;
+    node.segmentAxis = null;
+    node.segmentDirection = null;
+    node.segmentCount = null;
+    node.segmentMin = null;
+    node.segmentMax = null;
+    return;
+  }
+
+  node.splitPoint = null;
+  node.splitAxes = null;
+  node.splitDirection = null;
+  node.splitOffset = null;
+  node.routeMode = ROUTE_MODE_AXIS_SEGMENTS;
+  node.segmentAxis = action.axis;
+  node.segmentDirection = action.segmentDirection
+    ? action.segmentDirection.slice()
+    : null;
+  node.segmentCount = action.segmentCount;
+  node.segmentMin = action.segmentMin;
+  node.segmentMax = action.segmentMax;
+}
+
 function pointSegmentForSplitAction(action, x, y, z) {
   const extent = action.segmentMax - action.segmentMin;
   if (!Number.isFinite(extent) || extent <= 0.0) {
     return 0;
   }
+  const coordinate = coordinateForDirectionOrAxis(
+    action.segmentDirection,
+    action.axis,
+    x,
+    y,
+    z,
+  );
   const slot = Math.floor(
-    ((coordinateForAxis(action.axis, x, y, z) - action.segmentMin) / extent) *
-      action.segmentCount,
+    ((coordinate - action.segmentMin) / extent) * action.segmentCount,
   );
   return Math.max(0, Math.min(action.segmentCount - 1, slot));
+}
+
+function pointKdSlotForAction(action, bounds, x, y, z) {
+  if (action.splitDirection && Number.isFinite(action.splitOffset)) {
+    return pointPlaneSlot(action.splitDirection, action.splitOffset, x, y, z);
+  }
+  return pointOctant(
+    bounds,
+    x,
+    y,
+    z,
+    action.splitPoint,
+    action.splitAxes,
+  );
 }
 
 function childSlotForAdaptiveAction(stats, x, y, z) {
@@ -4351,14 +5065,7 @@ function childSlotForAdaptiveAction(stats, x, y, z) {
   if (action.kind === ROUTE_MODE_AXIS_SEGMENTS) {
     return pointSegmentForSplitAction(action, x, y, z);
   }
-  return pointOctant(
-    stats.node.bounds,
-    x,
-    y,
-    z,
-    action.splitPoint,
-    action.splitAxes,
-  );
+  return pointKdSlotForAction(action, stats.node.bounds, x, y, z);
 }
 
 function kdSplitAxisForAction(action) {
@@ -4601,6 +5308,7 @@ function childSlotForAdaptiveActionAtRow(stats, positions, rowIndex) {
 function updateAdaptiveSplitStatsForPositionIndexRange(
   stats,
   positions,
+  weights,
   indices,
   start,
   end,
@@ -4608,12 +5316,45 @@ function updateAdaptiveSplitStatsForPositionIndexRange(
 ) {
   let pendingProgressRows = 0;
   for (let offset = start; offset < end; offset++) {
-    const base = indices[offset] * 3;
+    const rowIndex = indices[offset];
+    const base = rowIndex * 3;
     updateAdaptiveSplitStats(
       stats,
       positions[base + 0],
       positions[base + 1],
       positions[base + 2],
+      weights ? weights[rowIndex] : 1.0,
+    );
+    pendingProgressRows += 1;
+    if (pendingProgressRows >= TILING_TREE_PROGRESS_ROW_INTERVAL) {
+      advanceTilingProgress(progressState, pendingProgressRows);
+      pendingProgressRows = 0;
+    }
+  }
+  if (pendingProgressRows > 0) {
+    advanceTilingProgress(progressState, pendingProgressRows);
+  }
+}
+
+function updateAdaptiveProjectionStatsForPositionIndexRange(
+  stats,
+  positions,
+  weights,
+  indices,
+  start,
+  end,
+  progressState = null,
+) {
+  let pendingProgressRows = 0;
+  for (let offset = start; offset < end; offset++) {
+    const rowIndex = indices[offset];
+    const base = rowIndex * 3;
+    updateAdaptiveProjectionStats(
+      stats,
+      positions[base + 0],
+      positions[base + 1],
+      positions[base + 2],
+      weights ? weights[rowIndex] : 1.0,
     );
     pendingProgressRows += 1;
     if (pendingProgressRows >= TILING_TREE_PROGRESS_ROW_INTERVAL) {
@@ -4807,19 +5548,24 @@ function partitionKdPositionIndexRange(
   progressState = null,
 ) {
   const action = stats.action;
-  const axis = kdSplitAxisForAction(action);
+  const usesPlane =
+    action &&
+    action.splitDirection &&
+    Number.isFinite(action.splitOffset);
+  const axis = usesPlane ? null : kdSplitAxisForAction(action);
   ensure(
-    Number.isInteger(axis) && axis >= 0 && axis < 3,
-    `Missing k-d split axis for node ${stats.node.key}.`,
+    usesPlane || (Number.isInteger(axis) && axis >= 0 && axis < 3),
+    `Missing k-d split plane for node ${stats.node.key}.`,
   );
-  const split = action.splitPoint[axis];
+  const split = usesPlane ? action.splitOffset : action.splitPoint[axis];
   ensure(
     Number.isFinite(split),
-    `Missing k-d split point for node ${stats.node.key}.`,
+    `Missing k-d split offset for node ${stats.node.key}.`,
   );
 
   const lower = makeAdaptiveChildEntry(0, start, null);
-  const upper = makeAdaptiveChildEntry(1 << axis, null, end);
+  const upperSlot = usesPlane ? 1 : 1 << axis;
+  const upper = makeAdaptiveChildEntry(upperSlot, null, end);
   let left = start;
   let right = end - 1;
   let pendingProgressRows = 0;
@@ -4836,7 +5582,9 @@ function partitionKdPositionIndexRange(
     const x = positions[base + 0];
     const y = positions[base + 1];
     const z = positions[base + 2];
-    const coordinate = coordinateForAxis(axis, x, y, z);
+    const coordinate = usesPlane
+      ? dotDirection(action.splitDirection, x, y, z)
+      : coordinateForAxis(axis, x, y, z);
 
     if (coordinate >= split) {
       updateAdaptiveChildEntry(upper, x, y, z);
@@ -4933,9 +5681,15 @@ function partitionPositionIndexRangeByAdaptiveSlot(
 async function forEachStagedPosition(source, callback) {
   if (source.positions) {
     const positions = source.positions;
+    const weights = source.weights || null;
     for (let rowIndex = 0; rowIndex < source.vertexCount; rowIndex++) {
       const base = rowIndex * 3;
-      callback(positions[base + 0], positions[base + 1], positions[base + 2]);
+      callback(
+        positions[base + 0],
+        positions[base + 1],
+        positions[base + 2],
+        weights ? weights[rowIndex] : 1.0,
+      );
     }
     return;
   }
@@ -4951,7 +5705,7 @@ async function forEachStagedPosition(source, callback) {
   const chunk = Buffer.allocUnsafe(rowsPerChunk * POSITION_ROW_BYTE_SIZE);
   const floatView =
     IS_LITTLE_ENDIAN && (chunk.byteOffset & 3) === 0
-      ? new Float32Array(chunk.buffer, chunk.byteOffset, rowsPerChunk * 3)
+      ? new Float32Array(chunk.buffer, chunk.byteOffset, rowsPerChunk * 4)
       : null;
   const handle = await fs.promises.open(source.positionsPath, 'r');
   try {
@@ -4976,22 +5730,103 @@ async function forEachStagedPosition(source, callback) {
         let x;
         let y;
         let z;
+        let weight;
         if (floatView) {
-          const base = i * 3;
+          const base = i * 4;
           x = floatView[base + 0];
           y = floatView[base + 1];
           z = floatView[base + 2];
+          weight = floatView[base + 3];
         } else {
           const base = i * POSITION_ROW_BYTE_SIZE;
           x = chunk.readFloatLE(base + 0);
           y = chunk.readFloatLE(base + 4);
           z = chunk.readFloatLE(base + 8);
+          weight = chunk.readFloatLE(base + 12);
         }
-        callback(x, y, z);
+        callback(x, y, z, weight);
       }
     }
   } finally {
     await handle.close();
+  }
+}
+
+function forEachNodeOnPointPath(root, x, y, z, callback) {
+  let node = root;
+  while (node) {
+    callback(node);
+    if (node.leaf) {
+      return;
+    }
+
+    let slot;
+    let child;
+    if (usesSegmentRouting(node)) {
+      slot = pointSegmentForNode(node, x, y, z);
+      child = ensureChildrenBySegment(node).get(slot);
+    } else {
+      slot = pointKdSlotForNode(node, x, y, z);
+      child = node.childrenByOct[slot];
+    }
+    ensure(
+      !!child,
+      `Failed to resolve OBB stats path for point at node ${node.key} slot=${slot}.`,
+    );
+    node = child;
+  }
+}
+
+async function computeRootBasisAxesFromPositions(source) {
+  const stats = makeOrientedBoxStats(null);
+  await forEachStagedPosition(source, (x, y, z) => {
+    updatePositionMomentStats(stats, x, y, z);
+  });
+  return orthonormalBasisFromMomentStats(stats);
+}
+
+async function computeNodeOrientedBoxesFromPositions(
+  root,
+  source,
+  rootBasisAxes = null,
+) {
+  const statsByNode = new Map();
+  await forEachStagedPosition(source, (x, y, z) => {
+    forEachNodeOnPointPath(root, x, y, z, (node) => {
+      let stats = statsByNode.get(node);
+      if (!stats) {
+        stats = makeOrientedBoxStats(node);
+        statsByNode.set(node, stats);
+      }
+      updatePositionMomentStats(stats, x, y, z);
+    });
+  });
+
+  const rootStats = statsByNode.get(root);
+  const activeRootBasisAxes =
+    rootBasisAxes || (rootStats ? orthonormalBasisFromMomentStats(rootStats) : null);
+
+  for (const stats of statsByNode.values()) {
+    const node = stats.node;
+    node.count = stats.count;
+    node.bounds = boundsFromMinMax(stats.minimum, stats.maximum, node.bounds);
+    prepareOrientedBoxStats(stats, activeRootBasisAxes);
+  }
+
+  await forEachStagedPosition(source, (x, y, z) => {
+    forEachNodeOnPointPath(root, x, y, z, (node) => {
+      const stats = statsByNode.get(node);
+      if (stats) {
+        updateOrientedBoxProjectionStats(stats, x, y, z);
+      }
+    });
+  });
+
+  for (const stats of statsByNode.values()) {
+    const node = stats.node;
+    node.orientedBox = normalizeOrientedBox(
+      orientedBoxFromProjectionStats(stats, node.bounds),
+    );
   }
 }
 
@@ -5002,22 +5837,33 @@ async function buildAdaptiveNodeTreeFromPositions(
   leafLimit,
   options = {},
 ) {
-  if (source.positions) {
-    return buildAdaptiveNodeTreeFromMemoryPositions(
+  const orientedBoundingBoxes = options.orientedBoundingBoxes !== false;
+  const rootBasisAxes = orientedBoundingBoxes
+    ? await computeRootBasisAxesFromPositions(source)
+    : null;
+  const buildOptions = {
+    ...options,
+    splitBasisAxes: rootBasisAxes,
+  };
+  const root = source.positions
+    ? await buildAdaptiveNodeTreeFromMemoryPositions(
       source,
       rootBounds,
       maxDepth,
       leafLimit,
-      options,
-    );
+      buildOptions,
+    )
+    : await buildAdaptiveNodeTreeFromStreamingPositions(
+        source,
+        rootBounds,
+        maxDepth,
+        leafLimit,
+        buildOptions,
+      );
+  if (orientedBoundingBoxes) {
+    await computeNodeOrientedBoxesFromPositions(root, source, rootBasisAxes);
   }
-  return buildAdaptiveNodeTreeFromStreamingPositions(
-    source,
-    rootBounds,
-    maxDepth,
-    leafLimit,
-    options,
-  );
+  return root;
 }
 
 async function buildAdaptiveNodeTreeFromMemoryPositions(
@@ -5042,6 +5888,7 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
   }
 
   const positions = source.positions;
+  const weights = source.weights || null;
   ensure(
     positions && positions.length >= source.vertexCount * 3,
     'In-memory staged positions are missing or truncated.',
@@ -5052,6 +5899,7 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
     source.vertexCount,
     maxDepth,
   );
+  const splitBasisAxes = options.splitBasisAxes || null;
   setNodePositionIndexRange(root, 0, source.vertexCount);
 
   try {
@@ -5082,10 +5930,11 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
       const statsByNode = new Map();
       for (const range of candidateRanges) {
         const node = range.node;
-        const stats = makeAdaptiveSplitStats(node);
+        const stats = makeAdaptiveSplitStats(node, splitBasisAxes);
         updateAdaptiveSplitStatsForPositionIndexRange(
           stats,
           positions,
+          weights,
           indices,
           range.start,
           range.end,
@@ -5095,7 +5944,8 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
       }
       advanceTilingProgress(splitProgress, 0, { force: true });
 
-      const splittableStats = [];
+      const actionStats = [];
+      const kdActionStats = [];
       for (const stats of statsByNode.values()) {
         stats.node.count = stats.count;
         const tightBounds = boundsFromMinMax(
@@ -5108,6 +5958,7 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
           tightBounds,
           maxDepth,
           leafLimit,
+          splitBasisAxes,
         );
         if (!action.kind) {
           stats.node.bounds = tightBounds;
@@ -5121,19 +5972,48 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
         }
         stats.node.bounds = tightBounds;
         stats.action = action;
+        actionStats.push(stats);
         if (action.kind === ROUTE_MODE_KD) {
-          stats.node.splitPoint = action.splitPoint;
-          stats.node.splitAxes = action.splitAxes;
-          stats.node.routeMode = ROUTE_MODE_KD;
-        } else {
-          stats.node.splitPoint = null;
-          stats.node.splitAxes = null;
-          stats.node.routeMode = ROUTE_MODE_AXIS_SEGMENTS;
-          stats.node.segmentAxis = action.axis;
-          stats.node.segmentCount = action.segmentCount;
-          stats.node.segmentMin = action.segmentMin;
-          stats.node.segmentMax = action.segmentMax;
+          resetAdaptiveProjectionStats(stats);
+          kdActionStats.push(stats);
         }
+      }
+
+      if (kdActionStats.length > 0) {
+        let projectionRowTotal = 0;
+        for (const stats of kdActionStats) {
+          projectionRowTotal +=
+            stats.node._positionIndexEnd - stats.node._positionIndexStart;
+        }
+        const projectionProgress = startTilingProgressPhase(
+          progress,
+          projectionRowTotal,
+          `building k-d tree | root-basis splits=${kdActionStats.length}`,
+        );
+        for (const stats of kdActionStats) {
+          updateAdaptiveProjectionStatsForPositionIndexRange(
+            stats,
+            positions,
+            weights,
+            indices,
+            stats.node._positionIndexStart,
+            stats.node._positionIndexEnd,
+            projectionProgress,
+          );
+        }
+        advanceTilingProgress(projectionProgress, 0, { force: true });
+      }
+
+      const splittableStats = [];
+      for (const stats of actionStats) {
+        if (
+          stats.action.kind === ROUTE_MODE_KD &&
+          !finalizeKdSplitAction(stats)
+        ) {
+          stats.node.splitExhausted = true;
+          continue;
+        }
+        applyAdaptiveSplitActionToNode(stats.node, stats.action);
         splittableStats.push(stats);
       }
 
@@ -5195,13 +6075,7 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
         }
 
         if (occupied.length <= 1) {
-          node.splitPoint = null;
-          node.splitAxes = null;
-          node.segmentAxis = null;
-          node.segmentCount = null;
-          node.segmentMin = null;
-          node.segmentMax = null;
-          node.routeMode = ROUTE_MODE_KD;
+          clearNodeSplitRouting(node);
           node.leaf = true;
           if (stats.action.kind === ROUTE_MODE_AXIS_SEGMENTS) {
             node.aspectSplitExhausted = true;
@@ -5262,7 +6136,7 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
   rootBounds,
   maxDepth,
   leafLimit,
-  _options = {},
+  options = {},
 ) {
   let nextPhysicalCoordinate = 1;
   const allocateChildCoordinates = (parent) => ({
@@ -5273,6 +6147,7 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
   });
 
   const root = makeAdaptiveRootNode(rootBounds, source.vertexCount);
+  const splitBasisAxes = options.splitBasisAxes || null;
 
   if (maxDepth <= 0 || source.vertexCount <= 1) {
     return root;
@@ -5287,18 +6162,19 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
 
     const statsByNode = new Map();
     for (const node of candidates) {
-      statsByNode.set(node, makeAdaptiveSplitStats(node));
+      statsByNode.set(node, makeAdaptiveSplitStats(node, splitBasisAxes));
     }
 
-    await forEachStagedPosition(source, (x, y, z) => {
+    await forEachStagedPosition(source, (x, y, z, weight) => {
       const leaf = resolveLeafNodeForPoint(root, x, y, z);
       const stats = statsByNode.get(leaf);
       if (stats) {
-        updateAdaptiveSplitStats(stats, x, y, z);
+        updateAdaptiveSplitStats(stats, x, y, z, weight);
       }
     });
 
-    const splittableStats = [];
+    const actionStats = [];
+    const kdActionStats = [];
     for (const stats of statsByNode.values()) {
       stats.node.count = stats.count;
       const tightBounds = boundsFromMinMax(
@@ -5311,6 +6187,7 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
         tightBounds,
         maxDepth,
         leafLimit,
+        splitBasisAxes,
       );
       if (!action.kind) {
         stats.node.bounds = tightBounds;
@@ -5325,18 +6202,36 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
       stats.node.bounds = tightBounds;
       stats.action = action;
       if (action.kind === ROUTE_MODE_KD) {
-        stats.node.splitPoint = action.splitPoint;
-        stats.node.splitAxes = action.splitAxes;
-        stats.node.routeMode = ROUTE_MODE_KD;
-      } else {
-        stats.node.splitPoint = null;
-        stats.node.splitAxes = null;
-        stats.node.routeMode = ROUTE_MODE_AXIS_SEGMENTS;
-        stats.node.segmentAxis = action.axis;
-        stats.node.segmentCount = action.segmentCount;
-        stats.node.segmentMin = action.segmentMin;
-        stats.node.segmentMax = action.segmentMax;
+        resetAdaptiveProjectionStats(stats);
+        kdActionStats.push(stats);
       }
+      actionStats.push(stats);
+    }
+
+    if (kdActionStats.length > 0) {
+      const kdStatsByNode = new Map();
+      for (const stats of kdActionStats) {
+        kdStatsByNode.set(stats.node, stats);
+      }
+      await forEachStagedPosition(source, (x, y, z, weight) => {
+        const leaf = resolveLeafNodeForPoint(root, x, y, z);
+        const stats = kdStatsByNode.get(leaf);
+        if (stats) {
+          updateAdaptiveProjectionStats(stats, x, y, z, weight);
+        }
+      });
+    }
+
+    const splittableStats = [];
+    for (const stats of actionStats) {
+      if (
+        stats.action.kind === ROUTE_MODE_KD &&
+        !finalizeKdSplitAction(stats)
+      ) {
+        stats.node.splitExhausted = true;
+        continue;
+      }
+      applyAdaptiveSplitActionToNode(stats.node, stats.action);
       stats.childStats = new Map();
       splittableStats.push(stats);
     }
@@ -5366,13 +6261,7 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
       const occupied = sortedAdaptiveChildStats(stats);
 
       if (occupied.length <= 1) {
-        node.splitPoint = null;
-        node.splitAxes = null;
-        node.segmentAxis = null;
-        node.segmentCount = null;
-        node.segmentMin = null;
-        node.segmentMax = null;
-        node.routeMode = ROUTE_MODE_KD;
+        clearNodeSplitRouting(node);
         node.leaf = true;
         if (stats.action.kind === ROUTE_MODE_AXIS_SEGMENTS) {
           node.aspectSplitExhausted = true;
@@ -5956,6 +6845,7 @@ function buildTileNodeTree(
     node.contentUri,
     children,
   );
+  tileNode.orientedBox = node.orientedBox ? node.orientedBox.slice() : null;
   nodesByKey.set(tileNode.key(), tileNode);
   return tileNode;
 }
@@ -5996,9 +6886,10 @@ function buildEmittedTileChildren(
 }
 
 function tileToJson(node) {
+  const box = node.orientedBox || node.bounds.toBoxArray();
   const obj = {
     boundingVolume: {
-      box: applyContentBoxTransform(node.bounds.toBoxArray()),
+      box: applyContentBoxTransform(box),
     },
     geometricError: node.error,
     refine: 'REPLACE',
@@ -6074,6 +6965,13 @@ function makeBuildSummary(
         : null,
     sampling_rate_per_level: args.samplingRatePerLevel,
     tiling_strategy: TILING_STRATEGY_KD_TREE,
+    kd_tree_split_direction: kdTreeSplitDirectionForArgs(args),
+    kd_tree_covariance_weighting: KD_TREE_COVARIANCE_WEIGHTING,
+    kd_tree_split_plane: KD_TREE_SPLIT_PLANE,
+    kd_tree_split_balance: kdTreeSplitBalanceForArgs(args),
+    oriented_bounding_boxes: useOrientedBoundingBoxes(args),
+    tile_bounding_volume_mode: tileBoundingVolumeModeForArgs(args),
+    split_weight_formula: SPLIT_WEIGHT_FORMULA,
     kd_tree_split_histogram_bins: ADAPTIVE_SPLIT_HISTOGRAM_BINS,
     kd_tree_max_long_width_ratio: ADAPTIVE_MAX_LONG_WIDTH_RATIO,
     kd_tree_long_tile_split_mode: LONG_TILE_SPLIT_MODE,
@@ -6264,7 +7162,7 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
           scanProgress.done(`ms=${timingsMs.scan_positions_ms}`);
 
           console.log(
-            '[info] scan 2/4 | building count-balanced k-d tiling tree from memory',
+            `[info] scan 2/4 | building ${splitBasisLabelForArgs(args)} visual-cost-balanced k-d tiling tree from memory`,
           );
           const tilingStartedAt = Date.now();
           const tilingProgress = new ConsoleProgressBar(
@@ -6274,16 +7172,21 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
           rootNodeMeta = await buildAdaptiveNodeTreeFromPositions(
             {
               positions: staged.positions,
+              weights: staged.weights,
               vertexCount: header.vertexCount,
             },
             rootBounds,
             args.maxDepth,
             args.leafLimit,
-            { progress: tilingProgress },
+            {
+              progress: tilingProgress,
+              orientedBoundingBoxes: useOrientedBoundingBoxes(args),
+            },
           );
           timingsMs.build_tiling_tree_ms = elapsedMsSince(tilingStartedAt);
           tilingProgress.done(`ms=${timingsMs.build_tiling_tree_ms}`);
           staged.positions = null;
+          staged.weights = null;
         } else {
           rootBounds = await scanGlobalBoundsAndWritePositions(
             handle,
@@ -6301,7 +7204,7 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
           scanProgress.done(`ms=${timingsMs.scan_positions_ms}`);
 
           console.log(
-            '[info] scan 2/4 | building count-balanced k-d tiling tree from positions',
+            `[info] scan 2/4 | building ${splitBasisLabelForArgs(args)} visual-cost-balanced k-d tiling tree from positions`,
           );
           const tilingStartedAt = Date.now();
           rootNodeMeta = await buildAdaptiveNodeTreeFromPositions(
@@ -6313,6 +7216,7 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
             rootBounds,
             args.maxDepth,
             args.leafLimit,
+            { orientedBoundingBoxes: useOrientedBoundingBoxes(args) },
           );
           timingsMs.build_tiling_tree_ms = elapsedMsSince(tilingStartedAt);
         }

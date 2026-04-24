@@ -43,6 +43,6 @@
     "converter"
   ],
   "dependencies": {
-    "3dtiles-inspector": "^0.1.2"
+    "3dtiles-inspector": "^0.1.3"
   }
 }
