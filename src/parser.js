@@ -25,6 +25,10 @@ const PLY_DTYPE_MAP = {
 const MAX_PLY_HEADER_BYTES = 8 * 1024 * 1024;
 const HEADER_READ_CHUNK_SIZE = 64 * 1024;
 const STREAM_READ_CHUNK_SIZE = 8 * 1024 * 1024;
+const IS_LITTLE_ENDIAN = (() => {
+  const probe = new Uint8Array(new Uint16Array([0x0102]).buffer);
+  return probe[0] === 0x02;
+})();
 
 const PLY_KIND_SKIP = 0;
 const PLY_KIND_POSITION = 1;
@@ -490,9 +494,14 @@ function buildGaussianPlyLayout(
   const propertyPlan = [];
   const binaryPositionProps = new Array(3).fill(null);
   let sourceRecordSize = 0;
+  let binaryFloat32Direct = true;
   for (const prop of vertexProps) {
     const typeInfo = PLY_DTYPE_MAP[prop.type];
     ensure(!!typeInfo, `Unsupported PLY property type: ${prop.type}`);
+    const floatOffset = sourceRecordSize >>> 2;
+    if (typeInfo.view !== 'Float32' || (sourceRecordSize & 3) !== 0) {
+      binaryFloat32Direct = false;
+    }
     const name = prop.name;
     let plan = null;
     if (name === 'x') plan = { kind: PLY_KIND_POSITION, index: 0, typeInfo };
@@ -534,9 +543,11 @@ function buildGaussianPlyLayout(
     if (!plan) {
       plan = { kind: PLY_KIND_SKIP, typeInfo };
     }
+    plan.floatOffset = floatOffset;
     if (plan.kind === PLY_KIND_POSITION) {
       binaryPositionProps[plan.index] = {
         offset: sourceRecordSize,
+        floatOffset,
         typeInfo,
       };
     }
@@ -555,6 +566,8 @@ function buildGaussianPlyLayout(
     fieldCount: propertyPlan.length,
     sourceRecordSize,
     binaryPositionProps,
+    binaryFloat32Direct:
+      binaryFloat32Direct && (sourceRecordSize & 3) === 0,
     canonicalFloatCount: canonicalGaussianRowFloatCount(coeffCount),
     canonicalByteSize: canonicalGaussianRowByteSize(coeffCount),
   };
@@ -586,6 +599,33 @@ function writeCanonicalScalarToView(view, layout, plan, value) {
       break;
     case PLY_KIND_REST:
       view.setFloat32((11 + plan.index) * 4, value, true);
+      break;
+    default:
+      break;
+  }
+}
+
+function writeCanonicalScalarToFloats(out, layout, plan, value) {
+  switch (plan.kind) {
+    case PLY_KIND_POSITION:
+      out[plan.index] = value;
+      break;
+    case PLY_KIND_SH0:
+      out[11 + plan.index] = value;
+      break;
+    case PLY_KIND_SCALE:
+      out[3 + plan.index] = layout.linearScaleInput
+        ? Math.log(Math.max(value, 1e-8))
+        : value;
+      break;
+    case PLY_KIND_OPACITY:
+      out[10] =
+        layout.inputConvention === 'graphdeco'
+          ? sigmoid(value)
+          : clamp(value, 0.0, 1.0);
+      break;
+    case PLY_KIND_REST:
+      out[11 + plan.index] = value;
       break;
     default:
       break;
@@ -625,6 +665,79 @@ function decodeBinaryGaussianRecordToCanonical(sourceView, offset, layout, rowVi
   return offset;
 }
 
+function writeNormalizedQuaternionToFloats(
+  out,
+  inputConvention,
+  r0,
+  r1,
+  r2,
+  r3,
+) {
+  let x;
+  let y;
+  let z;
+  let w;
+  if (inputConvention === 'graphdeco') {
+    x = r1;
+    y = r2;
+    z = r3;
+    w = r0;
+  } else if (inputConvention === 'khr_native') {
+    x = r0;
+    y = r1;
+    z = r2;
+    w = r3;
+  } else {
+    throw new ConversionError(`Unknown input_convention: ${inputConvention}`);
+  }
+
+  let n = Math.sqrt(x * x + y * y + z * z + w * w);
+  if (n < 1e-12) {
+    n = 1.0;
+  }
+  const sign = w < 0.0 ? -1.0 : 1.0;
+  const inv = sign / n;
+  out[6] = x * inv;
+  out[7] = y * inv;
+  out[8] = z * inv;
+  out[9] = w * inv;
+}
+
+function decodeBinaryFloat32GaussianRecordToCanonical(
+  sourceFloats,
+  rowFloatOffset,
+  layout,
+  rowFloats,
+) {
+  let r0 = 0.0;
+  let r1 = 0.0;
+  let r2 = 0.0;
+  let r3 = 1.0;
+  for (let p = 0; p < layout.propertyPlan.length; p++) {
+    const plan = layout.propertyPlan[p];
+    if (plan.kind === PLY_KIND_SKIP) {
+      continue;
+    }
+    const value = sourceFloats[rowFloatOffset + plan.floatOffset];
+    if (plan.kind === PLY_KIND_ROT) {
+      if (plan.index === 0) r0 = value;
+      else if (plan.index === 1) r1 = value;
+      else if (plan.index === 2) r2 = value;
+      else r3 = value;
+    } else {
+      writeCanonicalScalarToFloats(rowFloats, layout, plan, value);
+    }
+  }
+  writeNormalizedQuaternionToFloats(
+    rowFloats,
+    layout.inputConvention,
+    r0,
+    r1,
+    r2,
+    r3,
+  );
+}
+
 async function forEachBinaryGaussianPlyPosition(
   handle,
   filePath,
@@ -644,45 +757,92 @@ async function forEachBinaryGaussianPlyPosition(
     1,
     Math.floor(STREAM_READ_CHUNK_SIZE / layout.sourceRecordSize),
   );
-  const chunk = Buffer.allocUnsafe(rowsPerChunk * layout.sourceRecordSize);
-  let fileOffset = header.dataOffset;
+  const chunkBytes = rowsPerChunk * layout.sourceRecordSize;
+  const chunks = [Buffer.allocUnsafe(chunkBytes), Buffer.allocUnsafe(chunkBytes)];
+  const canUseFastPath =
+    layout.binaryFloat32Direct &&
+    IS_LITTLE_ENDIAN &&
+    chunks.every((chunk) => (chunk.byteOffset & 3) === 0);
+  const floatsPerRow = layout.sourceRecordSize >>> 2;
+  let nextRowBase = 0;
+  let nextFileOffset = header.dataOffset;
+  let nextChunkIndex = 0;
 
-  for (
-    let rowBase = 0;
-    rowBase < header.vertexCount;
-    rowBase += rowsPerChunk
-  ) {
+  const readNextChunk = () => {
+    if (nextRowBase >= header.vertexCount) {
+      return null;
+    }
+    const rowBase = nextRowBase;
     const rowCount = Math.min(rowsPerChunk, header.vertexCount - rowBase);
     const byteCount = rowCount * layout.sourceRecordSize;
-    await readExact(
+    const fileOffset = nextFileOffset;
+    const chunk = chunks[nextChunkIndex];
+    nextRowBase += rowCount;
+    nextFileOffset += byteCount;
+    nextChunkIndex = 1 - nextChunkIndex;
+    return readExact(
       handle,
       chunk,
       byteCount,
       fileOffset,
       `Binary PLY payload ended early in ${filePath}.`,
-    );
-    fileOffset += byteCount;
+    ).then(() => ({ chunk, rowBase, rowCount, byteCount }));
+  };
 
-    const view = new DataView(chunk.buffer, chunk.byteOffset, byteCount);
-    for (let i = 0; i < rowCount; i++) {
-      const rowOffset = i * layout.sourceRecordSize;
-      const x = readPlyScalar(
-        view,
-        rowOffset + positionProps[0].offset,
-        positionProps[0].typeInfo,
-      );
-      const y = readPlyScalar(
-        view,
-        rowOffset + positionProps[1].offset,
-        positionProps[1].typeInfo,
-      );
-      const z = readPlyScalar(
-        view,
-        rowOffset + positionProps[2].offset,
-        positionProps[2].typeInfo,
-      );
-      onPosition(rowBase + i, x, y, z);
+  let chunkPromise = readNextChunk();
+  while (chunkPromise) {
+    const { chunk, rowBase, rowCount, byteCount } = await chunkPromise;
+    const nextChunkPromise = readNextChunk();
+    try {
+      if (canUseFastPath) {
+        const sourceFloats = new Float32Array(
+          chunk.buffer,
+          chunk.byteOffset,
+          byteCount >>> 2,
+        );
+        const xOff = positionProps[0].floatOffset;
+        const yOff = positionProps[1].floatOffset;
+        const zOff = positionProps[2].floatOffset;
+        for (let i = 0; i < rowCount; i++) {
+          const rowFloatOffset = i * floatsPerRow;
+          onPosition(
+            rowBase + i,
+            sourceFloats[rowFloatOffset + xOff],
+            sourceFloats[rowFloatOffset + yOff],
+            sourceFloats[rowFloatOffset + zOff],
+          );
+        }
+      } else {
+        const view = new DataView(chunk.buffer, chunk.byteOffset, byteCount);
+        for (let i = 0; i < rowCount; i++) {
+          const rowOffset = i * layout.sourceRecordSize;
+          const x = readPlyScalar(
+            view,
+            rowOffset + positionProps[0].offset,
+            positionProps[0].typeInfo,
+          );
+          const y = readPlyScalar(
+            view,
+            rowOffset + positionProps[1].offset,
+            positionProps[1].typeInfo,
+          );
+          const z = readPlyScalar(
+            view,
+            rowOffset + positionProps[2].offset,
+            positionProps[2].typeInfo,
+          );
+          onPosition(rowBase + i, x, y, z);
+        }
+      }
+    } catch (err) {
+      if (nextChunkPromise) {
+        try {
+          await nextChunkPromise;
+        } catch {}
+      }
+      throw err;
     }
+    chunkPromise = nextChunkPromise;
   }
 }
 
@@ -697,40 +857,105 @@ async function forEachBinaryGaussianPlyCanonicalRecord(
     1,
     Math.floor(STREAM_READ_CHUNK_SIZE / layout.sourceRecordSize),
   );
-  const chunk = Buffer.allocUnsafe(rowsPerChunk * layout.sourceRecordSize);
+  const chunkBytes = rowsPerChunk * layout.sourceRecordSize;
+  const chunks = [Buffer.allocUnsafe(chunkBytes), Buffer.allocUnsafe(chunkBytes)];
   const rowBuffer = Buffer.allocUnsafe(layout.canonicalByteSize);
   const rowView = new DataView(
     rowBuffer.buffer,
     rowBuffer.byteOffset,
     rowBuffer.byteLength,
   );
-  let fileOffset = header.dataOffset;
+  const canUseFastPath =
+    layout.binaryFloat32Direct &&
+    IS_LITTLE_ENDIAN &&
+    chunks.every((chunk) => (chunk.byteOffset & 3) === 0) &&
+    (rowBuffer.byteOffset & 3) === 0;
+  const floatsPerRow = layout.sourceRecordSize >>> 2;
+  const rowFloats = canUseFastPath
+    ? new Float32Array(
+        rowBuffer.buffer,
+        rowBuffer.byteOffset,
+        layout.canonicalFloatCount,
+      )
+    : null;
+  let nextRowBase = 0;
+  let nextFileOffset = header.dataOffset;
+  let nextChunkIndex = 0;
 
-  for (
-    let rowBase = 0;
-    rowBase < header.vertexCount;
-    rowBase += rowsPerChunk
-  ) {
+  const readNextChunk = () => {
+    if (nextRowBase >= header.vertexCount) {
+      return null;
+    }
+    const rowBase = nextRowBase;
     const rowCount = Math.min(rowsPerChunk, header.vertexCount - rowBase);
     const byteCount = rowCount * layout.sourceRecordSize;
-    await readExact(
+    const fileOffset = nextFileOffset;
+    const chunk = chunks[nextChunkIndex];
+    nextRowBase += rowCount;
+    nextFileOffset += byteCount;
+    nextChunkIndex = 1 - nextChunkIndex;
+    return readExact(
       handle,
       chunk,
       byteCount,
       fileOffset,
       `Binary PLY payload ended early in ${filePath}.`,
-    );
-    fileOffset += byteCount;
+    ).then(() => ({ chunk, rowBase, rowCount, byteCount }));
+  };
 
-    const view = new DataView(chunk.buffer, chunk.byteOffset, byteCount);
-    let offset = 0;
-    for (let i = 0; i < rowCount; i++) {
-      offset = decodeBinaryGaussianRecordToCanonical(view, offset, layout, rowView);
-      const maybePromise = onRecord(rowBase + i, rowBuffer, rowView);
-      if (maybePromise && typeof maybePromise.then === 'function') {
-        await maybePromise;
+  let chunkPromise = readNextChunk();
+  while (chunkPromise) {
+    const { chunk, rowBase, rowCount, byteCount } = await chunkPromise;
+    const nextChunkPromise = readNextChunk();
+    try {
+      if (canUseFastPath) {
+        const sourceFloats = new Float32Array(
+          chunk.buffer,
+          chunk.byteOffset,
+          byteCount >>> 2,
+        );
+        for (let i = 0; i < rowCount; i++) {
+          decodeBinaryFloat32GaussianRecordToCanonical(
+            sourceFloats,
+            i * floatsPerRow,
+            layout,
+            rowFloats,
+          );
+          const maybePromise = onRecord(
+            rowBase + i,
+            rowBuffer,
+            rowView,
+            rowFloats,
+          );
+          if (maybePromise && typeof maybePromise.then === 'function') {
+            await maybePromise;
+          }
+        }
+      } else {
+        const view = new DataView(chunk.buffer, chunk.byteOffset, byteCount);
+        let offset = 0;
+        for (let i = 0; i < rowCount; i++) {
+          offset = decodeBinaryGaussianRecordToCanonical(
+            view,
+            offset,
+            layout,
+            rowView,
+          );
+          const maybePromise = onRecord(rowBase + i, rowBuffer, rowView);
+          if (maybePromise && typeof maybePromise.then === 'function') {
+            await maybePromise;
+          }
+        }
       }
+    } catch (err) {
+      if (nextChunkPromise) {
+        try {
+          await nextChunkPromise;
+        } catch {}
+      }
+      throw err;
     }
+    chunkPromise = nextChunkPromise;
   }
 }
 
@@ -990,66 +1215,111 @@ function writeGraphdecoLikePly(filePath, cloud) {
   header.push('end_header');
 
   const recordSize = names.length * 4;
+  const floatsPerRow = recordSize >>> 2;
   const payload = Buffer.alloc(n * recordSize);
-  const dv = new DataView(
-    payload.buffer,
-    payload.byteOffset,
-    payload.byteLength,
-  );
-  let off = 0;
+  const payloadByteOffset = payload.byteOffset;
+  const canUseFastPath =
+    IS_LITTLE_ENDIAN && (payloadByteOffset & 3) === 0;
 
-  for (let i = 0; i < n; i++) {
-    const basePos = i * 3;
-    const baseScale = i * 3;
-    const baseRot = i * 4;
-    const baseCoeff = i * (1 + coeffsPerChannel) * 3;
-    dv.setFloat32(off, cloud.positions[basePos + 0], true);
-    off += 4;
-    dv.setFloat32(off, cloud.positions[basePos + 1], true);
-    off += 4;
-    dv.setFloat32(off, cloud.positions[basePos + 2], true);
-    off += 4;
-    dv.setFloat32(off, 0.0, true);
-    off += 4;
-    dv.setFloat32(off, 0.0, true);
-    off += 4;
-    dv.setFloat32(off, 0.0, true);
-    off += 4;
-    dv.setFloat32(off, cloud.shCoeffs[baseCoeff + 0], true);
-    off += 4;
-    dv.setFloat32(off, cloud.shCoeffs[baseCoeff + 1], true);
-    off += 4;
-    dv.setFloat32(off, cloud.shCoeffs[baseCoeff + 2], true);
-    off += 4;
-
-    if (coeffsPerChannel > 0) {
-      const shExtraBase = baseCoeff + 3;
-      for (let c = 0; c < coeffsPerChannel * 3; c++) {
-        dv.setFloat32(off, cloud.shCoeffs[shExtraBase + c], true);
-        off += 4;
-      }
-    }
-
-    const p = cloud.opacity[i];
-    const num = Math.log(
-      clamp(p, 1e-7, 1.0 - 1e-7) / clamp(1.0 - p, 1e-7, 1.0),
+  if (canUseFastPath) {
+    const fv = new Float32Array(
+      payload.buffer,
+      payloadByteOffset,
+      n * floatsPerRow,
     );
-    dv.setFloat32(off, num, true);
-    off += 4;
-    dv.setFloat32(off, cloud.scaleLog[baseScale + 0], true);
-    off += 4;
-    dv.setFloat32(off, cloud.scaleLog[baseScale + 1], true);
-    off += 4;
-    dv.setFloat32(off, cloud.scaleLog[baseScale + 2], true);
-    off += 4;
-    dv.setFloat32(off, cloud.quatsXYZW[baseRot + 3], true);
-    off += 4;
-    dv.setFloat32(off, cloud.quatsXYZW[baseRot + 0], true);
-    off += 4;
-    dv.setFloat32(off, cloud.quatsXYZW[baseRot + 1], true);
-    off += 4;
-    dv.setFloat32(off, cloud.quatsXYZW[baseRot + 2], true);
-    off += 4;
+    const shExtraCount = coeffsPerChannel * 3;
+    for (let i = 0; i < n; i++) {
+      const basePos = i * 3;
+      const baseScale = i * 3;
+      const baseRot = i * 4;
+      const baseCoeff = i * (1 + coeffsPerChannel) * 3;
+      const rowOff = i * floatsPerRow;
+      fv[rowOff + 0] = cloud.positions[basePos + 0];
+      fv[rowOff + 1] = cloud.positions[basePos + 1];
+      fv[rowOff + 2] = cloud.positions[basePos + 2];
+      // normals (3 zeros) are already zeroed by Buffer.alloc, skip
+      fv[rowOff + 6] = cloud.shCoeffs[baseCoeff + 0];
+      fv[rowOff + 7] = cloud.shCoeffs[baseCoeff + 1];
+      fv[rowOff + 8] = cloud.shCoeffs[baseCoeff + 2];
+      if (shExtraCount > 0) {
+        fv.set(
+          cloud.shCoeffs.subarray(baseCoeff + 3, baseCoeff + 3 + shExtraCount),
+          rowOff + 9,
+        );
+      }
+      const opacityOff = rowOff + 9 + shExtraCount;
+      const p = cloud.opacity[i];
+      fv[opacityOff] = Math.log(
+        clamp(p, 1e-7, 1.0 - 1e-7) / clamp(1.0 - p, 1e-7, 1.0),
+      );
+      fv[opacityOff + 1] = cloud.scaleLog[baseScale + 0];
+      fv[opacityOff + 2] = cloud.scaleLog[baseScale + 1];
+      fv[opacityOff + 3] = cloud.scaleLog[baseScale + 2];
+      fv[opacityOff + 4] = cloud.quatsXYZW[baseRot + 3];
+      fv[opacityOff + 5] = cloud.quatsXYZW[baseRot + 0];
+      fv[opacityOff + 6] = cloud.quatsXYZW[baseRot + 1];
+      fv[opacityOff + 7] = cloud.quatsXYZW[baseRot + 2];
+    }
+  } else {
+    const dv = new DataView(
+      payload.buffer,
+      payloadByteOffset,
+      payload.byteLength,
+    );
+    let off = 0;
+    for (let i = 0; i < n; i++) {
+      const basePos = i * 3;
+      const baseScale = i * 3;
+      const baseRot = i * 4;
+      const baseCoeff = i * (1 + coeffsPerChannel) * 3;
+      dv.setFloat32(off, cloud.positions[basePos + 0], true);
+      off += 4;
+      dv.setFloat32(off, cloud.positions[basePos + 1], true);
+      off += 4;
+      dv.setFloat32(off, cloud.positions[basePos + 2], true);
+      off += 4;
+      dv.setFloat32(off, 0.0, true);
+      off += 4;
+      dv.setFloat32(off, 0.0, true);
+      off += 4;
+      dv.setFloat32(off, 0.0, true);
+      off += 4;
+      dv.setFloat32(off, cloud.shCoeffs[baseCoeff + 0], true);
+      off += 4;
+      dv.setFloat32(off, cloud.shCoeffs[baseCoeff + 1], true);
+      off += 4;
+      dv.setFloat32(off, cloud.shCoeffs[baseCoeff + 2], true);
+      off += 4;
+
+      if (coeffsPerChannel > 0) {
+        const shExtraBase = baseCoeff + 3;
+        for (let c = 0; c < coeffsPerChannel * 3; c++) {
+          dv.setFloat32(off, cloud.shCoeffs[shExtraBase + c], true);
+          off += 4;
+        }
+      }
+
+      const p = cloud.opacity[i];
+      const num = Math.log(
+        clamp(p, 1e-7, 1.0 - 1e-7) / clamp(1.0 - p, 1e-7, 1.0),
+      );
+      dv.setFloat32(off, num, true);
+      off += 4;
+      dv.setFloat32(off, cloud.scaleLog[baseScale + 0], true);
+      off += 4;
+      dv.setFloat32(off, cloud.scaleLog[baseScale + 1], true);
+      off += 4;
+      dv.setFloat32(off, cloud.scaleLog[baseScale + 2], true);
+      off += 4;
+      dv.setFloat32(off, cloud.quatsXYZW[baseRot + 3], true);
+      off += 4;
+      dv.setFloat32(off, cloud.quatsXYZW[baseRot + 0], true);
+      off += 4;
+      dv.setFloat32(off, cloud.quatsXYZW[baseRot + 1], true);
+      off += 4;
+      dv.setFloat32(off, cloud.quatsXYZW[baseRot + 2], true);
+      off += 4;
+    }
   }
 
   const head = Buffer.from(header.join('\n') + '\n', 'ascii');
@@ -1079,7 +1349,7 @@ function randn(rng) {
   return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
 }
 
-function makeSelfTestCloud(n = 6000, seed = 7) {
+function makeSelfTestCloud(n = 1000000, seed = 7) {
   const count = Math.max(1, Math.floor(n));
   const rng = mulberry32(seed);
   const centers = [

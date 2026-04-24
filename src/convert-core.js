@@ -23,7 +23,15 @@ const {
 
 const {
   convertPartitionedPlyTo3DTiles,
+  _writeBucketGlbTaskOutput,
 } = require('./partitioned-ply');
+
+async function openTilesetInspector(outputDir) {
+  const tilesetPath = path.join(outputDir, 'tileset.json');
+  const { runInspector } = require('3dtiles-inspector');
+  console.log(`[info] opening inspector: ${tilesetPath}`);
+  await runInspector(tilesetPath);
+}
 
 async function convertPlyTo3DTiles(inputPath, outputDir, options = {}) {
   const args = makeConversionArgs(inputPath, outputDir, options, {
@@ -36,6 +44,9 @@ async function convertPlyTo3DTiles(inputPath, outputDir, options = {}) {
     outPath,
     args,
   );
+  if (args.openInspector) {
+    await openTilesetInspector(outPath);
+  }
   return {
     inputPath: inPath,
     outputDir: outPath,
@@ -75,30 +86,33 @@ function writeCloudGlbTaskOutput(task, cloud, translation) {
   );
 }
 
-function runPackSpzWorkerTask(task) {
+async function runPackSpzWorkerTask(task) {
   const cloud = cloudFromWorkerTask(task);
   writeCloudGlbTaskOutput(task, cloud, task.translation);
   return true;
 }
 
-function runWorkerTask(task) {
+async function runWorkerTask(task) {
   if (!task || !task.kind) {
     throw new ConversionError('Missing worker task kind.');
   }
   if (task.kind === 'pack-spz') {
     return runPackSpzWorkerTask(task);
   }
+  if (task.kind === 'pack-bucket-spz') {
+    return _writeBucketGlbTaskOutput(task);
+  }
   throw new ConversionError(`Unknown worker task kind: ${task.kind}`);
 }
 
 if (!isMainThread && parentPort) {
-  parentPort.on('message', (msg) => {
+  parentPort.on('message', async (msg) => {
     if (!msg || msg.type !== 'worker-task') {
       parentPort.postMessage({ error: 'Unknown worker message type.' });
       return;
     }
     try {
-      parentPort.postMessage({ result: runWorkerTask(msg.task) });
+      parentPort.postMessage({ result: await runWorkerTask(msg.task) });
     } catch (err) {
       parentPort.postMessage({
         error: err instanceof Error ? err.message : String(err),
@@ -133,6 +147,9 @@ async function main(argv) {
       await convertPartitionedPlyTo3DTiles(samplePlyPath, outDir, buildArgs);
       console.log(`[ok] self-test completed: ${outDir}`);
       console.log(`[ok] sample input PLY: ${samplePlyPath}`);
+      if (args.openInspector) {
+        await openTilesetInspector(outDir);
+      }
       return 0;
     }
 
@@ -156,6 +173,9 @@ async function main(argv) {
       `[info] parsed PLY | splats=${result.splatCount} | sh_degree=${result.shDegree}`,
     );
     console.log(`[ok] output completed: ${outDir}`);
+    if (args.openInspector) {
+      await openTilesetInspector(outDir);
+    }
     return 0;
   } catch (err) {
     if (err instanceof ConversionError) {

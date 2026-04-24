@@ -24,9 +24,14 @@ function pad4Length(length) {
   return rem === 0 ? 0 : 4 - rem;
 }
 
-function padLength(length, alignment) {
-  const rem = length % alignment;
-  return rem === 0 ? 0 : alignment - rem;
+function asBufferView(data) {
+  if (Buffer.isBuffer(data)) {
+    return data;
+  }
+  if (ArrayBuffer.isView(data)) {
+    return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  }
+  return Buffer.from(data);
 }
 
 function mat4ToGltfColumnMajorList(m) {
@@ -110,7 +115,7 @@ class GltfBuilder {
       this.bufferParts.push(Buffer.alloc(pad));
       this.byteLength += pad;
     }
-    const buf = Buffer.from(data);
+    const buf = asBufferView(data);
     const byteOffset = this.byteLength;
     this.bufferParts.push(buf);
     this.byteLength += buf.length;
@@ -186,7 +191,7 @@ class GltfBuilder {
         accessor.max = Array.from(maxValue);
       }
       if (withBufferView) {
-        const buf = Buffer.from(u8);
+        const buf = asBufferView(u8);
         accessor.bufferView = this.addBufferView(buf);
       }
     }
@@ -198,14 +203,8 @@ class GltfBuilder {
     return this.accessors.length - 1;
   }
 
-  writeSpzStreamGlb(
-    filePath,
-    spzBytes,
-    cloud,
-    colorSpace,
-    translation,
-  ) {
-    const bufferViewIndex = this.addBufferView(Buffer.from(spzBytes));
+  writeSpzStreamGlb(filePath, spzBytes, cloud, colorSpace, translation) {
+    const bufferViewIndex = this.addBufferView(spzBytes);
     const n = cloud.length;
     const attributes = {};
 
@@ -346,36 +345,39 @@ class GltfBuilder {
     const jsonDataLength = jsonChunk.length + jsonPadLength;
 
     const totalLen = 12 + 8 + jsonDataLength + 8 + binDataLength;
-    const out = Buffer.alloc(totalLen);
-    out.write('glTF', 0, 'ascii');
-    out.writeUInt32LE(2, 4);
-    out.writeUInt32LE(totalLen, 8);
-    out.writeUInt32LE(jsonDataLength, 12);
-    out.write('JSON', 16, 'ascii');
-
-    const jsonOffset = 20;
-    jsonChunk.copy(out, jsonOffset);
-    if (jsonPadLength > 0) {
-      out.fill(
-        0x20,
-        jsonOffset + jsonChunk.length,
-        jsonOffset + jsonDataLength,
-      );
-    }
-
-    const binHeaderOffset = jsonOffset + jsonDataLength;
-    out.writeUInt32LE(binDataLength, binHeaderOffset);
-    out.write('BIN', binHeaderOffset + 4, 'ascii');
-    out[binHeaderOffset + 7] = 0x00;
-
-    let binOffset = binHeaderOffset + 8;
-    for (const part of this.bufferParts) {
-      part.copy(out, binOffset);
-      binOffset += part.length;
-    }
-
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.writeFileSync(filePath, out);
+    const fd = fs.openSync(filePath, 'w');
+    try {
+      const glbHeader = Buffer.allocUnsafe(12);
+      glbHeader.write('glTF', 0, 'ascii');
+      glbHeader.writeUInt32LE(2, 4);
+      glbHeader.writeUInt32LE(totalLen, 8);
+
+      const jsonHeader = Buffer.allocUnsafe(8);
+      jsonHeader.writeUInt32LE(jsonDataLength, 0);
+      jsonHeader.write('JSON', 4, 'ascii');
+
+      const binHeader = Buffer.allocUnsafe(8);
+      binHeader.writeUInt32LE(binDataLength, 0);
+      binHeader.write('BIN', 4, 'ascii');
+      binHeader[7] = 0x00;
+
+      fs.writeSync(fd, glbHeader);
+      fs.writeSync(fd, jsonHeader);
+      fs.writeSync(fd, jsonChunk);
+      if (jsonPadLength > 0) {
+        fs.writeSync(fd, Buffer.alloc(jsonPadLength, 0x20));
+      }
+      fs.writeSync(fd, binHeader);
+      for (const part of this.bufferParts) {
+        fs.writeSync(fd, part);
+      }
+      if (binPadLength > 0) {
+        fs.writeSync(fd, Buffer.alloc(binPadLength));
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
   }
 }
 

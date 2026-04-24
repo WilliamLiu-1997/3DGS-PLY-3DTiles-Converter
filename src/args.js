@@ -2,8 +2,7 @@ const { ConversionError } = require('./parser');
 
 const WGS84_SEMI_MAJOR_AXIS = 6378137.0;
 const WGS84_FLATTENING = 1.0 / 298.257223563;
-const WGS84_ECCENTRICITY_SQUARED =
-  WGS84_FLATTENING * (2.0 - WGS84_FLATTENING);
+const WGS84_ECCENTRICITY_SQUARED = WGS84_FLATTENING * (2.0 - WGS84_FLATTENING);
 
 function usage() {
   return [
@@ -27,6 +26,7 @@ function usage() {
     '  --sample-mode <sample|merge>',
     '  --build-concurrency <1+>',
     '  --content-workers <0+>',
+    '  --open-inspector',
     '  --self-test',
     '  --self-test-count <int>',
     '  --clean',
@@ -40,8 +40,8 @@ const DEFAULT_CONVERSION_ARGS = {
   inputConvention: 'graphdeco',
   linearScaleInput: false,
   colorSpace: 'srgb_rec709_display',
-  maxDepth: 4,
-  leafLimit: 10000,
+  maxDepth: 5,
+  leafLimit: 5000,
   tilingMode: 'explicit',
   subtreeLevels: 2,
   minGeometricError: null,
@@ -53,9 +53,10 @@ const DEFAULT_CONVERSION_ARGS = {
   sampleMode: 'merge',
   buildConcurrency: 2,
   contentWorkers: 4,
+  openInspector: false,
   clean: false,
   selfTest: false,
-  selfTestCount: 6000,
+  selfTestCount: 1000000,
   help: false,
 };
 
@@ -484,6 +485,10 @@ function parseArgs(argv) {
       args.contentWorkers = value;
       continue;
     }
+    if (token === '--open-inspector') {
+      args.openInspector = true;
+      continue;
+    }
     if (token === '--self-test') {
       args.selfTest = true;
       continue;
@@ -694,6 +699,12 @@ function makeConversionArgs(
         DEFAULT_CONVERSION_ARGS.contentWorkers,
       ),
       '--content-workers',
+    ),
+    openInspector: firstDefined(
+      options.openInspector,
+      options['open-inspector'],
+      options.open_inspector,
+      DEFAULT_CONVERSION_ARGS.openInspector,
     ),
     clean: firstDefined(options.clean, DEFAULT_CONVERSION_ARGS.clean),
     selfTest: firstDefined(

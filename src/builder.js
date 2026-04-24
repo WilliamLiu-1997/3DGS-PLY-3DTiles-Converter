@@ -121,25 +121,26 @@ class SpzContentWorkerPool {
     this.closed = false;
     this.idleResolvers = [];
     this._lastErr = null;
+  }
 
-    for (let i = 0; i < this.workerCount; i++) {
-      const worker = new Worker(this.workerScriptPath);
+  _createWorker() {
+    const worker = new Worker(this.workerScriptPath);
+    worker._busy = false;
+    worker._job = null;
+    worker.on('message', (msg) => this._handleMessage(worker, msg));
+    worker.on('error', (err) => this._handleError(worker, err));
+    worker.on('exit', (code) => {
+      if (code !== 0 && worker._job) {
+        this._handleError(
+          worker,
+          new Error(`Spz worker exited with code ${code}`),
+        );
+      }
       worker._busy = false;
       worker._job = null;
-      worker.on('message', (msg) => this._handleMessage(worker, msg));
-      worker.on('error', (err) => this._handleError(worker, err));
-      worker.on('exit', (code) => {
-        if (code !== 0 && worker._job) {
-          this._handleError(
-            worker,
-            new Error(`Spz worker exited with code ${code}`),
-          );
-        }
-        worker._busy = false;
-        worker._job = null;
-      });
-      this.workers.push(worker);
-    }
+    });
+    this.workers.push(worker);
+    return worker;
   }
 
   submit(task, transfer = []) {
@@ -160,6 +161,17 @@ class SpzContentWorkerPool {
   _drain() {
     if (this.closed || this._lastErr) {
       return;
+    }
+
+    while (this.taskQueue.length > 0 && this.workers.length < this.workerCount) {
+      const idleCount = this.workers.reduce(
+        (sum, worker) => sum + (worker._busy ? 0 : 1),
+        0,
+      );
+      if (idleCount >= this.taskQueue.length) {
+        break;
+      }
+      this._createWorker();
     }
 
     for (const worker of this.workers) {
@@ -269,63 +281,81 @@ class SpzContentWorkerPool {
   }
 }
 
+function writeThreeSigmaExtentComponents(
+  scaleLog,
+  scaleOffset,
+  quatsXYZW,
+  quatOffset,
+  out,
+  outOffset = 0,
+) {
+  let x = quatsXYZW[quatOffset + 0];
+  let y = quatsXYZW[quatOffset + 1];
+  let z = quatsXYZW[quatOffset + 2];
+  let w = quatsXYZW[quatOffset + 3];
+
+  const len2 = x * x + y * y + z * z + w * w;
+  if (len2 < 1e-20) {
+    x = 0.0;
+    y = 0.0;
+    z = 0.0;
+    w = 1.0;
+  } else {
+    const inv = 1.0 / Math.sqrt(len2);
+    x *= inv;
+    y *= inv;
+    z *= inv;
+    w *= inv;
+  }
+
+  const xx = x * x;
+  const yy = y * y;
+  const zz = z * z;
+  const xy = x * y;
+  const xz = x * z;
+  const yz = y * z;
+  const wx = w * x;
+  const wy = w * y;
+  const wz = w * z;
+
+  const s0 = Math.exp(scaleLog[scaleOffset + 0]);
+  const s1 = Math.exp(scaleLog[scaleOffset + 1]);
+  const s2 = Math.exp(scaleLog[scaleOffset + 2]);
+  const s2x = s0 * s0;
+  const s2y = s1 * s1;
+  const s2z = s2 * s2;
+
+  const c00 =
+    (1.0 - 2.0 * (yy + zz)) * (1.0 - 2.0 * (yy + zz)) * s2x +
+    2.0 * (xy - wz) * (2.0 * (xy - wz)) * s2y +
+    2.0 * (xz + wy) * (2.0 * (xz + wy)) * s2z;
+  const c11 =
+    2.0 * (xy + wz) * (2.0 * (xy + wz)) * s2x +
+    (1.0 - 2.0 * (xx + zz)) * (1.0 - 2.0 * (xx + zz)) * s2y +
+    2.0 * (yz - wx) * (2.0 * (yz - wx)) * s2z;
+  const c22 =
+    2.0 * (xz - wy) * (2.0 * (xz - wy)) * s2x +
+    2.0 * (yz + wx) * (2.0 * (yz + wx)) * s2y +
+    (1.0 - 2.0 * (xx + yy)) * (1.0 - 2.0 * (xx + yy)) * s2z;
+
+  out[outOffset + 0] = Math.fround(3.0 * Math.sqrt(Math.max(c00, 1e-20)));
+  out[outOffset + 1] = Math.fround(3.0 * Math.sqrt(Math.max(c11, 1e-20)));
+  out[outOffset + 2] = Math.fround(3.0 * Math.sqrt(Math.max(c22, 1e-20)));
+  return out;
+}
+
 function computeThreeSigmaExtents(scaleLog, quatsXYZW) {
   const n = scaleLog.length / 3;
   const out = new Float32Array(n * 3);
   for (let i = 0; i < n; i++) {
-    const qi = i * 4;
-    let x = quatsXYZW[qi + 0];
-    let y = quatsXYZW[qi + 1];
-    let z = quatsXYZW[qi + 2];
-    let w = quatsXYZW[qi + 3];
-
-    const len2 = x * x + y * y + z * z + w * w;
-    if (len2 < 1e-20) {
-      x = 0.0;
-      y = 0.0;
-      z = 0.0;
-      w = 1.0;
-    } else {
-      const inv = 1.0 / Math.sqrt(len2);
-      x *= inv;
-      y *= inv;
-      z *= inv;
-      w *= inv;
-    }
-
-    const xx = x * x;
-    const yy = y * y;
-    const zz = z * z;
-    const xy = x * y;
-    const xz = x * z;
-    const yz = y * z;
-    const wx = w * x;
-    const wy = w * y;
-    const wz = w * z;
-
-    const s0 = Math.exp(scaleLog[i * 3 + 0]);
-    const s1 = Math.exp(scaleLog[i * 3 + 1]);
-    const s2 = Math.exp(scaleLog[i * 3 + 2]);
-    const s2x = s0 * s0;
-    const s2y = s1 * s1;
-    const s2z = s2 * s2;
-
-    const c00 =
-      (1.0 - 2.0 * (yy + zz)) * (1.0 - 2.0 * (yy + zz)) * s2x +
-      2.0 * (xy - wz) * (2.0 * (xy - wz)) * s2y +
-      2.0 * (xz + wy) * (2.0 * (xz + wy)) * s2z;
-    const c11 =
-      2.0 * (xy + wz) * (2.0 * (xy + wz)) * s2x +
-      (1.0 - 2.0 * (xx + zz)) * (1.0 - 2.0 * (xx + zz)) * s2y +
-      2.0 * (yz - wx) * (2.0 * (yz - wx)) * s2z;
-    const c22 =
-      2.0 * (xz - wy) * (2.0 * (xz - wy)) * s2x +
-      2.0 * (yz + wx) * (2.0 * (yz + wx)) * s2y +
-      (1.0 - 2.0 * (xx + yy)) * (1.0 - 2.0 * (xx + yy)) * s2z;
-
-    out[i * 3 + 0] = 3.0 * Math.sqrt(Math.max(c00, 1e-20));
-    out[i * 3 + 1] = 3.0 * Math.sqrt(Math.max(c11, 1e-20));
-    out[i * 3 + 2] = 3.0 * Math.sqrt(Math.max(c22, 1e-20));
+    writeThreeSigmaExtentComponents(
+      scaleLog,
+      i * 3,
+      quatsXYZW,
+      i * 4,
+      out,
+      i * 3,
+    );
   }
   return out;
 }
@@ -334,79 +364,99 @@ function computeThreeSigmaAabbDiagonalRadius(scaleLog, quatsXYZW) {
   const n = scaleLog.length / 3;
   const out = new Float32Array(n);
   for (let i = 0; i < n; i++) {
-    const qi = i * 4;
-    let x = quatsXYZW[qi + 0];
-    let y = quatsXYZW[qi + 1];
-    let z = quatsXYZW[qi + 2];
-    let w = quatsXYZW[qi + 3];
-
-    const len2 = x * x + y * y + z * z + w * w;
-    if (len2 < 1e-20) {
-      x = 0.0;
-      y = 0.0;
-      z = 0.0;
-      w = 1.0;
-    } else {
-      const inv = 1.0 / Math.sqrt(len2);
-      x *= inv;
-      y *= inv;
-      z *= inv;
-      w *= inv;
-    }
-
-    const xx = x * x;
-    const yy = y * y;
-    const zz = z * z;
-    const xy = x * y;
-    const xz = x * z;
-    const yz = y * z;
-    const wx = w * x;
-    const wy = w * y;
-    const wz = w * z;
-
-    const s0 = Math.exp(scaleLog[i * 3 + 0]);
-    const s1 = Math.exp(scaleLog[i * 3 + 1]);
-    const s2 = Math.exp(scaleLog[i * 3 + 2]);
-    const s2x = s0 * s0;
-    const s2y = s1 * s1;
-    const s2z = s2 * s2;
-
-    const r00 = 1.0 - 2.0 * (yy + zz);
-    const r10 = 2.0 * (xy - wz);
-    const r20 = 2.0 * (xz + wy);
-    const r01 = 2.0 * (xy + wz);
-    const r11 = 1.0 - 2.0 * (xx + zz);
-    const r21 = 2.0 * (yz - wx);
-    const r02 = 2.0 * (xz - wy);
-    const r12 = 2.0 * (yz + wx);
-    const r22 = 1.0 - 2.0 * (xx + yy);
-
-    const c00 = r00 * r00 * s2x + r10 * r10 * s2y + r20 * r20 * s2z;
-    const c11 = r01 * r01 * s2x + r11 * r11 * s2y + r21 * r21 * s2z;
-    const c22 = r02 * r02 * s2x + r12 * r12 * s2y + r22 * r22 * s2z;
-
-    const ex = 3.0 * Math.sqrt(Math.max(c00, 1e-20));
-    const ey = 3.0 * Math.sqrt(Math.max(c11, 1e-20));
-    const ez = 3.0 * Math.sqrt(Math.max(c22, 1e-20));
-    out[i] = Math.sqrt(ex * ex + ey * ey + ez * ez);
+    out[i] = computeThreeSigmaAabbDiagonalRadiusAt(
+      scaleLog,
+      i * 3,
+      quatsXYZW,
+      i * 4,
+    );
   }
   return out;
 }
 
+function computeThreeSigmaAabbDiagonalRadiusAt(
+  scaleLog,
+  scaleOffset,
+  quatsXYZW,
+  quatOffset,
+) {
+  let x = quatsXYZW[quatOffset + 0];
+  let y = quatsXYZW[quatOffset + 1];
+  let z = quatsXYZW[quatOffset + 2];
+  let w = quatsXYZW[quatOffset + 3];
+
+  const len2 = x * x + y * y + z * z + w * w;
+  if (len2 < 1e-20) {
+    x = 0.0;
+    y = 0.0;
+    z = 0.0;
+    w = 1.0;
+  } else {
+    const inv = 1.0 / Math.sqrt(len2);
+    x *= inv;
+    y *= inv;
+    z *= inv;
+    w *= inv;
+  }
+
+  const xx = x * x;
+  const yy = y * y;
+  const zz = z * z;
+  const xy = x * y;
+  const xz = x * z;
+  const yz = y * z;
+  const wx = w * x;
+  const wy = w * y;
+  const wz = w * z;
+
+  const s0 = Math.exp(scaleLog[scaleOffset + 0]);
+  const s1 = Math.exp(scaleLog[scaleOffset + 1]);
+  const s2 = Math.exp(scaleLog[scaleOffset + 2]);
+  const s2x = s0 * s0;
+  const s2y = s1 * s1;
+  const s2z = s2 * s2;
+
+  const r00 = 1.0 - 2.0 * (yy + zz);
+  const r10 = 2.0 * (xy - wz);
+  const r20 = 2.0 * (xz + wy);
+  const r01 = 2.0 * (xy + wz);
+  const r11 = 1.0 - 2.0 * (xx + zz);
+  const r21 = 2.0 * (yz - wx);
+  const r02 = 2.0 * (xz - wy);
+  const r12 = 2.0 * (yz + wx);
+  const r22 = 1.0 - 2.0 * (xx + yy);
+
+  const c00 = r00 * r00 * s2x + r10 * r10 * s2y + r20 * r20 * s2z;
+  const c11 = r01 * r01 * s2x + r11 * r11 * s2y + r21 * r21 * s2z;
+  const c22 = r02 * r02 * s2x + r12 * r12 * s2y + r22 * r22 * s2z;
+
+  const ex = 3.0 * Math.sqrt(Math.max(c00, 1e-20));
+  const ey = 3.0 * Math.sqrt(Math.max(c11, 1e-20));
+  const ez = 3.0 * Math.sqrt(Math.max(c22, 1e-20));
+  return Math.sqrt(ex * ex + ey * ey + ez * ez);
+}
+
 function computeBounds(cloud) {
   const n = cloud.length;
-  const ext = computeThreeSigmaExtents(cloud.scaleLog, cloud.quatsXYZW);
   const minimum = [Infinity, Infinity, Infinity];
   const maximum = [-Infinity, -Infinity, -Infinity];
+  const extentScratch = new Float32Array(3);
   for (let i = 0; i < n; i++) {
     const pi = i * 3;
-    const ei = i * 3;
+    writeThreeSigmaExtentComponents(
+      cloud.scaleLog,
+      pi,
+      cloud.quatsXYZW,
+      i * 4,
+      extentScratch,
+      0,
+    );
     const p0 = cloud.positions[pi + 0];
     const p1 = cloud.positions[pi + 1];
     const p2 = cloud.positions[pi + 2];
-    const ex = ext[ei + 0];
-    const ey = ext[ei + 1];
-    const ez = ext[ei + 2];
+    const ex = extentScratch[0];
+    const ey = extentScratch[1];
+    const ez = extentScratch[2];
     const min0 = p0 - ex;
     const min1 = p1 - ey;
     const min2 = p2 - ez;
@@ -585,12 +635,116 @@ function representativeIndexForGroup(
   return rep;
 }
 
+function representativeIndexForGroupRange(
+  cloud,
+  groupIndices,
+  start,
+  end,
+  weightAt,
+  radii,
+  voxelDiagSq,
+  radiusBias,
+  excludeA = -1,
+  excludeB = -1,
+) {
+  if (end <= start) {
+    return -1;
+  }
+
+  const pos = cloud.positions;
+  let sumW = 0.0;
+  let cx = 0.0;
+  let cy = 0.0;
+  let cz = 0.0;
+  let fallback = -1;
+  let fallbackWeight = -Infinity;
+  let fallbackRadius = radiusBias >= 0.0 ? Infinity : -Infinity;
+  let validCount = 0;
+
+  for (let p = start; p < end; p++) {
+    const idx = groupIndices[p];
+    if (idx === excludeA || idx === excludeB) {
+      continue;
+    }
+    validCount += 1;
+    const w = Math.max(weightAt(idx), 1e-12);
+    const i3 = idx * 3;
+    sumW += w;
+    cx += pos[i3 + 0] * w;
+    cy += pos[i3 + 1] * w;
+    cz += pos[i3 + 2] * w;
+    if (
+      fallback < 0 ||
+      w > fallbackWeight + 1e-12 ||
+      (Math.abs(w - fallbackWeight) <= 1e-12 &&
+        ((radiusBias >= 0.0 && radii[idx] < fallbackRadius) ||
+          (radiusBias < 0.0 && radii[idx] > fallbackRadius)))
+    ) {
+      fallback = idx;
+      fallbackWeight = w;
+      fallbackRadius = radii[idx];
+    }
+  }
+
+  if (validCount <= 0 || fallback < 0) {
+    return -1;
+  }
+  if (validCount === 1) {
+    return fallback;
+  }
+  if (!Number.isFinite(sumW) || sumW <= 0.0) {
+    return fallback;
+  }
+
+  cx /= sumW;
+  cy /= sumW;
+  cz /= sumW;
+
+  let rep = fallback;
+  let bestCost = Infinity;
+  let bestWeight = fallbackWeight;
+  let bestRadius = fallbackRadius;
+  const invVoxelDiagSq = 1.0 / Math.max(voxelDiagSq, 1e-12);
+  for (let p = start; p < end; p++) {
+    const idx = groupIndices[p];
+    if (idx === excludeA || idx === excludeB) {
+      continue;
+    }
+    const i3 = idx * 3;
+    const dx = pos[i3 + 0] - cx;
+    const dy = pos[i3 + 1] - cy;
+    const dz = pos[i3 + 2] - cz;
+    const dist2 = dx * dx + dy * dy + dz * dz;
+    const radius = radii[idx];
+    const w = weightAt(idx);
+    const cost =
+      dist2 * invVoxelDiagSq + radiusBias * radius * radius * invVoxelDiagSq;
+    if (
+      cost < bestCost - 1e-12 ||
+      (Math.abs(cost - bestCost) <= 1e-12 &&
+        (w > bestWeight + 1e-12 ||
+          (Math.abs(w - bestWeight) <= 1e-12 &&
+            ((radiusBias >= 0.0 && radius < bestRadius) ||
+              (radiusBias < 0.0 && radius > bestRadius)))))
+    ) {
+      rep = idx;
+      bestCost = cost;
+      bestWeight = w;
+      bestRadius = radius;
+    }
+  }
+  return rep;
+}
+
 function planSimplifyCloudVoxel(
   cloud,
   targetCount,
   bounds = null,
   voxelTargetCount = targetCount,
+  options = {},
 ) {
+  const returnOrigRadius = options.returnOrigRadius !== false;
+  const returnKeptRadius = options.returnKeptRadius !== false;
   const n = cloud.length;
   const target = normalizeSplatTargetCount(targetCount, n);
   const voxelTarget = normalizeSplatTargetCount(voxelTargetCount, n);
@@ -601,15 +755,14 @@ function planSimplifyCloudVoxel(
       selected.push(i);
       assignment[i] = i;
     }
-    const keptRadius = computeThreeSigmaAabbDiagonalRadius(
-      cloud.scaleLog,
-      cloud.quatsXYZW,
-    );
+    const keptRadius =
+      cloud.origRadius ||
+      computeThreeSigmaAabbDiagonalRadius(cloud.scaleLog, cloud.quatsXYZW);
     return {
       selected,
       assignment,
-      keptRadius,
-      origRadius: keptRadius,
+      keptRadius: returnKeptRadius ? keptRadius : null,
+      origRadius: returnOrigRadius ? keptRadius : null,
       voxelDiag: 0.0,
     };
   }
@@ -619,7 +772,6 @@ function planSimplifyCloudVoxel(
   const mins = activeBounds.minimum;
   const ext = activeBounds.extents().map((v) => Math.max(v, 1e-6));
 
-  let groups = null;
   const pos = cloud.positions;
   const m0 = mins[0];
   const m1 = mins[1];
@@ -627,44 +779,46 @@ function planSimplifyCloudVoxel(
   const invExt0 = 1.0 / ext[0];
   const invExt1 = 1.0 / ext[1];
   const invExt2 = 1.0 / ext[2];
-  const map = new Map();
+  let groupKeys = [];
+  let cellCounts = null;
+
+  const flatForPoint = (idx, dimsIn) => {
+    const i3 = idx * 3;
+    const d0 = dimsIn[0];
+    const d1 = dimsIn[1];
+    const d2 = dimsIn[2];
+    const uvw0 = Math.max(0.0, Math.min(0.999999, (pos[i3] - m0) * invExt0));
+    const uvw1 = Math.max(
+      0.0,
+      Math.min(0.999999, (pos[i3 + 1] - m1) * invExt1),
+    );
+    const uvw2 = Math.max(
+      0.0,
+      Math.min(0.999999, (pos[i3 + 2] - m2) * invExt2),
+    );
+    const iIdx = Math.min(d0 - 1, Math.floor(uvw0 * d0));
+    const jIdx = Math.min(d1 - 1, Math.floor(uvw1 * d1));
+    const kIdx = Math.min(d2 - 1, Math.floor(uvw2 * d2));
+    return iIdx + d0 * (jIdx + d1 * kIdx);
+  };
 
   for (let iter = 0; iter < 24; iter++) {
-    map.clear();
-    const d0 = dims[0];
-    const d1 = dims[1];
-    const d2 = dims[2];
-    const d0m1 = d0 - 1;
-    const d1m1 = d1 - 1;
-    const d2m1 = d2 - 1;
+    const cellCount = dims[0] * dims[1] * dims[2];
+    cellCounts = new Uint32Array(cellCount);
 
     for (let i = 0; i < n; i++) {
-      const i3 = i * 3;
-      const uvw0 = Math.max(0.0, Math.min(0.999999, (pos[i3] - m0) * invExt0));
-      const uvw1 = Math.max(
-        0.0,
-        Math.min(0.999999, (pos[i3 + 1] - m1) * invExt1),
-      );
-      const uvw2 = Math.max(
-        0.0,
-        Math.min(0.999999, (pos[i3 + 2] - m2) * invExt2),
-      );
-      const iIdx = Math.min(d0m1, Math.floor(uvw0 * d0));
-      const jIdx = Math.min(d1m1, Math.floor(uvw1 * d1));
-      const kIdx = Math.min(d2m1, Math.floor(uvw2 * d2));
-      const flat = iIdx + d0 * (jIdx + d1 * kIdx);
-      let bucket = map.get(flat);
-      if (!bucket) {
-        bucket = [];
-        map.set(flat, bucket);
-      }
-      bucket.push(i);
+      const flat = flatForPoint(i, dims);
+      cellCounts[flat] += 1;
     }
 
-    const keys = Array.from(map.keys()).sort((a, b) => a - b);
-    groups = keys.map((k) => map.get(k));
+    groupKeys = [];
+    for (let flat = 0; flat < cellCount; flat++) {
+      if (cellCounts[flat] > 0) {
+        groupKeys.push(flat);
+      }
+    }
     if (
-      groups.length <= target ||
+      groupKeys.length <= target ||
       (dims[0] === 1 && dims[1] === 1 && dims[2] === 1)
     ) {
       break;
@@ -677,110 +831,122 @@ function planSimplifyCloudVoxel(
     ];
   }
 
-  const selectedGroups = groups || [];
-  const origRadius = computeThreeSigmaAabbDiagonalRadius(
-    cloud.scaleLog,
-    cloud.quatsXYZW,
-  );
+  const groupCount = groupKeys.length;
+  const groupOffsets = new Uint32Array(groupCount + 1);
+  for (let group = 0; group < groupCount; group++) {
+    const key = groupKeys[group];
+    groupOffsets[group + 1] = groupOffsets[group] + cellCounts[key];
+    cellCounts[key] = group;
+  }
+  const groupIndices = new Int32Array(n);
+  const groupCursors = new Uint32Array(groupOffsets);
+  for (let i = 0; i < n; i++) {
+    const group = cellCounts[flatForPoint(i, dims)];
+    groupIndices[groupCursors[group]++] = i;
+  }
+  cellCounts = null;
+  groupKeys = [];
+
+  const origRadius =
+    cloud.origRadius ||
+    computeThreeSigmaAabbDiagonalRadius(cloud.scaleLog, cloud.quatsXYZW);
   const voxelSize0 = ext[0] / Math.max(1, dims[0]);
   const voxelSize1 = ext[1] / Math.max(1, dims[1]);
   const voxelSize2 = ext[2] / Math.max(1, dims[2]);
   const voxelDiagSq =
     voxelSize0 * voxelSize0 + voxelSize1 * voxelSize1 + voxelSize2 * voxelSize2;
   const voxelDiag = Math.max(Math.sqrt(voxelDiagSq), 1e-6);
-  const coarseWeights = new Float64Array(n);
-  for (let i = 0; i < n; i++) {
+  const coarseWeightAt = (i) => {
     const opacity = Math.max(cloud.opacity[i], 1e-4);
     const radiusNorm = Math.max(origRadius[i] / voxelDiag, 0.35);
-    coarseWeights[i] = opacity * Math.sqrt(radiusNorm);
-  }
+    return opacity * Math.sqrt(radiusNorm);
+  };
 
   const selected = [];
-  const selectedSlotByOrig = new Int32Array(n);
-  selectedSlotByOrig.fill(-1);
   const assignment = new Int32Array(n);
-  const taken = new Uint8Array(n);
+  assignment.fill(-1);
   const extraCoarseCandidates = [];
 
-  for (const idxs of selectedGroups) {
-    if (idxs.length === 0) {
+  for (let group = 0; group < groupCount; group++) {
+    const start = groupOffsets[group];
+    const end = groupOffsets[group + 1];
+    if (end <= start) {
       continue;
     }
-    const coarseRep = representativeIndexForGroup(
+    const coarseRep = representativeIndexForGroupRange(
       cloud,
-      idxs,
-      coarseWeights,
+      groupIndices,
+      start,
+      end,
+      coarseWeightAt,
       origRadius,
       voxelDiagSq,
       -0.15,
     );
     const coarseOutIdx = selected.length;
     selected.push(coarseRep);
-    selectedSlotByOrig[coarseRep] = coarseOutIdx;
-    taken[coarseRep] = 1;
+    assignment[coarseRep] = coarseOutIdx;
 
-    const extraCoarseRep = representativeIndexForGroup(
+    const extraCoarseRep = representativeIndexForGroupRange(
       cloud,
-      idxs,
-      coarseWeights,
+      groupIndices,
+      start,
+      end,
+      coarseWeightAt,
       origRadius,
       voxelDiagSq,
       -0.15,
       coarseRep,
     );
     if (extraCoarseRep >= 0) {
-      extraCoarseCandidates.push({
-        rep: extraCoarseRep,
-        priority: coarseWeights[extraCoarseRep],
-      });
+      extraCoarseCandidates.push(extraCoarseRep);
     }
   }
 
   if (selected.length < target && extraCoarseCandidates.length > 0) {
     extraCoarseCandidates.sort((a, b) => {
-      if (b.priority !== a.priority) {
-        return b.priority - a.priority;
+      const priorityDiff = coarseWeightAt(b) - coarseWeightAt(a);
+      if (priorityDiff !== 0) {
+        return priorityDiff;
       }
-      return a.rep - b.rep;
+      return a - b;
     });
     for (
       let i = 0;
       i < extraCoarseCandidates.length && selected.length < target;
       i++
     ) {
-      const rep = extraCoarseCandidates[i].rep;
-      if (taken[rep]) {
+      const rep = extraCoarseCandidates[i];
+      if (assignment[rep] >= 0) {
         continue;
       }
       const outIdx = selected.length;
       selected.push(rep);
-      selectedSlotByOrig[rep] = outIdx;
-      taken[rep] = 1;
+      assignment[rep] = outIdx;
     }
   }
 
   if (selected.length < target) {
     const remain = [];
     for (let i = 0; i < n; i++) {
-      if (!taken[i]) {
+      if (assignment[i] < 0) {
         remain.push(i);
       }
     }
-    const remainCoarse = remain.slice().sort((a, b) => {
-      const w = coarseWeights[b] - coarseWeights[a];
+    remain.sort((a, b) => {
+      const w = coarseWeightAt(b) - coarseWeightAt(a);
       if (w !== 0) return w;
       const r = origRadius[b] - origRadius[a];
       return r !== 0 ? r : b - a;
     });
-    for (let i = 0; i < remainCoarse.length && selected.length < target; i++) {
-      const rep = remainCoarse[i];
-      if (taken[rep]) {
+    for (let i = 0; i < remain.length && selected.length < target; i++) {
+      const rep = remain[i];
+      if (assignment[rep] >= 0) {
         continue;
       }
       const outIdx = selected.length;
       selected.push(rep);
-      selectedSlotByOrig[rep] = outIdx;
-      taken[rep] = 1;
+      assignment[rep] = outIdx;
     }
   }
 
@@ -789,13 +955,15 @@ function planSimplifyCloudVoxel(
     keptRadius[i] = origRadius[selected[i]];
   }
 
-  for (const idxs of selectedGroups) {
-    if (idxs.length === 0) {
+  for (let group = 0; group < groupCount; group++) {
+    const start = groupOffsets[group];
+    const end = groupOffsets[group + 1];
+    if (end <= start) {
       continue;
     }
     const reps = [];
-    for (let i = 0; i < idxs.length; i++) {
-      const slot = selectedSlotByOrig[idxs[i]];
+    for (let p = start; p < end; p++) {
+      const slot = assignment[groupIndices[p]];
       if (slot >= 0) {
         reps.push(slot);
       }
@@ -804,13 +972,13 @@ function planSimplifyCloudVoxel(
       continue;
     }
     if (reps.length === 1) {
-      for (let i = 0; i < idxs.length; i++) {
-        assignment[idxs[i]] = reps[0];
+      for (let p = start; p < end; p++) {
+        assignment[groupIndices[p]] = reps[0];
       }
       continue;
     }
-    for (let i = 0; i < idxs.length; i++) {
-      const orig = idxs[i];
+    for (let p = start; p < end; p++) {
+      const orig = groupIndices[p];
       const p3 = orig * 3;
       let bestSlot = reps[0];
       let bestScore = Infinity;
@@ -834,8 +1002,8 @@ function planSimplifyCloudVoxel(
   return {
     selected,
     assignment,
-    keptRadius,
-    origRadius,
+    keptRadius: returnKeptRadius ? keptRadius : null,
+    origRadius: returnOrigRadius ? origRadius : null,
     voxelDiag,
   };
 }
@@ -1054,15 +1222,19 @@ function buildSubtreeArtifact(
 }
 
 function buildSubtreeBinaryBuffer(subtree, blob) {
-  const subtreeJson = JSON.parse(JSON.stringify(subtree));
+  let subtreeJson = subtree;
   let binaryChunk = Buffer.alloc(0);
 
   if (blob && blob.length > 0) {
     const binaryPad = padLength(blob.length, 8);
     binaryChunk =
       binaryPad > 0 ? Buffer.concat([blob, Buffer.alloc(binaryPad)]) : blob;
-    subtreeJson.buffers[0].byteLength = binaryChunk.length;
-    delete subtreeJson.buffers[0].uri;
+    const { uri: _uri, ...restBuf0 } = subtree.buffers[0];
+    const newBuf0 = { ...restBuf0, byteLength: binaryChunk.length };
+    subtreeJson = {
+      ...subtree,
+      buffers: [newBuf0, ...subtree.buffers.slice(1)],
+    };
   }
 
   const jsonChunk = Buffer.from(JSON.stringify(subtreeJson), 'utf8');
@@ -1091,6 +1263,7 @@ module.exports = {
   ConsoleProgressBar,
   SpzContentWorkerPool,
   computeBounds,
+  computeThreeSigmaAabbDiagonalRadiusAt,
   computeThreeSigmaAabbDiagonalRadius,
   childBounds,
   chooseGridDims,
@@ -1101,6 +1274,7 @@ module.exports = {
   samplingDivisorForDepth,
   geometricErrorScaleForDepth,
   rootGeometricErrorFromMinLevel,
+  writeThreeSigmaExtentComponents,
   buildSubtreeArtifact,
   writeSubtreeFile,
 };

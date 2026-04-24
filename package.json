@@ -42,5 +42,8 @@
     "ply",
     "spz",
     "converter"
-  ]
+  ],
+  "dependencies": {
+    "3dtiles-inspector": "^0.1.2"
+  }
 }

@@ -17,9 +17,22 @@ const {
 
 const {
   SPZ_STREAM_VERSION,
+  gzipSpzPacket,
+  makeSpzPacketLayout,
+  makeSpzShQuantBuckets,
+  packQuaternionSmallestThreeInto,
   packCloudToSpz,
+  quantizeSpzColor,
+  quantizeSpzExtraSh,
+  quantizeSpzOpacity,
+  quantizeSpzPosition,
+  quantizeSpzScale,
   serializeCloudForWorkerTask,
   transferListForCloud,
+  validateSpzCoeffCount,
+  validateSpzQuantBits,
+  writeFixed24Into,
+  writeSpzPacketHeader,
 } = require('./codec');
 const { GltfBuilder } = require('./gltf');
 const {
@@ -27,15 +40,16 @@ const {
   ConsoleProgressBar,
   SpzContentWorkerPool,
   computeBounds,
+  computeThreeSigmaAabbDiagonalRadiusAt,
   computeThreeSigmaAabbDiagonalRadius,
   childBounds,
   normalizeSplatTargetCount,
   constrainTargetSplatCount,
-  percent95,
   planSimplifyCloudVoxel,
   samplingDivisorForDepth,
   geometricErrorScaleForDepth,
   rootGeometricErrorFromMinLevel,
+  writeThreeSigmaExtentComponents,
   buildSubtreeArtifact,
   writeSubtreeFile,
 } = require('./builder');
@@ -43,14 +57,32 @@ const {
 const DEFAULT_WORKER_SCRIPT = path.join(__dirname, 'convert-core.js');
 const TEMP_WORKSPACE_NAME = '.tmp-ply-partitions';
 const PIPELINE_STATE_FILE = 'pipeline-state.json';
-const PIPELINE_STATE_VERSION = 2;
+const PIPELINE_STATE_VERSION = 5;
 const PIPELINE_STAGE_BUCKETED = 'bucketed';
 const LEAF_BUCKET_DIR = 'leaf';
 const HANDOFF_BUCKET_DIR = 'handoff';
 const LEAF_BUCKET_ENCODING = 'canonical32';
 const HANDOFF_BUCKET_ENCODING = 'canonical32';
-const PARTITION_FLUSH_BYTES = 16 * 1024 * 1024;
-const SPZ_ASYNC_WRITE_THRESHOLD = 65536;
+const PARTITION_ARENA_BYTES = 4 * 1024 * 1024;
+const POSITION_TMP_FILE = 'positions.tmp';
+const POSITION_ROW_BYTE_SIZE = 12;
+const POSITION_TMP_BUFFER_BYTES = 256 * 1024;
+const WRITEV_BATCH_CHUNKS = 1024;
+const SPZ_CLOUD_ASYNC_WRITE_THRESHOLD = 65536;
+const SPZ_BUCKET_ASYNC_WRITE_THRESHOLD = 32768;
+const MERGE_SH_COEFF_BLOCK = 12;
+const PIPELINE_STATE_SAVE_INTERVAL_MS = 1000;
+const PIPELINE_STATE_SAVE_NODE_INTERVAL = 64;
+const SHALLOW_COUNT_MAX_LEVEL = 6;
+const UINT32_MAX_COUNT = 0xffffffff;
+const COUNT_KEY_MAX_PACKED_LEVEL = 16;
+const COUNT_KEY_LEVEL_FACTOR = 281474976710656; // 2 ** 48
+const COUNT_KEY_X_FACTOR = 4294967296; // 2 ** 32
+const COUNT_KEY_Y_FACTOR = 65536; // 2 ** 16
+const IS_LITTLE_ENDIAN = (() => {
+  const probe = new Uint8Array(new Uint16Array([0x0102]).buffer);
+  return probe[0] === 0x02;
+})();
 const BUILT_IN_SOURCE_TO_TILE_Z_UP = [
   [1.0, 0.0, 0.0],
   [0.0, 0.0, 1.0],
@@ -125,9 +157,63 @@ function makeNodeKey(level, x, y, z) {
   return `${level}/${x}/${y}/${z}`;
 }
 
+function makeCountKey(level, x, y, z) {
+  if (level <= COUNT_KEY_MAX_PACKED_LEVEL) {
+    return (
+      level * COUNT_KEY_LEVEL_FACTOR +
+      x * COUNT_KEY_X_FACTOR +
+      y * COUNT_KEY_Y_FACTOR +
+      z
+    );
+  }
+  return makeNodeKey(level, x, y, z);
+}
+
+function packShallowCountIndex(level, x, y, z) {
+  if (level === 0) {
+    return 0;
+  }
+  return (x << (2 * level)) | (y << level) | z;
+}
+
+class CountsTable {
+  constructor(maxDepth, totalRows) {
+    this.shallowMaxLevel =
+      totalRows <= UINT32_MAX_COUNT
+        ? Math.min(maxDepth, SHALLOW_COUNT_MAX_LEVEL)
+        : -1;
+    this.shallow = [];
+    for (let level = 0; level <= this.shallowMaxLevel; level++) {
+      this.shallow[level] = new Uint32Array(1 << (3 * level));
+    }
+    this.deep = new Map();
+  }
+
+  increment(level, x, y, z) {
+    if (level <= this.shallowMaxLevel) {
+      this.shallow[level][packShallowCountIndex(level, x, y, z)] += 1;
+      return;
+    }
+    const key = makeCountKey(level, x, y, z);
+    this.deep.set(key, (this.deep.get(key) || 0) + 1);
+  }
+
+  getCount(level, x, y, z) {
+    if (level <= this.shallowMaxLevel) {
+      return this.shallow[level][packShallowCountIndex(level, x, y, z)] || 0;
+    }
+    return this.deep.get(makeCountKey(level, x, y, z)) || 0;
+  }
+}
+
 function pointOctant(bounds, x, y, z) {
-  const c = bounds.center();
-  return (x >= c[0] ? 1 : 0) | (y >= c[1] ? 2 : 0) | (z >= c[2] ? 4 : 0);
+  const min = bounds.minimum;
+  const max = bounds.maximum;
+  return (
+    (x >= (min[0] + max[0]) * 0.5 ? 1 : 0) |
+    (y >= (min[1] + max[1]) * 0.5 ? 2 : 0) |
+    (z >= (min[2] + max[2]) * 0.5 ? 4 : 0)
+  );
 }
 
 function targetSplatCountForDepth(
@@ -197,6 +283,13 @@ function deserializeBoundsState(value) {
   return new Bounds(value.minimum.slice(), value.maximum.slice());
 }
 
+function cloneBounds(bounds) {
+  if (!bounds) {
+    return null;
+  }
+  return new Bounds(bounds.minimum.slice(), bounds.maximum.slice());
+}
+
 function buildNodeTreeFromCounts(
   counts,
   bounds,
@@ -208,7 +301,7 @@ function buildNodeTreeFromCounts(
   z,
 ) {
   const key = makeNodeKey(depth, x, y, z);
-  const count = counts.get(key) || 0;
+  const count = counts.getCount(depth, x, y, z);
   if (count <= 0) {
     return null;
   }
@@ -229,6 +322,8 @@ function buildNodeTreeFromCounts(
     bucketPath: null,
     contentUri: null,
     handoffPath: null,
+    bucketRowCount: null,
+    handoffRowCount: null,
     handoffConsumed: false,
     ownError: null,
     buildState: 'pending',
@@ -273,6 +368,8 @@ function serializeNodeMeta(node) {
     bucketPath: node.bucketPath,
     contentUri: node.contentUri,
     handoffPath: node.handoffPath,
+    bucketRowCount: node.bucketRowCount,
+    handoffRowCount: node.handoffRowCount,
     handoffConsumed: !!node.handoffConsumed,
     ownError: node.ownError,
     buildState: node.buildState,
@@ -297,6 +394,14 @@ function deserializeNodeMeta(data) {
     bucketPath: data.bucketPath || null,
     contentUri: data.contentUri || null,
     handoffPath: data.handoffPath || null,
+    bucketRowCount:
+      Number.isFinite(data.bucketRowCount) && data.bucketRowCount >= 0
+        ? data.bucketRowCount
+        : null,
+    handoffRowCount:
+      Number.isFinite(data.handoffRowCount) && data.handoffRowCount >= 0
+        ? data.handoffRowCount
+        : null,
     handoffConsumed: !!data.handoffConsumed,
     ownError:
       Number.isFinite(data.ownError) || data.ownError === 0
@@ -358,11 +463,13 @@ function resolveLeafNodeForPoint(root, x, y, z) {
 function resetNodeArtifacts(node) {
   node.contentUri = null;
   node.handoffPath = null;
+  node.handoffRowCount = null;
   node.handoffConsumed = false;
   node.ownError = null;
   node.buildState = 'pending';
   if (node.leaf) {
     node.bucketPath = null;
+    node.bucketRowCount = null;
   }
   for (const child of node.children) {
     resetNodeArtifacts(child);
@@ -431,26 +538,80 @@ async function removeFileIfExists(filePath) {
   }
 }
 
-function enqueuePipelineStateSave(ctx, stage = null) {
+async function materializeLinkedHandoffFile(sourcePath, targetPath) {
+  ensure(
+    !!sourcePath,
+    'Missing source bucket path for handoff materialization.',
+  );
+  ensure(!!targetPath, 'Missing handoff target path.');
+  if (sourcePath === targetPath) {
+    return;
+  }
+
+  await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
+  await removeFileIfExists(targetPath);
+
+  try {
+    await fs.promises.link(sourcePath, targetPath);
+  } catch (err) {
+    if (
+      err &&
+      (err.code === 'EXDEV' ||
+        err.code === 'EPERM' ||
+        err.code === 'EACCES' ||
+        err.code === 'EMLINK' ||
+        err.code === 'ENOTSUP' ||
+        err.code === 'EINVAL')
+    ) {
+      await fs.promises.copyFile(sourcePath, targetPath);
+      return;
+    }
+    throw err;
+  }
+}
+
+function enqueuePipelineStateSave(ctx, stage = null, { force = false } = {}) {
   if (stage) {
     ctx.pipelineState.stage = stage;
   }
-  ctx.pipelineState.rootBounds = serializeBoundsState(ctx.rootBounds);
-  ctx.pipelineState.rootNode = serializeNodeMeta(ctx.rootNode);
-  ctx.pipelineState.layout = {
-    degree: ctx.layout.degree,
-    coeffCount: ctx.layout.coeffCount,
-  };
-  ctx.pipelineState.updatedAt = new Date().toISOString();
+  if (ctx.lastPipelineStateSaveAt == null) {
+    ctx.lastPipelineStateSaveAt = 0;
+  }
+  if (ctx.nodesSincePipelineStateSave == null) {
+    ctx.nodesSincePipelineStateSave = 0;
+  }
+
+  const now = Date.now();
+  if (!force) {
+    ctx.nodesSincePipelineStateSave += 1;
+    const dueByTime =
+      ctx.lastPipelineStateSaveAt <= 0 ||
+      now - ctx.lastPipelineStateSaveAt >= PIPELINE_STATE_SAVE_INTERVAL_MS;
+    const dueByCount =
+      ctx.nodesSincePipelineStateSave >= PIPELINE_STATE_SAVE_NODE_INTERVAL;
+    if (!dueByTime && !dueByCount) {
+      return ctx.savePromise;
+    }
+  }
+
+  ctx.lastPipelineStateSaveAt = now;
+  ctx.nodesSincePipelineStateSave = 0;
 
   const targetPath = path.join(ctx.tempDir, PIPELINE_STATE_FILE);
-  ctx.savePromise = ctx.savePromise.then(() =>
-    fs.promises.writeFile(
+  ctx.savePromise = ctx.savePromise.then(() => {
+    ctx.pipelineState.rootBounds = serializeBoundsState(ctx.rootBounds);
+    ctx.pipelineState.rootNode = serializeNodeMeta(ctx.rootNode);
+    ctx.pipelineState.layout = {
+      degree: ctx.layout.degree,
+      coeffCount: ctx.layout.coeffCount,
+    };
+    ctx.pipelineState.updatedAt = new Date().toISOString();
+    return fs.promises.writeFile(
       targetPath,
       JSON.stringify(ctx.pipelineState),
       'utf8',
-    ),
-  );
+    );
+  });
   return ctx.savePromise;
 }
 
@@ -464,16 +625,24 @@ function bucketRowByteSize(encoding, coeffCount) {
   throw new ConversionError(`Unknown bucket encoding: ${encoding}`);
 }
 
-function makeBucketFileSpec(filePath, encoding) {
-  return { filePath, encoding };
+function makeBucketFileSpec(filePath, encoding, rowCount) {
+  return { filePath, encoding, rowCount };
 }
 
 function leafBucketSpec(node) {
-  return makeBucketFileSpec(node.bucketPath, LEAF_BUCKET_ENCODING);
+  return makeBucketFileSpec(
+    node.bucketPath,
+    LEAF_BUCKET_ENCODING,
+    node.bucketRowCount,
+  );
 }
 
 function handoffBucketSpec(node) {
-  return makeBucketFileSpec(node.handoffPath, HANDOFF_BUCKET_ENCODING);
+  return makeBucketFileSpec(
+    node.handoffPath,
+    HANDOFF_BUCKET_ENCODING,
+    node.handoffRowCount,
+  );
 }
 
 function makeRowScratch(coeffCount) {
@@ -486,53 +655,98 @@ function makeRowScratch(coeffCount) {
   };
 }
 
-function readBucketRowIntoScratch(encoding, view, base, coeffCount, scratch) {
-  scratch.position[0] = view.getFloat32(base + 0, true);
-  scratch.position[1] = view.getFloat32(base + 4, true);
-  scratch.position[2] = view.getFloat32(base + 8, true);
-
+function readBucketRowIntoScratch(
+  encoding,
+  view,
+  base,
+  coeffCount,
+  scratch,
+  floatView = null,
+  floatBase = 0,
+) {
   if (
-    encoding === LEAF_BUCKET_ENCODING ||
-    encoding === HANDOFF_BUCKET_ENCODING
+    encoding !== LEAF_BUCKET_ENCODING &&
+    encoding !== HANDOFF_BUCKET_ENCODING
   ) {
-    scratch.scaleLog[0] = view.getFloat32(base + 12, true);
-    scratch.scaleLog[1] = view.getFloat32(base + 16, true);
-    scratch.scaleLog[2] = view.getFloat32(base + 20, true);
-    scratch.quat[0] = view.getFloat32(base + 24, true);
-    scratch.quat[1] = view.getFloat32(base + 28, true);
-    scratch.quat[2] = view.getFloat32(base + 32, true);
-    scratch.quat[3] = view.getFloat32(base + 36, true);
-    scratch.opacity = view.getFloat32(base + 40, true);
-    for (let i = 0; i < coeffCount * 3; i++) {
-      scratch.sh[i] = view.getFloat32(base + (11 + i) * 4, true);
+    throw new ConversionError(`Unknown bucket encoding: ${encoding}`);
+  }
+  const shLen = coeffCount * 3;
+  if (floatView) {
+    const src = floatView;
+    const off = floatBase;
+    scratch.position[0] = src[off + 0];
+    scratch.position[1] = src[off + 1];
+    scratch.position[2] = src[off + 2];
+    scratch.scaleLog[0] = src[off + 3];
+    scratch.scaleLog[1] = src[off + 4];
+    scratch.scaleLog[2] = src[off + 5];
+    scratch.quat[0] = src[off + 6];
+    scratch.quat[1] = src[off + 7];
+    scratch.quat[2] = src[off + 8];
+    scratch.quat[3] = src[off + 9];
+    scratch.opacity = src[off + 10];
+    if (shLen > 0) {
+      scratch.sh.set(src.subarray(off + 11, off + 11 + shLen));
     }
     return;
   }
-
-  throw new ConversionError(`Unknown bucket encoding: ${encoding}`);
-}
-
-function readBucketCoreRowIntoScratch(encoding, view, base, scratch) {
   scratch.position[0] = view.getFloat32(base + 0, true);
   scratch.position[1] = view.getFloat32(base + 4, true);
   scratch.position[2] = view.getFloat32(base + 8, true);
+  scratch.scaleLog[0] = view.getFloat32(base + 12, true);
+  scratch.scaleLog[1] = view.getFloat32(base + 16, true);
+  scratch.scaleLog[2] = view.getFloat32(base + 20, true);
+  scratch.quat[0] = view.getFloat32(base + 24, true);
+  scratch.quat[1] = view.getFloat32(base + 28, true);
+  scratch.quat[2] = view.getFloat32(base + 32, true);
+  scratch.quat[3] = view.getFloat32(base + 36, true);
+  scratch.opacity = view.getFloat32(base + 40, true);
+  for (let i = 0; i < shLen; i++) {
+    scratch.sh[i] = view.getFloat32(base + (11 + i) * 4, true);
+  }
+}
 
+function readBucketCoreRowIntoScratch(
+  encoding,
+  view,
+  base,
+  scratch,
+  floatView = null,
+  floatBase = 0,
+) {
   if (
-    encoding === LEAF_BUCKET_ENCODING ||
-    encoding === HANDOFF_BUCKET_ENCODING
+    encoding !== LEAF_BUCKET_ENCODING &&
+    encoding !== HANDOFF_BUCKET_ENCODING
   ) {
-    scratch.scaleLog[0] = view.getFloat32(base + 12, true);
-    scratch.scaleLog[1] = view.getFloat32(base + 16, true);
-    scratch.scaleLog[2] = view.getFloat32(base + 20, true);
-    scratch.quat[0] = view.getFloat32(base + 24, true);
-    scratch.quat[1] = view.getFloat32(base + 28, true);
-    scratch.quat[2] = view.getFloat32(base + 32, true);
-    scratch.quat[3] = view.getFloat32(base + 36, true);
-    scratch.opacity = view.getFloat32(base + 40, true);
+    throw new ConversionError(`Unknown bucket encoding: ${encoding}`);
+  }
+  if (floatView) {
+    const src = floatView;
+    const off = floatBase;
+    scratch.position[0] = src[off + 0];
+    scratch.position[1] = src[off + 1];
+    scratch.position[2] = src[off + 2];
+    scratch.scaleLog[0] = src[off + 3];
+    scratch.scaleLog[1] = src[off + 4];
+    scratch.scaleLog[2] = src[off + 5];
+    scratch.quat[0] = src[off + 6];
+    scratch.quat[1] = src[off + 7];
+    scratch.quat[2] = src[off + 8];
+    scratch.quat[3] = src[off + 9];
+    scratch.opacity = src[off + 10];
     return;
   }
-
-  throw new ConversionError(`Unknown bucket encoding: ${encoding}`);
+  scratch.position[0] = view.getFloat32(base + 0, true);
+  scratch.position[1] = view.getFloat32(base + 4, true);
+  scratch.position[2] = view.getFloat32(base + 8, true);
+  scratch.scaleLog[0] = view.getFloat32(base + 12, true);
+  scratch.scaleLog[1] = view.getFloat32(base + 16, true);
+  scratch.scaleLog[2] = view.getFloat32(base + 20, true);
+  scratch.quat[0] = view.getFloat32(base + 24, true);
+  scratch.quat[1] = view.getFloat32(base + 28, true);
+  scratch.quat[2] = view.getFloat32(base + 32, true);
+  scratch.quat[3] = view.getFloat32(base + 36, true);
+  scratch.opacity = view.getFloat32(base + 40, true);
 }
 
 async function appendBufferedBatches(buffered, ensuredDirs) {
@@ -550,11 +764,60 @@ async function appendBufferedBatches(buffered, ensuredDirs) {
       await fs.promises.mkdir(dir, { recursive: true });
       ensuredDirs.add(dir);
     }
-    const payload = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
-    writes.push(fs.promises.writeFile(filePath, payload, { flag: 'a' }));
+    writes.push(appendChunksToFile(filePath, chunks));
   }
   await Promise.all(writes);
   buffered.clear();
+}
+
+async function appendChunksToFile(filePath, chunks) {
+  if (chunks.length === 1) {
+    await fs.promises.writeFile(filePath, chunks[0], { flag: 'a' });
+    return;
+  }
+
+  const handle = await fs.promises.open(filePath, 'a');
+  try {
+    await writeChunksToHandle(handle, filePath, chunks);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function writeChunksToHandle(handle, filePath, chunks) {
+  if (chunks.length === 0) {
+    return;
+  }
+  if (chunks.length === 1) {
+    const chunk = chunks[0];
+    let written = 0;
+    while (written < chunk.length) {
+      const { bytesWritten } = await handle.write(
+        chunk,
+        written,
+        chunk.length - written,
+      );
+      ensure(bytesWritten > 0, `Failed to append bucket file: ${filePath}`);
+      written += bytesWritten;
+    }
+    return;
+  }
+  for (let start = 0; start < chunks.length; start += WRITEV_BATCH_CHUNKS) {
+    const batch = chunks.slice(start, start + WRITEV_BATCH_CHUNKS);
+    let offset = 0;
+    while (offset < batch.length) {
+      const { bytesWritten } = await handle.writev(batch.slice(offset));
+      ensure(bytesWritten > 0, `Failed to append bucket file: ${filePath}`);
+      let remaining = bytesWritten;
+      while (offset < batch.length && remaining >= batch[offset].length) {
+        remaining -= batch[offset].length;
+        offset += 1;
+      }
+      if (remaining > 0 && offset < batch.length) {
+        batch[offset] = batch[offset].subarray(remaining);
+      }
+    }
+  }
 }
 
 async function partitionLeafBuckets(
@@ -565,45 +828,174 @@ async function partitionLeafBuckets(
   rootNode,
   tempDir,
 ) {
-  const buffered = new Map();
+  const touchedLeaves = [];
   const ensuredDirs = new Set();
-  let bufferedBytes = 0;
+  const leafHandles = new Map();
+  const rowByteSize = layout.canonicalByteSize;
+  const arenaByteSize = Math.max(PARTITION_ARENA_BYTES, rowByteSize);
+  const arenas = [0, 1].map(() => ({
+    buffer: Buffer.allocUnsafe(arenaByteSize),
+    offset: 0,
+    activeLeaves: [],
+    leafChunks: new Map(),
+    flushPromise: null,
+  }));
+  let activeArenaIndex = 0;
+  let flushError = null;
 
-  const flush = async () => {
-    await appendBufferedBatches(buffered, ensuredDirs);
-    bufferedBytes = 0;
+  const ensureLeafHandle = async (leaf) => {
+    let fh = leafHandles.get(leaf);
+    if (fh) {
+      return fh;
+    }
+    const dir = path.dirname(leaf.bucketPath);
+    if (!ensuredDirs.has(dir)) {
+      await fs.promises.mkdir(dir, { recursive: true });
+      ensuredDirs.add(dir);
+    }
+    fh = await fs.promises.open(leaf.bucketPath, 'a');
+    leafHandles.set(leaf, fh);
+    return fh;
   };
 
-  await _forEachGaussianPlyCanonicalRecord(
-    handle,
-    filePath,
-    header,
-    layout,
-    async (_rowIndex, rowBuffer, rowView) => {
-      const leaf = resolveLeafNodeForPoint(
-        rootNode,
-        rowView.getFloat32(0, true),
-        rowView.getFloat32(4, true),
-        rowView.getFloat32(8, true),
-      );
-      if (!leaf.bucketPath) {
-        leaf.bucketPath = canonicalNodePath(tempDir, LEAF_BUCKET_DIR, leaf);
-      }
-      let chunks = buffered.get(leaf.bucketPath);
-      if (!chunks) {
-        chunks = [];
-        buffered.set(leaf.bucketPath, chunks);
-      }
-      const rowCopy = Buffer.from(rowBuffer);
-      chunks.push(rowCopy);
-      bufferedBytes += rowCopy.length;
-      if (bufferedBytes >= PARTITION_FLUSH_BYTES) {
-        await flush();
-      }
-    },
-  );
+  const touchLeaf = (leaf) => {
+    if (leaf._partitionTouched) {
+      return;
+    }
+    leaf._partitionTouched = true;
+    leaf._partitionWriteChain = Promise.resolve();
+    touchedLeaves.push(leaf);
+  };
 
-  await flush();
+  const throwIfFlushFailed = () => {
+    if (flushError) {
+      throw flushError;
+    }
+  };
+
+  const resetArena = (arena) => {
+    arena.offset = 0;
+    arena.activeLeaves = [];
+    arena.leafChunks = new Map();
+  };
+
+  const scheduleArenaFlush = (arena) => {
+    if (arena.flushPromise) {
+      return arena.flushPromise;
+    }
+    if (arena.leafChunks.size === 0) {
+      arena.offset = 0;
+      return Promise.resolve();
+    }
+
+    const writes = [];
+    for (const leaf of arena.activeLeaves) {
+      const chunks = arena.leafChunks.get(leaf);
+      if (!chunks || chunks.length === 0) {
+        continue;
+      }
+      const writePromise = leaf._partitionWriteChain.then(async () => {
+        const fh = await ensureLeafHandle(leaf);
+        await writeChunksToHandle(fh, leaf.bucketPath, chunks);
+      });
+      leaf._partitionWriteChain = writePromise;
+      writes.push(writePromise);
+    }
+
+    arena.flushPromise = Promise.all(writes)
+      .catch((err) => {
+        if (!flushError) {
+          flushError = err;
+        }
+      })
+      .then(() => {
+        resetArena(arena);
+      })
+      .finally(() => {
+        arena.flushPromise = null;
+      });
+    return arena.flushPromise;
+  };
+
+  const switchArena = async () => {
+    const currentArena = arenas[activeArenaIndex];
+    scheduleArenaFlush(currentArena);
+    activeArenaIndex = 1 - activeArenaIndex;
+    const nextArena = arenas[activeArenaIndex];
+    if (nextArena.flushPromise) {
+      await nextArena.flushPromise;
+    }
+    throwIfFlushFailed();
+  };
+
+  const appendLeafRow = (leaf, rowBuffer) => {
+    const arena = arenas[activeArenaIndex];
+    if (arena.offset + rowByteSize > arena.buffer.length) {
+      return switchArena().then(() => appendLeafRow(leaf, rowBuffer));
+    }
+    touchLeaf(leaf);
+
+    let chunks = arena.leafChunks.get(leaf);
+    if (!chunks) {
+      chunks = [];
+      arena.leafChunks.set(leaf, chunks);
+      arena.activeLeaves.push(leaf);
+    }
+    rowBuffer.copy(arena.buffer, arena.offset, 0, rowByteSize);
+    chunks.push(
+      arena.buffer.subarray(arena.offset, arena.offset + rowByteSize),
+    );
+    arena.offset += rowByteSize;
+    leaf.bucketRowCount = (leaf.bucketRowCount || 0) + 1;
+    return null;
+  };
+
+  try {
+    await _forEachGaussianPlyCanonicalRecord(
+      handle,
+      filePath,
+      header,
+      layout,
+      (_rowIndex, rowBuffer, rowView, rowFloats) => {
+        const x = rowFloats ? rowFloats[0] : rowView.getFloat32(0, true);
+        const y = rowFloats ? rowFloats[1] : rowView.getFloat32(4, true);
+        const z = rowFloats ? rowFloats[2] : rowView.getFloat32(8, true);
+        const leaf = resolveLeafNodeForPoint(rootNode, x, y, z);
+        if (!leaf.bucketPath) {
+          leaf.bucketPath = canonicalNodePath(tempDir, LEAF_BUCKET_DIR, leaf);
+        }
+        return appendLeafRow(leaf, rowBuffer);
+      },
+    );
+
+    await Promise.all(arenas.map((arena) => scheduleArenaFlush(arena)));
+    await Promise.all(
+      touchedLeaves.map((leaf) =>
+        leaf._partitionWriteChain.catch((err) => {
+          if (!flushError) {
+            flushError = err;
+          }
+        }),
+      ),
+    );
+    throwIfFlushFailed();
+  } finally {
+    await Promise.all(
+      arenas
+        .map((arena) => arena.flushPromise)
+        .filter((promise) => !!promise),
+    );
+    await Promise.all(
+      Array.from(leafHandles.values()).map((fh) => fh.close()),
+    );
+    leafHandles.clear();
+
+    for (const leaf of touchedLeaves) {
+      delete leaf._partitionTouched;
+      delete leaf._partitionWriteChain;
+    }
+  }
+  arenas.length = 0;
 }
 
 async function collectBucketEntries(fileSpecs, coeffCount) {
@@ -614,12 +1006,11 @@ async function collectBucketEntries(fileSpecs, coeffCount) {
       continue;
     }
     const rowByteSize = bucketRowByteSize(fileSpec.encoding, coeffCount);
-    const stat = await fs.promises.stat(fileSpec.filePath);
     ensure(
-      stat.size % rowByteSize === 0,
-      `Bucket file has invalid byte length: ${fileSpec.filePath}`,
+      Number.isInteger(fileSpec.rowCount) && fileSpec.rowCount >= 0,
+      `Bucket row count metadata is missing: ${fileSpec.filePath}`,
     );
-    const rowCount = stat.size / rowByteSize;
+    const rowCount = fileSpec.rowCount;
     if (rowCount <= 0) {
       continue;
     }
@@ -634,12 +1025,12 @@ async function forEachBucketSpecRow(fileSpec, coeffCount, onRow) {
     return;
   }
   const rowByteSize = bucketRowByteSize(fileSpec.encoding, coeffCount);
-  const stat = await fs.promises.stat(fileSpec.filePath);
   ensure(
-    stat.size % rowByteSize === 0,
-    `Bucket file has invalid byte length: ${fileSpec.filePath}`,
+    Number.isInteger(fileSpec.rowCount) && fileSpec.rowCount >= 0,
+    `Bucket row count metadata is missing: ${fileSpec.filePath}`,
   );
-  if (stat.size === 0) {
+  const totalBytes = fileSpec.rowCount * rowByteSize;
+  if (totalBytes === 0) {
     return;
   }
 
@@ -649,8 +1040,8 @@ async function forEachBucketSpecRow(fileSpec, coeffCount, onRow) {
   const handle = await fs.promises.open(fileSpec.filePath, 'r');
   try {
     let fileOffset = 0;
-    while (fileOffset < stat.size) {
-      const expectedBytes = Math.min(chunkBytes, stat.size - fileOffset);
+    while (fileOffset < totalBytes) {
+      const expectedBytes = Math.min(chunkBytes, totalBytes - fileOffset);
       const { bytesRead } = await handle.read(
         chunk,
         0,
@@ -664,12 +1055,18 @@ async function forEachBucketSpecRow(fileSpec, coeffCount, onRow) {
       fileOffset += bytesRead;
 
       const view = new DataView(chunk.buffer, chunk.byteOffset, bytesRead);
+      const floatView =
+        IS_LITTLE_ENDIAN && (chunk.byteOffset & 3) === 0
+          ? new Float32Array(chunk.buffer, chunk.byteOffset, bytesRead >>> 2)
+          : null;
       for (let offset = 0; offset < bytesRead; offset += rowByteSize) {
         const maybePromise = onRow(
           view,
           offset,
           fileSpec.encoding,
           fileSpec.filePath,
+          floatView,
+          floatView ? offset >>> 2 : 0,
         );
         if (maybePromise && typeof maybePromise.then === 'function') {
           await maybePromise;
@@ -687,28 +1084,298 @@ async function forEachBucketEntryRow(entries, coeffCount, onRow) {
   }
 }
 
-async function loadBucketCloudFromSpecs(fileSpecs, coeffCount) {
-  const { entries, totalRows } = await collectBucketEntries(
-    fileSpecs,
+function accumulateBoundsFromScratchRow(
+  scratch,
+  minimum,
+  maximum,
+  extentScratch,
+) {
+  writeThreeSigmaExtentComponents(
+    scratch.scaleLog,
+    0,
+    scratch.quat,
+    0,
+    extentScratch,
+    0,
+  );
+
+  const p0 = scratch.position[0];
+  const p1 = scratch.position[1];
+  const p2 = scratch.position[2];
+  const ex = extentScratch[0];
+  const ey = extentScratch[1];
+  const ez = extentScratch[2];
+  const min0 = p0 - ex;
+  const min1 = p1 - ey;
+  const min2 = p2 - ez;
+  const max0 = p0 + ex;
+  const max1 = p1 + ey;
+  const max2 = p2 + ez;
+  if (min0 < minimum[0]) minimum[0] = min0;
+  if (min1 < minimum[1]) minimum[1] = min1;
+  if (min2 < minimum[2]) minimum[2] = min2;
+  if (max0 > maximum[0]) maximum[0] = max0;
+  if (max1 > maximum[1]) maximum[1] = max1;
+  if (max2 > maximum[2]) maximum[2] = max2;
+}
+
+async function computeBucketEntriesBounds(entries, coeffCount) {
+  const minimum = [Infinity, Infinity, Infinity];
+  const maximum = [-Infinity, -Infinity, -Infinity];
+  const scratch = makeRowScratch(0);
+  const extentScratch = new Float32Array(3);
+  let rowCount = 0;
+
+  await forEachBucketEntryRow(
+    entries,
     coeffCount,
+    (view, base, encoding, _filePath, floatView, floatBase) => {
+      readBucketCoreRowIntoScratch(
+        encoding,
+        view,
+        base,
+        scratch,
+        floatView,
+        floatBase,
+      );
+      accumulateBoundsFromScratchRow(scratch, minimum, maximum, extentScratch);
+      rowCount += 1;
+    },
+  );
+
+  ensure(rowCount > 0, 'Cannot compute bounds for an empty bucket input.');
+  return new Bounds(minimum, maximum);
+}
+
+async function packBucketEntriesToSpz(
+  entries,
+  coeffCount,
+  shDegree,
+  sh1Bits,
+  shRestBits,
+  translation = null,
+) {
+  validateSpzQuantBits(sh1Bits, shRestBits);
+
+  const n = entries.reduce((sum, entry) => sum + entry.rowCount, 0);
+  ensure(n > 0, 'Cannot pack an empty bucket input to SPZ.');
+  validateSpzCoeffCount(shDegree, coeffCount);
+
+  const extra = coeffCount - 1;
+  const layout = makeSpzPacketLayout(n, coeffCount);
+  const { packet } = layout;
+  const tx = translation ? translation[0] : 0.0;
+  const ty = translation ? translation[1] : 0.0;
+  const tz = translation ? translation[2] : 0.0;
+  const scratch = makeRowScratch(coeffCount);
+  const shBuckets =
+    extra > 0 ? makeSpzShQuantBuckets(coeffCount, sh1Bits, shRestBits) : null;
+
+  let rowIndex = 0;
+  await forEachBucketEntryRow(
+    entries,
+    coeffCount,
+    (view, base, encoding, _filePath, floatView, floatBase) => {
+      readBucketRowIntoScratch(
+        encoding,
+        view,
+        base,
+        coeffCount,
+        scratch,
+        floatView,
+        floatBase,
+      );
+
+      const localX = translation
+        ? Math.fround(scratch.position[0] - tx)
+        : scratch.position[0];
+      const posBase = layout.positionsOffset + rowIndex * 9;
+      writeFixed24Into(packet, posBase + 0, quantizeSpzPosition(localX));
+
+      const localY = translation
+        ? Math.fround(scratch.position[1] - ty)
+        : scratch.position[1];
+      writeFixed24Into(packet, posBase + 3, quantizeSpzPosition(localY));
+
+      const localZ = translation
+        ? Math.fround(scratch.position[2] - tz)
+        : scratch.position[2];
+      writeFixed24Into(packet, posBase + 6, quantizeSpzPosition(localZ));
+
+      packet[layout.opacityOffset + rowIndex] = quantizeSpzOpacity(
+        scratch.opacity,
+      );
+
+      const colorBase = layout.colorOffset + rowIndex * 3;
+      packet[colorBase + 0] = quantizeSpzColor(scratch.sh[0]);
+      packet[colorBase + 1] = quantizeSpzColor(scratch.sh[1]);
+      packet[colorBase + 2] = quantizeSpzColor(scratch.sh[2]);
+
+      const scaleBase = layout.scaleOffset + rowIndex * 3;
+      packet[scaleBase + 0] = quantizeSpzScale(scratch.scaleLog[0]);
+      packet[scaleBase + 1] = quantizeSpzScale(scratch.scaleLog[1]);
+      packet[scaleBase + 2] = quantizeSpzScale(scratch.scaleLog[2]);
+
+      packQuaternionSmallestThreeInto(
+        scratch.quat,
+        0,
+        packet,
+        layout.quatOffset + rowIndex * 4,
+      );
+
+      if (extra > 0) {
+        let shBase =
+          layout.extraShOffset + rowIndex * layout.extraBytesPerPoint;
+        for (let coeff = 1; coeff < coeffCount; coeff++) {
+          const bucket = shBuckets.buckets[coeff];
+          const halfBucket = shBuckets.halfBuckets[coeff];
+          const invBucket = shBuckets.invBuckets[coeff];
+          const coeffBase = coeff * 3;
+          packet[shBase++] = quantizeSpzExtraSh(
+            scratch.sh[coeffBase + 0],
+            bucket,
+            halfBucket,
+            invBucket,
+          );
+          packet[shBase++] = quantizeSpzExtraSh(
+            scratch.sh[coeffBase + 1],
+            bucket,
+            halfBucket,
+            invBucket,
+          );
+          packet[shBase++] = quantizeSpzExtraSh(
+            scratch.sh[coeffBase + 2],
+            bucket,
+            halfBucket,
+            invBucket,
+          );
+        }
+      }
+
+      rowIndex += 1;
+    },
   );
   ensure(
-    totalRows > 0,
+    rowIndex === n,
+    `Bucket row count changed while packing SPZ: expected ${n}, read ${rowIndex}.`,
+  );
+
+  writeSpzPacketHeader(packet, n, shDegree);
+  return gzipSpzPacket(packet);
+}
+
+async function writeBufferToHandle(handle, buffer, byteLength, targetPath) {
+  let offset = 0;
+  while (offset < byteLength) {
+    const { bytesWritten } = await handle.write(
+      buffer,
+      offset,
+      byteLength - offset,
+      null,
+    );
+    ensure(bytesWritten > 0, `Failed to write bucket file: ${targetPath}`);
+    offset += bytesWritten;
+  }
+}
+
+async function appendBucketEntryToHandle(
+  entry,
+  coeffCount,
+  handle,
+  targetPath = null,
+) {
+  const rowByteSize =
+    entry.rowByteSize || bucketRowByteSize(entry.encoding, coeffCount);
+  const rowsPerChunk = Math.max(1, Math.floor((8 * 1024 * 1024) / rowByteSize));
+  const chunkBytes = rowsPerChunk * rowByteSize;
+  const chunk = Buffer.allocUnsafe(chunkBytes);
+  const source = await fs.promises.open(entry.filePath, 'r');
+  try {
+    let fileOffset = 0;
+    const totalBytes = entry.rowCount * rowByteSize;
+    while (fileOffset < totalBytes) {
+      const expectedBytes = Math.min(chunkBytes, totalBytes - fileOffset);
+      const { bytesRead } = await source.read(
+        chunk,
+        0,
+        expectedBytes,
+        fileOffset,
+      );
+      ensure(
+        bytesRead === expectedBytes,
+        `Bucket file ended early: ${entry.filePath}`,
+      );
+      fileOffset += bytesRead;
+
+      await writeBufferToHandle(handle, chunk, bytesRead, targetPath);
+    }
+  } finally {
+    await source.close();
+  }
+}
+
+async function materializeCanonicalEntriesFile(
+  entries,
+  targetPath,
+  coeffCount,
+) {
+  ensure(
+    entries.length > 0,
+    'Cannot materialize an empty canonical bucket set.',
+  );
+  if (entries.length === 1) {
+    await materializeLinkedHandoffFile(entries[0].filePath, targetPath);
+    return;
+  }
+
+  await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
+  await removeFileIfExists(targetPath);
+  const handle = await fs.promises.open(targetPath, 'w');
+  try {
+    for (const entry of entries) {
+      await appendBucketEntryToHandle(entry, coeffCount, handle, targetPath);
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+async function loadBucketCloudFromEntries(
+  entries,
+  coeffCount,
+  totalRows = null,
+) {
+  const resolvedTotalRows =
+    totalRows == null
+      ? entries.reduce((sum, entry) => sum + (entry.rowCount || 0), 0)
+      : totalRows;
+  ensure(
+    resolvedTotalRows > 0,
     'Cannot load an empty Gaussian cloud from bucket files.',
   );
 
   const coeffStride = coeffCount * 3;
-  const positions = new Float32Array(totalRows * 3);
-  const scaleLog = new Float32Array(totalRows * 3);
-  const quats = new Float32Array(totalRows * 4);
-  const opacity = new Float32Array(totalRows);
-  const shCoeffs = new Float32Array(totalRows * coeffStride);
+  const positions = new Float32Array(resolvedTotalRows * 3);
+  const scaleLog = new Float32Array(resolvedTotalRows * 3);
+  const quats = new Float32Array(resolvedTotalRows * 4);
+  const opacity = new Float32Array(resolvedTotalRows);
+  const shCoeffs = new Float32Array(resolvedTotalRows * coeffStride);
   const scratch = makeRowScratch(coeffCount);
   let rowIndex = 0;
 
-  for (const entry of entries) {
-    await forEachBucketSpecRow(entry, coeffCount, (view, base, encoding) => {
-      readBucketRowIntoScratch(encoding, view, base, coeffCount, scratch);
+  await forEachBucketEntryRow(
+    entries,
+    coeffCount,
+    (view, base, encoding, _filePath, floatView, floatBase) => {
+      readBucketRowIntoScratch(
+        encoding,
+        view,
+        base,
+        coeffCount,
+        scratch,
+        floatView,
+        floatBase,
+      );
       const base3 = rowIndex * 3;
       const base4 = rowIndex * 4;
       const coeffBase = rowIndex * coeffStride;
@@ -727,8 +1394,8 @@ async function loadBucketCloudFromSpecs(fileSpecs, coeffCount) {
         shCoeffs[coeffBase + c] = scratch.sh[c];
       }
       rowIndex += 1;
-    });
-  }
+    },
+  );
 
   const cloud = new GaussianCloud(
     positions,
@@ -754,34 +1421,69 @@ async function writeCanonicalCloudFile(filePath, cloud) {
     for (let rowBase = 0; rowBase < cloud.length; rowBase += rowsPerChunk) {
       const rowCount = Math.min(rowsPerChunk, cloud.length - rowBase);
       const chunk = Buffer.allocUnsafe(rowCount * rowByteSize);
-      const view = new DataView(
-        chunk.buffer,
-        chunk.byteOffset,
-        chunk.byteLength,
-      );
-      for (let i = 0; i < rowCount; i++) {
-        const rowIndex = rowBase + i;
-        const base = i * rowByteSize;
-        const base3 = rowIndex * 3;
-        const base4 = rowIndex * 4;
-        const coeffBase = rowIndex * coeffStride;
-        view.setFloat32(base + 0, cloud.positions[base3 + 0], true);
-        view.setFloat32(base + 4, cloud.positions[base3 + 1], true);
-        view.setFloat32(base + 8, cloud.positions[base3 + 2], true);
-        view.setFloat32(base + 12, cloud.scaleLog[base3 + 0], true);
-        view.setFloat32(base + 16, cloud.scaleLog[base3 + 1], true);
-        view.setFloat32(base + 20, cloud.scaleLog[base3 + 2], true);
-        view.setFloat32(base + 24, cloud.quatsXYZW[base4 + 0], true);
-        view.setFloat32(base + 28, cloud.quatsXYZW[base4 + 1], true);
-        view.setFloat32(base + 32, cloud.quatsXYZW[base4 + 2], true);
-        view.setFloat32(base + 36, cloud.quatsXYZW[base4 + 3], true);
-        view.setFloat32(base + 40, cloud.opacity[rowIndex], true);
-        for (let c = 0; c < coeffStride; c++) {
-          view.setFloat32(
-            base + (11 + c) * 4,
-            cloud.shCoeffs[coeffBase + c],
-            true,
-          );
+      const chunkByteOffset = chunk.byteOffset;
+      const canUseFastPath = IS_LITTLE_ENDIAN && (chunkByteOffset & 3) === 0;
+      if (canUseFastPath) {
+        const floatView = new Float32Array(
+          chunk.buffer,
+          chunkByteOffset,
+          (rowCount * rowByteSize) >>> 2,
+        );
+        const floatsPerRow = 11 + coeffStride;
+        for (let i = 0; i < rowCount; i++) {
+          const rowIndex = rowBase + i;
+          const base3 = rowIndex * 3;
+          const base4 = rowIndex * 4;
+          const coeffBase = rowIndex * coeffStride;
+          const rowOff = i * floatsPerRow;
+          floatView[rowOff + 0] = cloud.positions[base3 + 0];
+          floatView[rowOff + 1] = cloud.positions[base3 + 1];
+          floatView[rowOff + 2] = cloud.positions[base3 + 2];
+          floatView[rowOff + 3] = cloud.scaleLog[base3 + 0];
+          floatView[rowOff + 4] = cloud.scaleLog[base3 + 1];
+          floatView[rowOff + 5] = cloud.scaleLog[base3 + 2];
+          floatView[rowOff + 6] = cloud.quatsXYZW[base4 + 0];
+          floatView[rowOff + 7] = cloud.quatsXYZW[base4 + 1];
+          floatView[rowOff + 8] = cloud.quatsXYZW[base4 + 2];
+          floatView[rowOff + 9] = cloud.quatsXYZW[base4 + 3];
+          floatView[rowOff + 10] = cloud.opacity[rowIndex];
+          if (coeffStride > 0) {
+            floatView.set(
+              cloud.shCoeffs.subarray(coeffBase, coeffBase + coeffStride),
+              rowOff + 11,
+            );
+          }
+        }
+      } else {
+        const view = new DataView(
+          chunk.buffer,
+          chunkByteOffset,
+          chunk.byteLength,
+        );
+        for (let i = 0; i < rowCount; i++) {
+          const rowIndex = rowBase + i;
+          const base = i * rowByteSize;
+          const base3 = rowIndex * 3;
+          const base4 = rowIndex * 4;
+          const coeffBase = rowIndex * coeffStride;
+          view.setFloat32(base + 0, cloud.positions[base3 + 0], true);
+          view.setFloat32(base + 4, cloud.positions[base3 + 1], true);
+          view.setFloat32(base + 8, cloud.positions[base3 + 2], true);
+          view.setFloat32(base + 12, cloud.scaleLog[base3 + 0], true);
+          view.setFloat32(base + 16, cloud.scaleLog[base3 + 1], true);
+          view.setFloat32(base + 20, cloud.scaleLog[base3 + 2], true);
+          view.setFloat32(base + 24, cloud.quatsXYZW[base4 + 0], true);
+          view.setFloat32(base + 28, cloud.quatsXYZW[base4 + 1], true);
+          view.setFloat32(base + 32, cloud.quatsXYZW[base4 + 2], true);
+          view.setFloat32(base + 36, cloud.quatsXYZW[base4 + 3], true);
+          view.setFloat32(base + 40, cloud.opacity[rowIndex], true);
+          for (let c = 0; c < coeffStride; c++) {
+            view.setFloat32(
+              base + (11 + c) * 4,
+              cloud.shCoeffs[coeffBase + c],
+              true,
+            );
+          }
         }
       }
       await handle.write(chunk, 0, chunk.length, null);
@@ -1063,6 +1765,12 @@ function mergeAggregationWeight(opacity, radius, voxelDiag) {
   return alpha * Math.sqrt(radiusNorm);
 }
 
+function scratchThreeSigmaRadiusFloat32(scratch) {
+  return Math.fround(
+    computeThreeSigmaAabbDiagonalRadiusAt(scratch.scaleLog, 0, scratch.quat, 0),
+  );
+}
+
 function writeScratchRowToArrays(
   scratch,
   coeffStride,
@@ -1094,44 +1802,11 @@ function writeScratchRowToArrays(
   }
 }
 
-function copySlotArrays(
-  srcIndex,
-  coeffStride,
-  srcPositions,
-  srcScaleLog,
-  srcQuats,
-  srcOpacity,
-  srcShCoeffs,
-  dstPositions,
-  dstScaleLog,
-  dstQuats,
-  dstOpacity,
-  dstShCoeffs,
-) {
-  const base3 = srcIndex * 3;
-  const base4 = srcIndex * 4;
-  const coeffBase = srcIndex * coeffStride;
-  dstPositions[base3 + 0] = srcPositions[base3 + 0];
-  dstPositions[base3 + 1] = srcPositions[base3 + 1];
-  dstPositions[base3 + 2] = srcPositions[base3 + 2];
-  dstScaleLog[base3 + 0] = srcScaleLog[base3 + 0];
-  dstScaleLog[base3 + 1] = srcScaleLog[base3 + 1];
-  dstScaleLog[base3 + 2] = srcScaleLog[base3 + 2];
-  dstQuats[base4 + 0] = srcQuats[base4 + 0];
-  dstQuats[base4 + 1] = srcQuats[base4 + 1];
-  dstQuats[base4 + 2] = srcQuats[base4 + 2];
-  dstQuats[base4 + 3] = srcQuats[base4 + 3];
-  dstOpacity[srcIndex] = srcOpacity[srcIndex];
-  for (let c = 0; c < coeffStride; c++) {
-    dstShCoeffs[coeffBase + c] = srcShCoeffs[coeffBase + c];
-  }
-}
-
 async function gatherSelectedBucketRowsToCloud(
   entries,
   coeffCount,
   outCount,
-  selectedSlotByOrig,
+  selectedRows,
 ) {
   const coeffStride = coeffCount * 3;
   const positions = new Float32Array(outCount * 3);
@@ -1139,26 +1814,16 @@ async function gatherSelectedBucketRowsToCloud(
   const quats = new Float32Array(outCount * 4);
   const opacity = new Float32Array(outCount);
   const shCoeffs = new Float32Array(outCount * coeffStride);
-  const scratch = makeRowScratch(coeffCount);
-  let rowIndex = 0;
-
-  await forEachBucketEntryRow(entries, coeffCount, (view, base, encoding) => {
-    const slot = selectedSlotByOrig[rowIndex];
-    if (slot >= 0) {
-      readBucketRowIntoScratch(encoding, view, base, coeffCount, scratch);
-      writeScratchRowToArrays(
-        scratch,
-        coeffStride,
-        slot,
-        positions,
-        scaleLog,
-        quats,
-        opacity,
-        shCoeffs,
-      );
-    }
-    rowIndex += 1;
-  });
+  await materializeBucketRowsToSlots(
+    entries,
+    coeffCount,
+    selectedRows,
+    positions,
+    scaleLog,
+    quats,
+    opacity,
+    shCoeffs,
+  );
 
   const cloud = new GaussianCloud(
     positions,
@@ -1172,7 +1837,75 @@ async function gatherSelectedBucketRowsToCloud(
   return cloud;
 }
 
-async function loadBucketSimplifyCoreFromEntries(entries, coeffCount) {
+async function materializeBucketRowsToSlots(
+  entries,
+  coeffCount,
+  rowIndicesBySlot,
+  positions,
+  scaleLog,
+  quats,
+  opacity,
+  shCoeffs,
+) {
+  const wantedRows = new Map();
+  for (let slot = 0; slot < rowIndicesBySlot.length; slot++) {
+    const rowIndex = rowIndicesBySlot[slot];
+    if (rowIndex < 0) {
+      continue;
+    }
+    let slots = wantedRows.get(rowIndex);
+    if (!slots) {
+      slots = [];
+      wantedRows.set(rowIndex, slots);
+    }
+    slots.push(slot);
+  }
+  if (wantedRows.size === 0) {
+    return;
+  }
+
+  const coeffStride = coeffCount * 3;
+  const scratch = makeRowScratch(coeffCount);
+  let rowIndex = 0;
+
+  await forEachBucketEntryRow(
+    entries,
+    coeffCount,
+    (view, base, encoding, _filePath, floatView, floatBase) => {
+      const slots = wantedRows.get(rowIndex);
+      if (slots) {
+        readBucketRowIntoScratch(
+          encoding,
+          view,
+          base,
+          coeffCount,
+          scratch,
+          floatView,
+          floatBase,
+        );
+        for (const slot of slots) {
+          writeScratchRowToArrays(
+            scratch,
+            coeffStride,
+            slot,
+            positions,
+            scaleLog,
+            quats,
+            opacity,
+            shCoeffs,
+          );
+        }
+      }
+      rowIndex += 1;
+    },
+  );
+}
+
+async function loadBucketSimplifyCoreFromEntries(
+  entries,
+  coeffCount,
+  { keepScaleQuat = false } = {},
+) {
   let totalRows = 0;
   for (const entry of entries) {
     totalRows += entry.rowCount || 0;
@@ -1183,35 +1916,56 @@ async function loadBucketSimplifyCoreFromEntries(entries, coeffCount) {
   );
 
   const positions = new Float32Array(totalRows * 3);
-  const scaleLog = new Float32Array(totalRows * 3);
-  const quatsXYZW = new Float32Array(totalRows * 4);
+  const scaleLog = keepScaleQuat ? new Float32Array(totalRows * 3) : null;
+  const quatsXYZW = keepScaleQuat ? new Float32Array(totalRows * 4) : null;
   const opacity = new Float32Array(totalRows);
+  const origRadius = new Float32Array(totalRows);
   const scratch = makeRowScratch(coeffCount);
   let rowIndex = 0;
 
-  await forEachBucketEntryRow(entries, coeffCount, (view, base, encoding) => {
-    readBucketCoreRowIntoScratch(encoding, view, base, scratch);
-    const base3 = rowIndex * 3;
-    const base4 = rowIndex * 4;
-    positions[base3 + 0] = scratch.position[0];
-    positions[base3 + 1] = scratch.position[1];
-    positions[base3 + 2] = scratch.position[2];
-    scaleLog[base3 + 0] = scratch.scaleLog[0];
-    scaleLog[base3 + 1] = scratch.scaleLog[1];
-    scaleLog[base3 + 2] = scratch.scaleLog[2];
-    quatsXYZW[base4 + 0] = scratch.quat[0];
-    quatsXYZW[base4 + 1] = scratch.quat[1];
-    quatsXYZW[base4 + 2] = scratch.quat[2];
-    quatsXYZW[base4 + 3] = scratch.quat[3];
-    opacity[rowIndex] = scratch.opacity;
-    rowIndex += 1;
-  });
+  await forEachBucketEntryRow(
+    entries,
+    coeffCount,
+    (view, base, encoding, _filePath, floatView, floatBase) => {
+      readBucketCoreRowIntoScratch(
+        encoding,
+        view,
+        base,
+        scratch,
+        floatView,
+        floatBase,
+      );
+      const base3 = rowIndex * 3;
+      const base4 = rowIndex * 4;
+      positions[base3 + 0] = scratch.position[0];
+      positions[base3 + 1] = scratch.position[1];
+      positions[base3 + 2] = scratch.position[2];
+      if (keepScaleQuat) {
+        scaleLog[base3 + 0] = scratch.scaleLog[0];
+        scaleLog[base3 + 1] = scratch.scaleLog[1];
+        scaleLog[base3 + 2] = scratch.scaleLog[2];
+        quatsXYZW[base4 + 0] = scratch.quat[0];
+        quatsXYZW[base4 + 1] = scratch.quat[1];
+        quatsXYZW[base4 + 2] = scratch.quat[2];
+        quatsXYZW[base4 + 3] = scratch.quat[3];
+      }
+      opacity[rowIndex] = scratch.opacity;
+      origRadius[rowIndex] = computeThreeSigmaAabbDiagonalRadiusAt(
+        scratch.scaleLog,
+        0,
+        scratch.quat,
+        0,
+      );
+      rowIndex += 1;
+    },
+  );
 
   return {
     positions,
     scaleLog,
     quatsXYZW,
     opacity,
+    origRadius,
     length: totalRows,
   };
 }
@@ -1219,89 +1973,61 @@ async function loadBucketSimplifyCoreFromEntries(entries, coeffCount) {
 async function mergeSelectedBucketRowsToCloud(
   entries,
   coeffCount,
-  selectedSlotByOrig,
+  selectedRows,
   assignment,
-  radii,
   selectedCount,
   voxelDiag,
 ) {
   const coeffStride = coeffCount * 3;
-  const positions = new Float32Array(selectedCount * 3);
-  const scaleLog = new Float32Array(selectedCount * 3);
-  const quats = new Float32Array(selectedCount * 4);
-  const opacity = new Float32Array(selectedCount);
-  const shCoeffs = new Float32Array(selectedCount * coeffStride);
-  const selectedPositions = new Float32Array(selectedCount * 3);
-  const selectedScaleLog = new Float32Array(selectedCount * 3);
-  const selectedQuats = new Float32Array(selectedCount * 4);
-  const selectedOpacity = new Float32Array(selectedCount);
-  const selectedShCoeffs = new Float32Array(selectedCount * coeffStride);
-  const selectedSeen = new Uint8Array(selectedCount);
-  const fallbackPositions = new Float32Array(selectedCount * 3);
-  const fallbackScaleLog = new Float32Array(selectedCount * 3);
-  const fallbackQuats = new Float32Array(selectedCount * 4);
-  const fallbackOpacity = new Float32Array(selectedCount);
-  const fallbackShCoeffs = new Float32Array(selectedCount * coeffStride);
+  let positions = null;
+  let scaleLog = null;
+  let quats = null;
+  let opacity = null;
+  let shCoeffs = null;
   const weightSums = new Float64Array(selectedCount);
   const counts = new Uint32Array(selectedCount);
   const firstAssigned = new Int32Array(selectedCount);
   firstAssigned.fill(-1);
-  const weightedPos = new Float64Array(selectedCount * 3);
-  const weightedOpacity = new Float64Array(selectedCount);
-  const weightedSh = new Float64Array(selectedCount * coeffStride);
-  const covSums = new Float64Array(selectedCount * 6);
+  const fallbackRowIndex = new Int32Array(selectedCount);
+  fallbackRowIndex.fill(-1);
+  let weightedPos = new Float64Array(selectedCount * 3);
+  let weightedOpacity = new Float64Array(selectedCount);
   const covScratch = new Float64Array(6);
   const scratch = makeRowScratch(coeffCount);
   let rowIndex = 0;
 
-  await forEachBucketEntryRow(entries, coeffCount, (view, base, encoding) => {
-    readBucketRowIntoScratch(encoding, view, base, coeffCount, scratch);
-    const selectedSlot = selectedSlotByOrig[rowIndex];
-    if (selectedSlot >= 0 && !selectedSeen[selectedSlot]) {
-      writeScratchRowToArrays(
+  await forEachBucketEntryRow(
+    entries,
+    coeffCount,
+    (view, base, encoding, _filePath, floatView, floatBase) => {
+      readBucketCoreRowIntoScratch(
+        encoding,
+        view,
+        base,
         scratch,
-        coeffStride,
-        selectedSlot,
-        selectedPositions,
-        selectedScaleLog,
-        selectedQuats,
-        selectedOpacity,
-        selectedShCoeffs,
+        floatView,
+        floatBase,
       );
-      selectedSeen[selectedSlot] = 1;
-    }
-    const slot = assignment[rowIndex];
-    const weight = mergeAggregationWeight(
-      scratch.opacity,
-      radii[rowIndex],
-      voxelDiag,
-    );
-    const base3 = slot * 3;
-    const coeffBase = slot * coeffStride;
-    if (firstAssigned[slot] < 0) {
-      firstAssigned[slot] = rowIndex;
-      writeScratchRowToArrays(
-        scratch,
-        coeffStride,
-        slot,
-        fallbackPositions,
-        fallbackScaleLog,
-        fallbackQuats,
-        fallbackOpacity,
-        fallbackShCoeffs,
-      );
-    }
-    weightSums[slot] += weight;
-    counts[slot] += 1;
-    weightedPos[base3 + 0] += scratch.position[0] * weight;
-    weightedPos[base3 + 1] += scratch.position[1] * weight;
-    weightedPos[base3 + 2] += scratch.position[2] * weight;
-    weightedOpacity[slot] += scratch.opacity * weight;
-    for (let c = 0; c < coeffStride; c++) {
-      weightedSh[coeffBase + c] += scratch.sh[c] * weight;
-    }
-    rowIndex += 1;
-  });
+      const slot = assignment[rowIndex];
+      const radius = scratchThreeSigmaRadiusFloat32(scratch);
+      const weight = mergeAggregationWeight(scratch.opacity, radius, voxelDiag);
+      const base3 = slot * 3;
+      if (firstAssigned[slot] < 0) {
+        firstAssigned[slot] = rowIndex;
+      }
+      weightSums[slot] += weight;
+      counts[slot] += 1;
+      weightedPos[base3 + 0] += scratch.position[0] * weight;
+      weightedPos[base3 + 1] += scratch.position[1] * weight;
+      weightedPos[base3 + 2] += scratch.position[2] * weight;
+      weightedOpacity[slot] += scratch.opacity * weight;
+      rowIndex += 1;
+    },
+  );
+
+  positions = new Float32Array(selectedCount * 3);
+  opacity = new Float32Array(selectedCount);
+  shCoeffs = new Float32Array(selectedCount * coeffStride);
 
   for (let slot = 0; slot < selectedCount; slot++) {
     if (
@@ -1309,43 +2035,13 @@ async function mergeSelectedBucketRowsToCloud(
       weightSums[slot] <= 1e-12 ||
       counts[slot] === 0
     ) {
-      if (firstAssigned[slot] >= 0) {
-        copySlotArrays(
-          slot,
-          coeffStride,
-          fallbackPositions,
-          fallbackScaleLog,
-          fallbackQuats,
-          fallbackOpacity,
-          fallbackShCoeffs,
-          positions,
-          scaleLog,
-          quats,
-          opacity,
-          shCoeffs,
-        );
-      } else {
-        copySlotArrays(
-          slot,
-          coeffStride,
-          selectedPositions,
-          selectedScaleLog,
-          selectedQuats,
-          selectedOpacity,
-          selectedShCoeffs,
-          positions,
-          scaleLog,
-          quats,
-          opacity,
-          shCoeffs,
-        );
-      }
+      fallbackRowIndex[slot] =
+        firstAssigned[slot] >= 0 ? firstAssigned[slot] : selectedRows[slot];
       continue;
     }
 
     const invWeight = 1.0 / weightSums[slot];
     const base3 = slot * 3;
-    const coeffBase = slot * coeffStride;
     positions[base3 + 0] = weightedPos[base3 + 0] * invWeight;
     positions[base3 + 1] = weightedPos[base3 + 1] * invWeight;
     positions[base3 + 2] = weightedPos[base3 + 2] * invWeight;
@@ -1353,42 +2049,117 @@ async function mergeSelectedBucketRowsToCloud(
       0.0,
       Math.min(1.0, weightedOpacity[slot] * invWeight),
     );
-    for (let c = 0; c < coeffStride; c++) {
-      shCoeffs[coeffBase + c] = weightedSh[coeffBase + c] * invWeight;
-    }
   }
 
-  rowIndex = 0;
-  await forEachBucketEntryRow(entries, coeffCount, (view, base, encoding) => {
-    const slot = assignment[rowIndex];
-    if (
-      !Number.isFinite(weightSums[slot]) ||
-      weightSums[slot] <= 1e-12 ||
-      counts[slot] <= 1
-    ) {
-      rowIndex += 1;
-      return;
-    }
-    readBucketCoreRowIntoScratch(encoding, view, base, scratch);
-    const weight = mergeAggregationWeight(
-      scratch.opacity,
-      radii[rowIndex],
-      voxelDiag,
+  weightedPos = null;
+  weightedOpacity = null;
+
+  for (
+    let coeffStart = 0;
+    coeffStart < coeffStride;
+    coeffStart += MERGE_SH_COEFF_BLOCK
+  ) {
+    const blockWidth = Math.min(MERGE_SH_COEFF_BLOCK, coeffStride - coeffStart);
+    let weightedShBlock = new Float64Array(selectedCount * blockWidth);
+    rowIndex = 0;
+    await forEachBucketEntryRow(
+      entries,
+      coeffCount,
+      (view, base, encoding, _filePath, floatView, floatBase) => {
+        const slot = assignment[rowIndex];
+        if (
+          !Number.isFinite(weightSums[slot]) ||
+          weightSums[slot] <= 1e-12 ||
+          counts[slot] === 0
+        ) {
+          rowIndex += 1;
+          return;
+        }
+        readBucketRowIntoScratch(
+          encoding,
+          view,
+          base,
+          coeffCount,
+          scratch,
+          floatView,
+          floatBase,
+        );
+        const radius = scratchThreeSigmaRadiusFloat32(scratch);
+        const weight = mergeAggregationWeight(
+          scratch.opacity,
+          radius,
+          voxelDiag,
+        );
+        const blockBase = slot * blockWidth;
+        for (let c = 0; c < blockWidth; c++) {
+          weightedShBlock[blockBase + c] += scratch.sh[coeffStart + c] * weight;
+        }
+        rowIndex += 1;
+      },
     );
-    covarianceComponentsFromScratch(scratch.scaleLog, scratch.quat, covScratch);
-    const base3 = slot * 3;
-    const covBase = slot * 6;
-    const dx = scratch.position[0] - positions[base3 + 0];
-    const dy = scratch.position[1] - positions[base3 + 1];
-    const dz = scratch.position[2] - positions[base3 + 2];
-    covSums[covBase + 0] += weight * (covScratch[0] + dx * dx);
-    covSums[covBase + 1] += weight * (covScratch[1] + dx * dy);
-    covSums[covBase + 2] += weight * (covScratch[2] + dx * dz);
-    covSums[covBase + 3] += weight * (covScratch[3] + dy * dy);
-    covSums[covBase + 4] += weight * (covScratch[4] + dy * dz);
-    covSums[covBase + 5] += weight * (covScratch[5] + dz * dz);
-    rowIndex += 1;
-  });
+
+    for (let slot = 0; slot < selectedCount; slot++) {
+      if (
+        !Number.isFinite(weightSums[slot]) ||
+        weightSums[slot] <= 1e-12 ||
+        counts[slot] === 0
+      ) {
+        continue;
+      }
+      const invWeight = 1.0 / weightSums[slot];
+      const blockBase = slot * blockWidth;
+      const coeffBase = slot * coeffStride + coeffStart;
+      for (let c = 0; c < blockWidth; c++) {
+        shCoeffs[coeffBase + c] = weightedShBlock[blockBase + c] * invWeight;
+      }
+    }
+    weightedShBlock = null;
+  }
+
+  let covSums = new Float64Array(selectedCount * 6);
+  rowIndex = 0;
+  await forEachBucketEntryRow(
+    entries,
+    coeffCount,
+    (view, base, encoding, _filePath, floatView, floatBase) => {
+      const slot = assignment[rowIndex];
+      if (
+        !Number.isFinite(weightSums[slot]) ||
+        weightSums[slot] <= 1e-12 ||
+        counts[slot] <= 1
+      ) {
+        rowIndex += 1;
+        return;
+      }
+      readBucketCoreRowIntoScratch(
+        encoding,
+        view,
+        base,
+        scratch,
+        floatView,
+        floatBase,
+      );
+      const radius = scratchThreeSigmaRadiusFloat32(scratch);
+      const weight = mergeAggregationWeight(scratch.opacity, radius, voxelDiag);
+      covarianceComponentsFromScratch(
+        scratch.scaleLog,
+        scratch.quat,
+        covScratch,
+      );
+      const base3 = slot * 3;
+      const covBase = slot * 6;
+      const dx = scratch.position[0] - positions[base3 + 0];
+      const dy = scratch.position[1] - positions[base3 + 1];
+      const dz = scratch.position[2] - positions[base3 + 2];
+      covSums[covBase + 0] += weight * (covScratch[0] + dx * dx);
+      covSums[covBase + 1] += weight * (covScratch[1] + dx * dy);
+      covSums[covBase + 2] += weight * (covScratch[2] + dx * dz);
+      covSums[covBase + 3] += weight * (covScratch[3] + dy * dy);
+      covSums[covBase + 4] += weight * (covScratch[4] + dy * dz);
+      covSums[covBase + 5] += weight * (covScratch[5] + dz * dz);
+      rowIndex += 1;
+    },
+  );
 
   for (let slot = 0; slot < selectedCount; slot++) {
     if (
@@ -1396,42 +2167,17 @@ async function mergeSelectedBucketRowsToCloud(
       weightSums[slot] <= 1e-12 ||
       counts[slot] <= 1
     ) {
-      if (firstAssigned[slot] >= 0) {
-        copySlotArrays(
-          slot,
-          coeffStride,
-          fallbackPositions,
-          fallbackScaleLog,
-          fallbackQuats,
-          fallbackOpacity,
-          fallbackShCoeffs,
-          positions,
-          scaleLog,
-          quats,
-          opacity,
-          shCoeffs,
-        );
-      } else {
-        copySlotArrays(
-          slot,
-          coeffStride,
-          selectedPositions,
-          selectedScaleLog,
-          selectedQuats,
-          selectedOpacity,
-          selectedShCoeffs,
-          positions,
-          scaleLog,
-          quats,
-          opacity,
-          shCoeffs,
-        );
-      }
+      fallbackRowIndex[slot] =
+        firstAssigned[slot] >= 0 ? firstAssigned[slot] : selectedRows[slot];
       continue;
     }
 
     const invWeight = 1.0 / weightSums[slot];
     const covBase = slot * 6;
+    if (!scaleLog) {
+      scaleLog = new Float32Array(selectedCount * 3);
+      quats = new Float32Array(selectedCount * 4);
+    }
     covarianceToScaleQuat(
       Math.max(covSums[covBase + 0] * invWeight, 1e-20),
       covSums[covBase + 1] * invWeight,
@@ -1446,6 +2192,23 @@ async function mergeSelectedBucketRowsToCloud(
     );
   }
 
+  if (!scaleLog) {
+    scaleLog = new Float32Array(selectedCount * 3);
+    quats = new Float32Array(selectedCount * 4);
+  }
+  covSums = null;
+
+  await materializeBucketRowsToSlots(
+    entries,
+    coeffCount,
+    fallbackRowIndex,
+    positions,
+    scaleLog,
+    quats,
+    opacity,
+    shCoeffs,
+  );
+
   const cloud = new GaussianCloud(
     positions,
     scaleLog,
@@ -1458,86 +2221,199 @@ async function mergeSelectedBucketRowsToCloud(
   return cloud;
 }
 
-function computeExactStreamingOwnError(
-  inputPositions,
-  inputRadii,
+class FixedMinHeap {
+  constructor(capacity) {
+    this.values = new Float64Array(capacity);
+    this.length = 0;
+    this.capacity = capacity;
+  }
+
+  pushCandidate(value) {
+    if (this.capacity <= 0) {
+      return;
+    }
+    if (this.length < this.capacity) {
+      const index = this.length++;
+      this.values[index] = value;
+      this._siftUp(index);
+      return;
+    }
+    if (value <= this.values[0]) {
+      return;
+    }
+    this.values[0] = value;
+    this._siftDown(0);
+  }
+
+  _siftUp(index) {
+    const values = this.values;
+    const value = values[index];
+    while (index > 0) {
+      const parent = (index - 1) >> 1;
+      const parentValue = values[parent];
+      if (parentValue <= value) {
+        break;
+      }
+      values[index] = parentValue;
+      index = parent;
+    }
+    values[index] = value;
+  }
+
+  _siftDown(index) {
+    const values = this.values;
+    const length = this.length;
+    const value = values[index];
+    while (true) {
+      const left = index * 2 + 1;
+      if (left >= length) {
+        break;
+      }
+      const right = left + 1;
+      let child = left;
+      let childValue = values[left];
+      if (right < length && values[right] < childValue) {
+        child = right;
+        childValue = values[right];
+      }
+      if (childValue >= value) {
+        break;
+      }
+      values[index] = childValue;
+      index = child;
+    }
+    values[index] = value;
+  }
+
+  sortedValues() {
+    const out = this.values.subarray(0, this.length);
+    out.sort((a, b) => a - b);
+    return out;
+  }
+}
+
+async function computeExactStreamingOwnErrorFromEntries(
+  entries,
+  coeffCount,
   assignment,
   outputCloud,
   outputRadius,
 ) {
-  const err = new Float64Array(assignment.length);
-  for (let rowIndex = 0; rowIndex < assignment.length; rowIndex++) {
-    const slot = assignment[rowIndex];
-    const srcBase3 = rowIndex * 3;
-    const dstBase3 = slot * 3;
-    const dx =
-      inputPositions[srcBase3 + 0] - outputCloud.positions[dstBase3 + 0];
-    const dy =
-      inputPositions[srcBase3 + 1] - outputCloud.positions[dstBase3 + 1];
-    const dz =
-      inputPositions[srcBase3 + 2] - outputCloud.positions[dstBase3 + 2];
-    err[rowIndex] =
-      Math.sqrt(dx * dx + dy * dy + dz * dz) +
-      inputRadii[rowIndex] +
-      outputRadius[slot];
+  const totalRows = assignment.length;
+  const pos95 = 0.95 * (totalRows - 1);
+  const lo = Math.floor(pos95);
+  const hi = Math.min(totalRows - 1, lo + 1);
+  const frac = pos95 - lo;
+  const tailStart = lo;
+  const tail = new FixedMinHeap(totalRows - tailStart);
+  const scratch = makeRowScratch(coeffCount);
+  let rowIndex = 0;
+
+  await forEachBucketEntryRow(
+    entries,
+    coeffCount,
+    (view, base, encoding, _filePath, floatView, floatBase) => {
+      readBucketCoreRowIntoScratch(
+        encoding,
+        view,
+        base,
+        scratch,
+        floatView,
+        floatBase,
+      );
+      const slot = assignment[rowIndex];
+      const dstBase3 = slot * 3;
+      const dx = scratch.position[0] - outputCloud.positions[dstBase3 + 0];
+      const dy = scratch.position[1] - outputCloud.positions[dstBase3 + 1];
+      const dz = scratch.position[2] - outputCloud.positions[dstBase3 + 2];
+      const radius = scratchThreeSigmaRadiusFloat32(scratch);
+      const error =
+        Math.sqrt(dx * dx + dy * dy + dz * dz) + radius + outputRadius[slot];
+      tail.pushCandidate(error);
+      rowIndex += 1;
+    },
+  );
+
+  const sortedTail = tail.sortedValues();
+  const loValue = sortedTail[0];
+  if (frac === 0) {
+    return loValue;
   }
-  return percent95(err);
+  return loValue * (1 - frac) + sortedTail[hi - tailStart] * frac;
 }
 
-async function streamSimplifyBucketFilesExact(
-  fileSpecs,
+async function planExactStreamingSimplify(
+  entries,
+  coeffCount,
+  target,
+  bounds,
+  totalRows,
+  { sampleMode = 'merge' } = {},
+) {
+  const lightCloud = await loadBucketSimplifyCoreFromEntries(
+    entries,
+    coeffCount,
+    { keepScaleQuat: bounds == null },
+  );
+  const activeBounds = bounds || computeBounds(lightCloud);
+  return planSimplifyCloudVoxel(
+    lightCloud,
+    target,
+    activeBounds,
+    normalizeSplatTargetCount(target, totalRows),
+    {
+      returnOrigRadius: false,
+      returnKeptRadius: sampleMode !== 'merge',
+    },
+  );
+}
+
+async function streamSimplifyBucketEntriesExact(
+  entries,
   coeffCount,
   targetCount,
   bounds,
   sampleMode,
 ) {
-  const { entries, totalRows } = await collectBucketEntries(
-    fileSpecs,
-    coeffCount,
-  );
+  const totalRows = entries.reduce((sum, entry) => sum + entry.rowCount, 0);
   ensure(totalRows > 0, 'Cannot simplify an empty bucket input.');
   const target = normalizeSplatTargetCount(targetCount, totalRows);
   if (totalRows <= target) {
     return {
-      cloud: await loadBucketCloudFromSpecs(entries, coeffCount),
+      cloud: await loadBucketCloudFromEntries(entries, coeffCount, totalRows),
       ownError: 0.0,
     };
   }
 
-  const lightCloud = await loadBucketSimplifyCoreFromEntries(
+  const plan = await planExactStreamingSimplify(
     entries,
     coeffCount,
-  );
-  const activeBounds = bounds || computeBounds(lightCloud);
-  const plan = planSimplifyCloudVoxel(
-    lightCloud,
     target,
-    activeBounds,
-    normalizeSplatTargetCount(target, totalRows),
+    bounds,
+    totalRows,
+    { sampleMode },
   );
-  const selectedSlotByOrig = new Int32Array(totalRows);
-  selectedSlotByOrig.fill(-1);
-  for (let slot = 0; slot < plan.selected.length; slot++) {
-    selectedSlotByOrig[plan.selected[slot]] = slot;
-  }
+  const selectedRows = plan.selected;
+  const selectedCount = selectedRows.length;
+  plan.selected = null;
 
   const outputCloud =
     sampleMode === 'merge'
       ? await mergeSelectedBucketRowsToCloud(
           entries,
           coeffCount,
-          selectedSlotByOrig,
+          selectedRows,
           plan.assignment,
-          plan.origRadius,
-          plan.selected.length,
+          selectedCount,
           plan.voxelDiag,
         )
       : await gatherSelectedBucketRowsToCloud(
           entries,
           coeffCount,
-          plan.selected.length,
-          selectedSlotByOrig,
+          selectedCount,
+          selectedRows,
         );
+
   const outputRadius =
     sampleMode === 'merge'
       ? computeThreeSigmaAabbDiagonalRadius(
@@ -1548,9 +2424,9 @@ async function streamSimplifyBucketFilesExact(
 
   return {
     cloud: outputCloud,
-    ownError: computeExactStreamingOwnError(
-      lightCloud.positions,
-      plan.origRadius,
+    ownError: await computeExactStreamingOwnErrorFromEntries(
+      entries,
+      coeffCount,
       plan.assignment,
       outputCloud,
       outputRadius,
@@ -1589,7 +2465,7 @@ async function writeContentFile(
   if (
     params.contentWorkerPool &&
     transferOwnership &&
-    cloud.length >= SPZ_ASYNC_WRITE_THRESHOLD
+    cloud.length >= SPZ_CLOUD_ASYNC_WRITE_THRESHOLD
   ) {
     await params.contentWorkerPool.submit(
       {
@@ -1623,81 +2499,280 @@ async function writeContentFile(
   return relPath;
 }
 
-async function scanGlobalBounds(handle, filePath, header, layout) {
-  const minimum = [Infinity, Infinity, Infinity];
-  const maximum = [-Infinity, -Infinity, -Infinity];
-  let count = 0;
-  await _forEachGaussianPlyPosition(
-    handle,
-    filePath,
-    header,
-    layout,
-    (_rowIndex, x, y, z) => {
-      if (x < minimum[0]) minimum[0] = x;
-      if (y < minimum[1]) minimum[1] = y;
-      if (z < minimum[2]) minimum[2] = z;
-      if (x > maximum[0]) maximum[0] = x;
-      if (y > maximum[1]) maximum[1] = y;
-      if (z > maximum[2]) maximum[2] = z;
-      count += 1;
-    },
-  );
-  ensure(count > 0, `PLY file ${filePath} does not contain any vertices.`);
-  return new Bounds(minimum, maximum);
+function bucketEntriesForWorkerTask(entries) {
+  return entries.map((entry) => ({
+    filePath: entry.filePath,
+    encoding: entry.encoding,
+    rowCount: entry.rowCount,
+  }));
 }
 
-async function buildCountsTable(
+async function writeBucketGlbTaskOutput(task) {
+  ensure(task && task.outPath, 'Missing bucket GLB task output path.');
+  ensure(task.pointCount > 0, 'Cannot write empty bucket content.');
+  const translation =
+    task.translation ||
+    (await computeBucketEntriesBounds(task.entries, task.coeffCount)).center();
+  const spzBytes = await packBucketEntriesToSpz(
+    task.entries,
+    task.coeffCount,
+    task.shDegree,
+    task.sh1Bits,
+    task.shRestBits,
+    translation,
+  );
+  const builder = new GltfBuilder();
+  builder.writeSpzStreamGlb(
+    task.outPath,
+    spzBytes,
+    { length: task.pointCount, shDegree: task.shDegree },
+    task.colorSpace,
+    translation,
+  );
+  return true;
+}
+
+async function writeBucketContentFile(
+  params,
+  entries,
+  coeffCount,
+  pointCount,
+  shDegree,
+  level,
+  x,
+  y,
+  z,
+) {
+  ensure(pointCount > 0, 'Cannot write empty bucket content.');
+  const relPath = contentRelPath(level, x, y, z);
+  const outPath = path.join(params.outputDir, relPath);
+  await fs.promises.mkdir(path.dirname(outPath), { recursive: true });
+
+  const task = {
+    kind: 'pack-bucket-spz',
+    outPath,
+    entries: bucketEntriesForWorkerTask(entries),
+    coeffCount,
+    pointCount,
+    shDegree,
+    sh1Bits: params.spzSh1Bits,
+    shRestBits: params.spzShRestBits,
+    colorSpace: params.colorSpace,
+  };
+
+  if (
+    params.contentWorkerPool &&
+    pointCount >= SPZ_BUCKET_ASYNC_WRITE_THRESHOLD
+  ) {
+    await params.contentWorkerPool.submit(task);
+    return relPath;
+  }
+
+  await writeBucketGlbTaskOutput(task);
+  return relPath;
+}
+
+function updatePositionBounds(minimum, maximum, x, y, z) {
+  if (x < minimum[0]) minimum[0] = x;
+  if (y < minimum[1]) minimum[1] = y;
+  if (z < minimum[2]) minimum[2] = z;
+  if (x > maximum[0]) maximum[0] = x;
+  if (y > maximum[1]) maximum[1] = y;
+  if (z > maximum[2]) maximum[2] = z;
+}
+
+async function scanGlobalBoundsAndWritePositions(
   handle,
   filePath,
   header,
   layout,
+  positionsPath,
+) {
+  const minimum = [Infinity, Infinity, Infinity];
+  const maximum = [-Infinity, -Infinity, -Infinity];
+  const rowsPerBuffer = Math.max(
+    1,
+    Math.floor(POSITION_TMP_BUFFER_BYTES / POSITION_ROW_BYTE_SIZE),
+  );
+  const buffer = Buffer.allocUnsafe(rowsPerBuffer * POSITION_ROW_BYTE_SIZE);
+  const floatView =
+    IS_LITTLE_ENDIAN && (buffer.byteOffset & 3) === 0
+      ? new Float32Array(buffer.buffer, buffer.byteOffset, rowsPerBuffer * 3)
+      : null;
+  let bufferedRows = 0;
+  let count = 0;
+
+  await fs.promises.mkdir(path.dirname(positionsPath), { recursive: true });
+  await removeFileIfExists(positionsPath);
+  const positionFd = fs.openSync(positionsPath, 'w');
+  const flush = () => {
+    if (bufferedRows === 0) {
+      return;
+    }
+    const byteLength = bufferedRows * POSITION_ROW_BYTE_SIZE;
+    let written = 0;
+    while (written < byteLength) {
+      const bytesWritten = fs.writeSync(
+        positionFd,
+        buffer,
+        written,
+        byteLength - written,
+      );
+      ensure(
+        bytesWritten > 0,
+        `Failed to write staged positions: ${positionsPath}`,
+      );
+      written += bytesWritten;
+    }
+    bufferedRows = 0;
+  };
+
+  try {
+    await _forEachGaussianPlyPosition(
+      handle,
+      filePath,
+      header,
+      layout,
+      (_rowIndex, x, y, z) => {
+        const fx = Math.fround(x);
+        const fy = Math.fround(y);
+        const fz = Math.fround(z);
+        updatePositionBounds(minimum, maximum, fx, fy, fz);
+
+        if (floatView) {
+          const base = bufferedRows * 3;
+          floatView[base + 0] = fx;
+          floatView[base + 1] = fy;
+          floatView[base + 2] = fz;
+        } else {
+          const base = bufferedRows * POSITION_ROW_BYTE_SIZE;
+          buffer.writeFloatLE(fx, base + 0);
+          buffer.writeFloatLE(fy, base + 4);
+          buffer.writeFloatLE(fz, base + 8);
+        }
+
+        bufferedRows += 1;
+        count += 1;
+        if (bufferedRows === rowsPerBuffer) {
+          flush();
+        }
+      },
+    );
+    flush();
+  } finally {
+    fs.closeSync(positionFd);
+  }
+
+  ensure(count > 0, `PLY file ${filePath} does not contain any vertices.`);
+  ensure(
+    count === header.vertexCount,
+    `PLY position row count mismatch. Expected ${header.vertexCount}, got ${count}.`,
+  );
+  return new Bounds(minimum, maximum);
+}
+
+function addPositionToCounts(counts, rootBounds, maxDepth, x, y, z) {
+  let minX = rootBounds.minimum[0];
+  let minY = rootBounds.minimum[1];
+  let minZ = rootBounds.minimum[2];
+  let maxX = rootBounds.maximum[0];
+  let maxY = rootBounds.maximum[1];
+  let maxZ = rootBounds.maximum[2];
+  let ix = 0;
+  let iy = 0;
+  let iz = 0;
+
+  counts.increment(0, 0, 0, 0);
+  for (let depth = 0; depth < maxDepth; depth++) {
+    const cx = (minX + maxX) * 0.5;
+    const cy = (minY + maxY) * 0.5;
+    const cz = (minZ + maxZ) * 0.5;
+    const bx = x >= cx ? 1 : 0;
+    const by = y >= cy ? 1 : 0;
+    const bz = z >= cz ? 1 : 0;
+    ix = (ix << 1) | bx;
+    iy = (iy << 1) | by;
+    iz = (iz << 1) | bz;
+    counts.increment(depth + 1, ix, iy, iz);
+
+    if (bx) minX = cx;
+    else maxX = cx;
+    if (by) minY = cy;
+    else maxY = cy;
+    if (bz) minZ = cz;
+    else maxZ = cz;
+  }
+}
+
+async function readExactFromHandle(handle, buffer, length, position, message) {
+  let offset = 0;
+  while (offset < length) {
+    const { bytesRead } = await handle.read(
+      buffer,
+      offset,
+      length - offset,
+      position + offset,
+    );
+    if (bytesRead === 0) {
+      throw new ConversionError(message);
+    }
+    offset += bytesRead;
+  }
+}
+
+async function buildCountsTableFromPositionFile(
+  positionsPath,
+  vertexCount,
   rootBounds,
   maxDepth,
 ) {
-  const counts = new Map();
-  const increment = (level, x, y, z) => {
-    const key = makeNodeKey(level, x, y, z);
-    counts.set(key, (counts.get(key) || 0) + 1);
-  };
-
-  await _forEachGaussianPlyPosition(
-    handle,
-    filePath,
-    header,
-    layout,
-    (_rowIndex, x, y, z) => {
-      let minX = rootBounds.minimum[0];
-      let minY = rootBounds.minimum[1];
-      let minZ = rootBounds.minimum[2];
-      let maxX = rootBounds.maximum[0];
-      let maxY = rootBounds.maximum[1];
-      let maxZ = rootBounds.maximum[2];
-      let ix = 0;
-      let iy = 0;
-      let iz = 0;
-
-      increment(0, 0, 0, 0);
-      for (let depth = 0; depth < maxDepth; depth++) {
-        const cx = (minX + maxX) * 0.5;
-        const cy = (minY + maxY) * 0.5;
-        const cz = (minZ + maxZ) * 0.5;
-        const bx = x >= cx ? 1 : 0;
-        const by = y >= cy ? 1 : 0;
-        const bz = z >= cz ? 1 : 0;
-        ix = (ix << 1) | bx;
-        iy = (iy << 1) | by;
-        iz = (iz << 1) | bz;
-        increment(depth + 1, ix, iy, iz);
-
-        if (bx) minX = cx;
-        else maxX = cx;
-        if (by) minY = cy;
-        else maxY = cy;
-        if (bz) minZ = cz;
-        else maxZ = cz;
-      }
-    },
+  const counts = new CountsTable(maxDepth, vertexCount);
+  const rowsPerChunk = Math.max(
+    1,
+    Math.floor((8 * 1024 * 1024) / POSITION_ROW_BYTE_SIZE),
   );
+  const chunk = Buffer.allocUnsafe(rowsPerChunk * POSITION_ROW_BYTE_SIZE);
+  const floatView =
+    IS_LITTLE_ENDIAN && (chunk.byteOffset & 3) === 0
+      ? new Float32Array(chunk.buffer, chunk.byteOffset, rowsPerChunk * 3)
+      : null;
+  const handle = await fs.promises.open(positionsPath, 'r');
+  try {
+    let fileOffset = 0;
+    for (let rowBase = 0; rowBase < vertexCount; rowBase += rowsPerChunk) {
+      const rowCount = Math.min(rowsPerChunk, vertexCount - rowBase);
+      const byteCount = rowCount * POSITION_ROW_BYTE_SIZE;
+      await readExactFromHandle(
+        handle,
+        chunk,
+        byteCount,
+        fileOffset,
+        `Staged position file ended early: ${positionsPath}`,
+      );
+      fileOffset += byteCount;
+
+      for (let i = 0; i < rowCount; i++) {
+        let x;
+        let y;
+        let z;
+        if (floatView) {
+          const base = i * 3;
+          x = floatView[base + 0];
+          y = floatView[base + 1];
+          z = floatView[base + 2];
+        } else {
+          const base = i * POSITION_ROW_BYTE_SIZE;
+          x = chunk.readFloatLE(base + 0);
+          y = chunk.readFloatLE(base + 4);
+          z = chunk.readFloatLE(base + 8);
+        }
+        addPositionToCounts(counts, rootBounds, maxDepth, x, y, z);
+      }
+    }
+  } finally {
+    await handle.close();
+  }
+
   return counts;
 }
 
@@ -1720,33 +2795,36 @@ async function isPartitionedNodeComplete(node, ctx) {
 
 async function processPartitionedLeafNode(node, ctx) {
   ensure(!!node.bucketPath, `Missing leaf bucket path for node ${node.key}.`);
-  const leafCloud = await loadBucketCloudFromSpecs(
+  const { entries, totalRows } = await collectBucketEntries(
     [leafBucketSpec(node)],
     ctx.layout.coeffCount,
   );
+  node.bucketRowCount = totalRows;
   if (node.depth > 0) {
     node.handoffPath = canonicalNodePath(ctx.tempDir, HANDOFF_BUCKET_DIR, node);
-    await writeCanonicalCloudFile(node.handoffPath, leafCloud);
+    await materializeLinkedHandoffFile(node.bucketPath, node.handoffPath);
+    node.handoffRowCount = totalRows;
     node.handoffConsumed = false;
   } else {
     node.handoffPath = null;
+    node.handoffRowCount = null;
     node.handoffConsumed = true;
   }
 
   node.ownError = 0.0;
-  node.contentUri = await writeContentFile(
+  node.contentUri = await writeBucketContentFile(
     ctx.params,
-    leafCloud,
+    entries,
+    ctx.layout.coeffCount,
+    totalRows,
+    ctx.layout.degree,
     node.level,
     node.x,
     node.y,
     node.z,
-    {
-      transferOwnership: true,
-    },
   );
   node.buildState = 'completed';
-  await enqueuePipelineStateSave(ctx, PIPELINE_STAGE_BUCKETED);
+  enqueuePipelineStateSave(ctx, PIPELINE_STAGE_BUCKETED);
 }
 
 async function processPartitionedInternalNode(node, ctx) {
@@ -1762,44 +2840,85 @@ async function processPartitionedInternalNode(node, ctx) {
     ctx.layout.coeffCount,
   );
   const contentTarget = resolveNodeContentTarget(node, ctx, totalRows);
-  const { cloud: contentCloud, ownError } =
-    await streamSimplifyBucketFilesExact(
+  if (totalRows <= contentTarget) {
+    if (node.depth > 0) {
+      node.handoffPath = canonicalNodePath(
+        ctx.tempDir,
+        HANDOFF_BUCKET_DIR,
+        node,
+      );
+      await materializeCanonicalEntriesFile(
+        entries,
+        node.handoffPath,
+        ctx.layout.coeffCount,
+      );
+      node.handoffRowCount = totalRows;
+      node.handoffConsumed = false;
+    } else {
+      node.handoffPath = null;
+      node.handoffRowCount = null;
+      node.handoffConsumed = true;
+    }
+
+    node.ownError = 0.0;
+    node.contentUri = await writeBucketContentFile(
+      ctx.params,
       entries,
       ctx.layout.coeffCount,
-      contentTarget,
-      node.bounds,
-      ctx.params.sampleMode,
+      totalRows,
+      ctx.layout.degree,
+      node.level,
+      node.x,
+      node.y,
+      node.z,
     );
-  if (node.depth > 0) {
-    node.handoffPath = canonicalNodePath(ctx.tempDir, HANDOFF_BUCKET_DIR, node);
-    await writeCanonicalCloudFile(node.handoffPath, contentCloud);
-    node.handoffConsumed = false;
   } else {
-    node.handoffPath = null;
-    node.handoffConsumed = true;
-  }
+    const { cloud: contentCloud, ownError } =
+      await streamSimplifyBucketEntriesExact(
+        entries,
+        ctx.layout.coeffCount,
+        contentTarget,
+        node.bounds,
+        ctx.params.sampleMode,
+      );
+    if (node.depth > 0) {
+      node.handoffPath = canonicalNodePath(
+        ctx.tempDir,
+        HANDOFF_BUCKET_DIR,
+        node,
+      );
+      await writeCanonicalCloudFile(node.handoffPath, contentCloud);
+      node.handoffRowCount = contentCloud.length;
+      node.handoffConsumed = false;
+    } else {
+      node.handoffPath = null;
+      node.handoffRowCount = null;
+      node.handoffConsumed = true;
+    }
 
-  node.ownError = Number.isFinite(ownError) && ownError > 0.0 ? ownError : 0.0;
-  node.contentUri = await writeContentFile(
-    ctx.params,
-    contentCloud,
-    node.level,
-    node.x,
-    node.y,
-    node.z,
-    {
-      transferOwnership: true,
-    },
-  );
+    node.ownError =
+      Number.isFinite(ownError) && ownError > 0.0 ? ownError : 0.0;
+    node.contentUri = await writeContentFile(
+      ctx.params,
+      contentCloud,
+      node.level,
+      node.x,
+      node.y,
+      node.z,
+      {
+        transferOwnership: true,
+      },
+    );
+  }
   node.buildState = 'completed';
   for (const child of node.children) {
     child.handoffConsumed = true;
+    if (child.handoffPath) {
+      ctx.pendingHandoffCleanup.add(child.handoffPath);
+    }
+    child.handoffRowCount = null;
   }
-  await enqueuePipelineStateSave(ctx, PIPELINE_STAGE_BUCKETED);
-
-  for (const child of node.children) {
-    await removeFileIfExists(child.handoffPath);
-  }
+  enqueuePipelineStateSave(ctx, PIPELINE_STAGE_BUCKETED);
 }
 
 async function runWithConcurrency(items, limit, onItem) {
@@ -1823,6 +2942,21 @@ async function runWithConcurrency(items, limit, onItem) {
   await Promise.all(workers);
 }
 
+async function processBuildNodes(nodes, concurrency, ctx) {
+  await runWithConcurrency(nodes, concurrency, async (node) => {
+    if (await isPartitionedNodeComplete(node, ctx)) {
+      tickBuildProgress(ctx, node, 'checkpoint');
+      return;
+    }
+    if (node.leaf) {
+      await processPartitionedLeafNode(node, ctx);
+    } else {
+      await processPartitionedInternalNode(node, ctx);
+    }
+    tickBuildProgress(ctx, node);
+  });
+}
+
 function tickBuildProgress(ctx, node, status) {
   if (!ctx || !ctx.buildProgress || !node) {
     return;
@@ -1834,22 +2968,47 @@ function tickBuildProgress(ctx, node, status) {
 
 async function buildPartitionedBottomUp(rootNode, ctx) {
   const treeStats = collectTreeStats(rootNode);
+  const cleanupTasks = [];
   for (let level = treeStats.maxLevel; level >= 0; level--) {
     const levelNodes = treeStats.levels[level] || [];
-    await runWithConcurrency(levelNodes, ctx.nodeConcurrency, async (node) => {
-      if (await isPartitionedNodeComplete(node, ctx)) {
-        tickBuildProgress(ctx, node, 'checkpoint');
-        return;
-      }
+    ctx.pendingHandoffCleanup = new Set();
+    const leafNodes = [];
+    const internalNodes = [];
+    for (const node of levelNodes) {
       if (node.leaf) {
-        await processPartitionedLeafNode(node, ctx);
+        leafNodes.push(node);
       } else {
-        await processPartitionedInternalNode(node, ctx);
+        internalNodes.push(node);
       }
-      tickBuildProgress(ctx, node);
-    });
+    }
+    await processBuildNodes(leafNodes, ctx.leafNodeConcurrency, ctx);
+    await processBuildNodes(internalNodes, ctx.nodeConcurrency, ctx);
+    if (levelNodes.length > 0) {
+      await enqueuePipelineStateSave(ctx, PIPELINE_STAGE_BUCKETED, {
+        force: true,
+      });
+      const handoffPaths = Array.from(ctx.pendingHandoffCleanup);
+      if (handoffPaths.length > 0) {
+        cleanupTasks.push(
+          runWithConcurrency(
+            handoffPaths,
+            ctx.nodeConcurrency,
+            async (filePath) => {
+              await removeFileIfExists(filePath);
+            },
+          ).then(
+            () => null,
+            (err) => err,
+          ),
+        );
+      }
+    }
   }
-  await enqueuePipelineStateSave(ctx, 'built');
+  const cleanupErrors = (await Promise.all(cleanupTasks)).filter(Boolean);
+  if (cleanupErrors.length > 0) {
+    throw cleanupErrors[0];
+  }
+  await enqueuePipelineStateSave(ctx, 'built', { force: true });
 }
 
 function resolveRootGeometricError(rootNode, rootBounds, params, lodMaxDepth) {
@@ -2055,7 +3214,12 @@ function makeBuildSummary(
 async function ensureReusablePartitionState(rootNode) {
   const { leaves } = collectTreeStats(rootNode);
   for (const leaf of leaves) {
-    if (!leaf.bucketPath || !(await pathExists(leaf.bucketPath))) {
+    if (
+      !leaf.bucketPath ||
+      !Number.isInteger(leaf.bucketRowCount) ||
+      leaf.bucketRowCount <= 0 ||
+      !(await pathExists(leaf.bucketPath))
+    ) {
       return false;
     }
   }
@@ -2143,20 +3307,30 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
     }
 
     if (!rootBounds || !rootNodeMeta) {
-      console.log(
-        `[info] scan 1/3 | vertices=${header.vertexCount} | sh_degree=${layout.degree}`,
-      );
-      rootBounds = await scanGlobalBounds(handle, inputPath, header, layout);
+      const positionsPath = path.join(tempDir, POSITION_TMP_FILE);
+      let counts = null;
+      try {
+        console.log(
+          `[info] scan 1/4 | vertices=${header.vertexCount} | sh_degree=${layout.degree} | staging positions`,
+        );
+        rootBounds = await scanGlobalBoundsAndWritePositions(
+          handle,
+          inputPath,
+          header,
+          layout,
+          positionsPath,
+        );
 
-      console.log('[info] scan 2/3 | building count tree');
-      const counts = await buildCountsTable(
-        handle,
-        inputPath,
-        header,
-        layout,
-        rootBounds,
-        args.maxDepth,
-      );
+        console.log('[info] scan 2/4 | building count tree from positions');
+        counts = await buildCountsTableFromPositionFile(
+          positionsPath,
+          header.vertexCount,
+          rootBounds,
+          args.maxDepth,
+        );
+      } finally {
+        await removeFileIfExists(positionsPath);
+      }
 
       rootNodeMeta = buildNodeTreeFromCounts(
         counts,
@@ -2204,7 +3378,7 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
         force: true,
       });
       console.log(
-        `[info] scan 3/3 | writing ${treeStats.leaves.length} leaf buckets`,
+        `[info] scan 3/4 | partitioning ${treeStats.leaves.length} leaf buckets`,
       );
       await partitionLeafBuckets(
         handle,
@@ -2217,13 +3391,16 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
       pipelineState.rootNode = serializeNodeMeta(rootNodeMeta);
       pipelineState.stage = PIPELINE_STAGE_BUCKETED;
       pipelineState.updatedAt = new Date().toISOString();
+      console.log(
+        `[info] scan 4/4 | writing ${treeStats.leaves.length} leaf buckets`,
+      );
       await fs.promises.writeFile(
         path.join(tempDir, PIPELINE_STATE_FILE),
         JSON.stringify(pipelineState),
         'utf8',
       );
     } else if (checkpointInfo.reused) {
-      console.log('[info] scan 3/3 | reusing existing leaf buckets');
+      console.log('[info] scan 4/4 | reusing existing leaf buckets');
     }
 
     await handle.close();
@@ -2243,10 +3420,14 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
       params,
       tempDir,
       nodeConcurrency: Math.max(1, args.buildConcurrency || 1),
+      leafNodeConcurrency: Math.max(1, args.buildConcurrency || 1),
       pipelineState,
       rootBounds,
       rootNode: rootNodeMeta,
       savePromise: Promise.resolve(),
+      lastPipelineStateSaveAt: Date.now(),
+      nodesSincePipelineStateSave: 0,
+      pendingHandoffCleanup: new Set(),
       buildProgress: new ConsoleProgressBar('build', treeStats.nodes.length),
     };
 
@@ -2372,4 +3553,5 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
 
 module.exports = {
   convertPartitionedPlyTo3DTiles,
+  _writeBucketGlbTaskOutput: writeBucketGlbTaskOutput,
 };
