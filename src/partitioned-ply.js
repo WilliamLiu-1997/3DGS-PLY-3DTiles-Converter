@@ -66,6 +66,7 @@ const HANDOFF_BUCKET_ENCODING = 'canonical32';
 const PARTITION_ARENA_BYTES = 4 * 1024 * 1024;
 const PARTITION_LEAF_HANDLE_LIMIT = 256;
 const PARTITION_LEAF_WRITE_CONCURRENCY = 128;
+const PARTITION_PROGRESS_ROW_INTERVAL = 8192;
 const POSITION_TMP_FILE = 'positions.tmp';
 const POSITION_ROW_BYTE_SIZE = 12;
 const POSITION_TMP_BUFFER_BYTES = 256 * 1024;
@@ -829,10 +830,15 @@ async function partitionLeafBuckets(
   layout,
   rootNode,
   tempDir,
+  options = {},
 ) {
   const touchedLeaves = [];
   const ensuredDirs = new Set();
   const leafHandles = new Map();
+  const progress = options.progress || null;
+  const totalLeafCount = Number.isInteger(options.leafCount)
+    ? options.leafCount
+    : null;
   const rowByteSize = layout.canonicalByteSize;
   const arenaByteSize = Math.max(PARTITION_ARENA_BYTES, rowByteSize);
   const arenas = [0, 1].map(() => ({
@@ -844,6 +850,27 @@ async function partitionLeafBuckets(
   }));
   let activeArenaIndex = 0;
   let flushError = null;
+  let processedRows = 0;
+
+  const progressMessage = () =>
+    totalLeafCount == null
+      ? `leaves=${touchedLeaves.length}`
+      : `leaves=${touchedLeaves.length}/${totalLeafCount}`;
+
+  const updateProgress = (force = false) => {
+    if (!progress) {
+      return;
+    }
+    if (!force && processedRows % PARTITION_PROGRESS_ROW_INTERVAL !== 0) {
+      return;
+    }
+    progress.update(processedRows, progressMessage());
+  };
+
+  const tickProgress = () => {
+    processedRows += 1;
+    updateProgress();
+  };
 
   const closeLeafHandleEntry = async (leaf, entry) => {
     leafHandles.delete(leaf);
@@ -993,6 +1020,7 @@ async function partitionLeafBuckets(
   };
 
   try {
+    updateProgress(true);
     await _forEachGaussianPlyCanonicalRecord(
       handle,
       filePath,
@@ -1006,7 +1034,12 @@ async function partitionLeafBuckets(
         if (!leaf.bucketPath) {
           leaf.bucketPath = canonicalNodePath(tempDir, LEAF_BUCKET_DIR, leaf);
         }
-        return appendLeafRow(leaf, rowBuffer);
+        const appendResult = appendLeafRow(leaf, rowBuffer);
+        if (appendResult && typeof appendResult.then === 'function') {
+          return appendResult.then(tickProgress);
+        }
+        tickProgress();
+        return null;
       },
     );
 
@@ -1021,6 +1054,7 @@ async function partitionLeafBuckets(
       ),
     );
     throwIfFlushFailed();
+    updateProgress(true);
   } finally {
     await Promise.all(
       arenas.map((arena) => arena.flushPromise).filter((promise) => !!promise),
@@ -1036,6 +1070,10 @@ async function partitionLeafBuckets(
     }
   }
   arenas.length = 0;
+  return {
+    rowCount: processedRows,
+    leafCount: touchedLeaves.length,
+  };
 }
 
 async function collectBucketEntries(fileSpecs, coeffCount) {
@@ -3420,13 +3458,24 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
       console.log(
         `[info] scan 3/4 | partitioning ${treeStats.leaves.length} leaf buckets`,
       );
-      await partitionLeafBuckets(
+      const partitionProgress = new ConsoleProgressBar(
+        'partition',
+        header.vertexCount,
+      );
+      const partitionResult = await partitionLeafBuckets(
         handle,
         inputPath,
         header,
         layout,
         rootNodeMeta,
         tempDir,
+        {
+          progress: partitionProgress,
+          leafCount: treeStats.leaves.length,
+        },
+      );
+      partitionProgress.done(
+        `rows=${partitionResult.rowCount} leaves=${partitionResult.leafCount}/${treeStats.leaves.length}`,
       );
       pipelineState.rootNode = serializeNodeMeta(rootNodeMeta);
       pipelineState.stage = PIPELINE_STAGE_BUCKETED;

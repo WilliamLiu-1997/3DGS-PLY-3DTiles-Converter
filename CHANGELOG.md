@@ -22,6 +22,7 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 - Reduced large binary PLY conversion time by staging position-only scan data, using shallow typed-array count tables, tracking bucket row counts in node metadata, overlapping handoff cleanup, prefetching binary PLY chunks, and double-buffering partition write arenas.
 - Changed the default `buildConcurrency` from `2` to `4`.
 - Reduced partition write bottlenecks by limiting active leaf file handles and writing leaf buckets with bounded concurrency.
+- Added progress reporting for the large-PLY leaf bucket partitioning scan.
 
 ### Removed
 
