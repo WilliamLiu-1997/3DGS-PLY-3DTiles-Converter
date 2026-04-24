@@ -20,6 +20,8 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 - Reduced bottom-up build overhead in the temp-file-backed pipeline by throttling checkpoint rewrites across node levels, batch-cleaning consumed handoff buckets per level, and linking leaf handoff buckets to existing leaf bucket files when possible instead of rewriting the same canonical payload.
 - Streamed unsimplified bucket-backed content directly into SPZ/GLB output with content-worker support, avoiding full `GaussianCloud` materialization when no simplification is needed.
 - Reduced large binary PLY conversion time by staging position-only scan data, using shallow typed-array count tables, tracking bucket row counts in node metadata, overlapping handoff cleanup, prefetching binary PLY chunks, and double-buffering partition write arenas.
+- Changed the default `buildConcurrency` from `2` to `4`.
+- Reduced partition write bottlenecks by limiting active leaf file handles and writing leaf buckets with bounded concurrency.
 
 ### Removed
 

@@ -64,6 +64,8 @@ const HANDOFF_BUCKET_DIR = 'handoff';
 const LEAF_BUCKET_ENCODING = 'canonical32';
 const HANDOFF_BUCKET_ENCODING = 'canonical32';
 const PARTITION_ARENA_BYTES = 4 * 1024 * 1024;
+const PARTITION_LEAF_HANDLE_LIMIT = 256;
+const PARTITION_LEAF_WRITE_CONCURRENCY = 128;
 const POSITION_TMP_FILE = 'positions.tmp';
 const POSITION_ROW_BYTE_SIZE = 12;
 const POSITION_TMP_BUFFER_BYTES = 256 * 1024;
@@ -843,19 +845,54 @@ async function partitionLeafBuckets(
   let activeArenaIndex = 0;
   let flushError = null;
 
-  const ensureLeafHandle = async (leaf) => {
-    let fh = leafHandles.get(leaf);
-    if (fh) {
-      return fh;
+  const closeLeafHandleEntry = async (leaf, entry) => {
+    leafHandles.delete(leaf);
+    await entry.fh.close();
+  };
+
+  const evictLeafHandleIfNeeded = async () => {
+    while (leafHandles.size >= PARTITION_LEAF_HANDLE_LIMIT) {
+      let evicted = false;
+      for (const [leaf, entry] of leafHandles) {
+        if (entry.active > 0) {
+          continue;
+        }
+        await closeLeafHandleEntry(leaf, entry);
+        evicted = true;
+        break;
+      }
+      if (evicted) {
+        return;
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  };
+
+  const acquireLeafHandle = async (leaf) => {
+    let entry = leafHandles.get(leaf);
+    if (entry) {
+      leafHandles.delete(leaf);
+      leafHandles.set(leaf, entry);
+      entry.active += 1;
+      return entry;
     }
     const dir = path.dirname(leaf.bucketPath);
     if (!ensuredDirs.has(dir)) {
       await fs.promises.mkdir(dir, { recursive: true });
       ensuredDirs.add(dir);
     }
-    fh = await fs.promises.open(leaf.bucketPath, 'a');
-    leafHandles.set(leaf, fh);
-    return fh;
+    await evictLeafHandleIfNeeded();
+    entry = {
+      fh: await fs.promises.open(leaf.bucketPath, 'a'),
+      active: 1,
+    };
+    leafHandles.set(leaf, entry);
+    return entry;
+  };
+
+  const releaseLeafHandle = (entry) => {
+    entry.active -= 1;
+    ensure(entry.active >= 0, 'Partition leaf handle released too many times.');
   };
 
   const touchLeaf = (leaf) => {
@@ -888,21 +925,26 @@ async function partitionLeafBuckets(
       return Promise.resolve();
     }
 
-    const writes = [];
-    for (const leaf of arena.activeLeaves) {
-      const chunks = arena.leafChunks.get(leaf);
-      if (!chunks || chunks.length === 0) {
-        continue;
-      }
-      const writePromise = leaf._partitionWriteChain.then(async () => {
-        const fh = await ensureLeafHandle(leaf);
-        await writeChunksToHandle(fh, leaf.bucketPath, chunks);
-      });
-      leaf._partitionWriteChain = writePromise;
-      writes.push(writePromise);
-    }
-
-    arena.flushPromise = Promise.all(writes)
+    arena.flushPromise = runWithConcurrency(
+      arena.activeLeaves,
+      PARTITION_LEAF_WRITE_CONCURRENCY,
+      async (leaf) => {
+        const chunks = arena.leafChunks.get(leaf);
+        if (!chunks || chunks.length === 0) {
+          return;
+        }
+        const writePromise = leaf._partitionWriteChain.then(async () => {
+          const entry = await acquireLeafHandle(leaf);
+          try {
+            await writeChunksToHandle(entry.fh, leaf.bucketPath, chunks);
+          } finally {
+            releaseLeafHandle(entry);
+          }
+        });
+        leaf._partitionWriteChain = writePromise;
+        await writePromise;
+      },
+    )
       .catch((err) => {
         if (!flushError) {
           flushError = err;
@@ -981,12 +1023,10 @@ async function partitionLeafBuckets(
     throwIfFlushFailed();
   } finally {
     await Promise.all(
-      arenas
-        .map((arena) => arena.flushPromise)
-        .filter((promise) => !!promise),
+      arenas.map((arena) => arena.flushPromise).filter((promise) => !!promise),
     );
     await Promise.all(
-      Array.from(leafHandles.values()).map((fh) => fh.close()),
+      Array.from(leafHandles.values()).map((entry) => entry.fh.close()),
     );
     leafHandles.clear();
 

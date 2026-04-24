@@ -51,7 +51,7 @@ const DEFAULT_CONVERSION_ARGS = {
   coordinate: null,
   samplingRatePerLevel: 0.5,
   sampleMode: 'merge',
-  buildConcurrency: 2,
+  buildConcurrency: 4,
   contentWorkers: 4,
   openInspector: false,
   clean: false,
