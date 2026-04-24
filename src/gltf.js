@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { ensure } = require('./parser');
+const { sourceCoordinateSystemInfo } = require('./coordinates');
 
 const GLTF_ACCESSOR_COMPONENTS = {
   SCALAR: 1,
@@ -13,20 +14,19 @@ const GLTF_ACCESSOR_COMPONENTS = {
   MAT4: 16,
 };
 
-const Y_AXIS_SOURCE_TO_GLTF_Y_UP = [
-  [1.0, 0.0, 0.0],
-  [0.0, -1.0, 0.0],
-  [0.0, 0.0, -1.0],
-];
-
 function pad4Length(length) {
   const rem = length % 4;
   return rem === 0 ? 0 : 4 - rem;
 }
 
-function padLength(length, alignment) {
-  const rem = length % alignment;
-  return rem === 0 ? 0 : alignment - rem;
+function asBufferView(data) {
+  if (Buffer.isBuffer(data)) {
+    return data;
+  }
+  if (ArrayBuffer.isView(data)) {
+    return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  }
+  return Buffer.from(data);
 }
 
 function mat4ToGltfColumnMajorList(m) {
@@ -50,24 +50,24 @@ function mat4ToGltfColumnMajorList(m) {
   ];
 }
 
-function make3DTilesGltfRootMatrix(translation) {
+function make3DTilesGltfRootMatrix(translation, sourceCoordinateSystem = null) {
   const t0 = translation[0];
   const t1 = translation[1];
   const t2 = translation[2];
-  // Many 3DGS PLY datasets that are described as "y-axis" content still use
-  // the common camera-style basis (+Y down, +Z forward). Normalize that to
-  // glTF's Y-up local space before the 3D Tiles runtime applies its standard
-  // glTF Y-up -> tile Z-up rotation.
+  const sourceInfo = sourceCoordinateSystemInfo(sourceCoordinateSystem);
+  // Normalize source PLY coordinates to glTF Y-up before the 3D Tiles runtime
+  // applies its standard glTF Y-up -> tile Z-up rotation.
+  const sourceToGltfYUp = sourceInfo.sourceToGltfYUp;
   const r = [
-    Y_AXIS_SOURCE_TO_GLTF_Y_UP[0][0],
-    Y_AXIS_SOURCE_TO_GLTF_Y_UP[0][1],
-    Y_AXIS_SOURCE_TO_GLTF_Y_UP[0][2],
-    Y_AXIS_SOURCE_TO_GLTF_Y_UP[1][0],
-    Y_AXIS_SOURCE_TO_GLTF_Y_UP[1][1],
-    Y_AXIS_SOURCE_TO_GLTF_Y_UP[1][2],
-    Y_AXIS_SOURCE_TO_GLTF_Y_UP[2][0],
-    Y_AXIS_SOURCE_TO_GLTF_Y_UP[2][1],
-    Y_AXIS_SOURCE_TO_GLTF_Y_UP[2][2],
+    sourceToGltfYUp[0][0],
+    sourceToGltfYUp[0][1],
+    sourceToGltfYUp[0][2],
+    sourceToGltfYUp[1][0],
+    sourceToGltfYUp[1][1],
+    sourceToGltfYUp[1][2],
+    sourceToGltfYUp[2][0],
+    sourceToGltfYUp[2][1],
+    sourceToGltfYUp[2][2],
   ];
   const t = [
     r[0] * t0 + r[1] * t1 + r[2] * t2,
@@ -96,6 +96,23 @@ function make3DTilesGltfRootMatrix(translation) {
   return mat4ToGltfColumnMajorList(m);
 }
 
+function writeAllBuffersSync(fd, buffers) {
+  const pending = buffers.filter((buffer) => buffer && buffer.length > 0);
+  let index = 0;
+  while (index < pending.length) {
+    const written = fs.writevSync(fd, pending.slice(index));
+    ensure(written > 0, 'Failed to write GLB output.');
+    let remaining = written;
+    while (index < pending.length && remaining >= pending[index].length) {
+      remaining -= pending[index].length;
+      index += 1;
+    }
+    if (remaining > 0 && index < pending.length) {
+      pending[index] = pending[index].subarray(remaining);
+    }
+  }
+}
+
 class GltfBuilder {
   constructor() {
     this.bufferParts = [];
@@ -110,7 +127,7 @@ class GltfBuilder {
       this.bufferParts.push(Buffer.alloc(pad));
       this.byteLength += pad;
     }
-    const buf = Buffer.from(data);
+    const buf = asBufferView(data);
     const byteOffset = this.byteLength;
     this.bufferParts.push(buf);
     this.byteLength += buf.length;
@@ -186,7 +203,7 @@ class GltfBuilder {
         accessor.max = Array.from(maxValue);
       }
       if (withBufferView) {
-        const buf = Buffer.from(u8);
+        const buf = asBufferView(u8);
         accessor.bufferView = this.addBufferView(buf);
       }
     }
@@ -204,8 +221,9 @@ class GltfBuilder {
     cloud,
     colorSpace,
     translation,
+    sourceCoordinateSystem = null,
   ) {
-    const bufferViewIndex = this.addBufferView(Buffer.from(spzBytes));
+    const bufferViewIndex = this.addBufferView(spzBytes);
     const n = cloud.length;
     const attributes = {};
 
@@ -312,7 +330,10 @@ class GltfBuilder {
       nodes: [
         {
           mesh: 0,
-          matrix: make3DTilesGltfRootMatrix(translation),
+          matrix: make3DTilesGltfRootMatrix(
+            translation,
+            sourceCoordinateSystem,
+          ),
         },
       ],
       materials: [{ extensions: { KHR_materials_unlit: {} } }],
@@ -346,36 +367,35 @@ class GltfBuilder {
     const jsonDataLength = jsonChunk.length + jsonPadLength;
 
     const totalLen = 12 + 8 + jsonDataLength + 8 + binDataLength;
-    const out = Buffer.alloc(totalLen);
-    out.write('glTF', 0, 'ascii');
-    out.writeUInt32LE(2, 4);
-    out.writeUInt32LE(totalLen, 8);
-    out.writeUInt32LE(jsonDataLength, 12);
-    out.write('JSON', 16, 'ascii');
-
-    const jsonOffset = 20;
-    jsonChunk.copy(out, jsonOffset);
-    if (jsonPadLength > 0) {
-      out.fill(
-        0x20,
-        jsonOffset + jsonChunk.length,
-        jsonOffset + jsonDataLength,
-      );
-    }
-
-    const binHeaderOffset = jsonOffset + jsonDataLength;
-    out.writeUInt32LE(binDataLength, binHeaderOffset);
-    out.write('BIN', binHeaderOffset + 4, 'ascii');
-    out[binHeaderOffset + 7] = 0x00;
-
-    let binOffset = binHeaderOffset + 8;
-    for (const part of this.bufferParts) {
-      part.copy(out, binOffset);
-      binOffset += part.length;
-    }
-
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.writeFileSync(filePath, out);
+    const fd = fs.openSync(filePath, 'w');
+    try {
+      const glbHeader = Buffer.allocUnsafe(12);
+      glbHeader.write('glTF', 0, 'ascii');
+      glbHeader.writeUInt32LE(2, 4);
+      glbHeader.writeUInt32LE(totalLen, 8);
+
+      const jsonHeader = Buffer.allocUnsafe(8);
+      jsonHeader.writeUInt32LE(jsonDataLength, 0);
+      jsonHeader.write('JSON', 4, 'ascii');
+
+      const binHeader = Buffer.allocUnsafe(8);
+      binHeader.writeUInt32LE(binDataLength, 0);
+      binHeader.write('BIN', 4, 'ascii');
+      binHeader[7] = 0x00;
+
+      const chunks = [glbHeader, jsonHeader, jsonChunk];
+      if (jsonPadLength > 0) {
+        chunks.push(Buffer.alloc(jsonPadLength, 0x20));
+      }
+      chunks.push(binHeader, ...this.bufferParts);
+      if (binPadLength > 0) {
+        chunks.push(Buffer.alloc(binPadLength));
+      }
+      writeAllBuffersSync(fd, chunks);
+    } finally {
+      fs.closeSync(fd);
+    }
   }
 }
 

@@ -1,3 +1,6 @@
 
 *.ply
 out_tiles/
+out_tiles1/
+node_modules/
+dist/

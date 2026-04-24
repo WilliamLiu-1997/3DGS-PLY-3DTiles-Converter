@@ -2,8 +2,7 @@ const { ConversionError } = require('./parser');
 
 const WGS84_SEMI_MAJOR_AXIS = 6378137.0;
 const WGS84_FLATTENING = 1.0 / 298.257223563;
-const WGS84_ECCENTRICITY_SQUARED =
-  WGS84_FLATTENING * (2.0 - WGS84_FLATTENING);
+const WGS84_ECCENTRICITY_SQUARED = WGS84_FLATTENING * (2.0 - WGS84_FLATTENING);
 
 function usage() {
   return [
@@ -16,19 +15,20 @@ function usage() {
     '  --color-space <lin_rec709_display|srgb_rec709_display>',
     '  --max-depth <int>',
     '  --leaf-limit <int>',
-    '  --tiling-mode <explicit|implicit>',
-    '  --subtree-levels <int>',
     '  --min-geometric-error <number>',
     '  --spz-sh1-bits <1..8>',
     '  --spz-sh-rest-bits <1..8>',
+    '  --spz-compression-level <0..9>',
     '  --transform <json_matrix4>',
     '  --coordinate <json_[lat,long,height]>',
     '  --sampling-rate-per-level <0..1]',
     '  --sample-mode <sample|merge>',
-    '  --content-workers <0+>',
+    '  --memory-budget <gb>',
+    '  --obb / --aabb',
+    '  --open-inspector / --no-open-inspector',
     '  --self-test',
     '  --self-test-count <int>',
-    '  --clean',
+    '  --clean / --continue',
     '  --help',
   ].join('\n');
 }
@@ -39,21 +39,22 @@ const DEFAULT_CONVERSION_ARGS = {
   inputConvention: 'graphdeco',
   linearScaleInput: false,
   colorSpace: 'srgb_rec709_display',
-  maxDepth: 4,
-  leafLimit: 10000,
-  tilingMode: 'explicit',
-  subtreeLevels: 2,
+  maxDepth: 8,
+  leafLimit: 100,
   minGeometricError: null,
   spzSh1Bits: 8,
   spzShRestBits: 8,
+  spzCompressionLevel: 8,
   transform: null,
   coordinate: null,
   samplingRatePerLevel: 0.5,
   sampleMode: 'merge',
-  contentWorkers: 4,
-  clean: false,
+  memoryBudget: 2,
+  orientedBoundingBoxes: true,
+  openInspector: true,
+  clean: true,
   selfTest: false,
-  selfTestCount: 6000,
+  selfTestCount: 1000000,
   help: false,
 };
 
@@ -288,20 +289,27 @@ function validateConversionArgs(args, { requireInput = false } = {}) {
   if (args.leafLimit < 1) {
     throw new ConversionError('--leaf-limit must be >= 1');
   }
-  if (args.subtreeLevels < 1) {
-    throw new ConversionError('--subtree-levels must be >= 1');
-  }
   if (args.spzSh1Bits < 1 || args.spzSh1Bits > 8) {
     throw new ConversionError('--spz-sh1-bits must be in [1, 8]');
   }
   if (args.spzShRestBits < 1 || args.spzShRestBits > 8) {
     throw new ConversionError('--spz-sh-rest-bits must be in [1, 8]');
   }
+  if (
+    !Number.isInteger(args.spzCompressionLevel) ||
+    args.spzCompressionLevel < 0 ||
+    args.spzCompressionLevel > 9
+  ) {
+    throw new ConversionError('--spz-compression-level must be in [0, 9]');
+  }
   if (args.samplingRatePerLevel <= 0.0 || args.samplingRatePerLevel > 1.0) {
     throw new ConversionError('--sampling-rate-per-level must be in (0, 1]');
   }
-  if (args.contentWorkers < 0) {
-    throw new ConversionError('--content-workers must be >= 0');
+  if (!Number.isFinite(args.memoryBudget) || args.memoryBudget <= 0.0) {
+    throw new ConversionError('--memory-budget must be > 0 GB');
+  }
+  if (typeof args.orientedBoundingBoxes !== 'boolean') {
+    throw new ConversionError('--obb / --aabb must normalize to boolean');
   }
 
   assertChoice(
@@ -314,7 +322,6 @@ function validateConversionArgs(args, { requireInput = false } = {}) {
     ['lin_rec709_display', 'srgb_rec709_display'],
     '--color-space',
   );
-  assertChoice(args.tilingMode, ['explicit', 'implicit'], '--tiling-mode');
   assertChoice(args.sampleMode, ['sample', 'merge'], '--sample-mode');
   if (args.transform !== null) {
     if (!Array.isArray(args.transform) || args.transform.length !== 16) {
@@ -388,21 +395,6 @@ function parseArgs(argv) {
       args.leafLimit = value;
       continue;
     }
-    if (token === '--tiling-mode') {
-      args.tilingMode = requireValue(token);
-      continue;
-    }
-    if (token === '--subtree-levels') {
-      const raw = requireValue(token);
-      const value = Number.parseInt(raw, 10);
-      if (!Number.isInteger(value)) {
-        throw new ConversionError(
-          `Invalid integer for --subtree-levels: ${raw}`,
-        );
-      }
-      args.subtreeLevels = value;
-      continue;
-    }
     if (token === '--min-geometric-error') {
       const raw = requireValue(token);
       const value = Number.parseFloat(raw);
@@ -434,10 +426,16 @@ function parseArgs(argv) {
       args.spzShRestBits = value;
       continue;
     }
-    if (token === '--source-up-axis') {
-      throw new ConversionError(
-        '--source-up-axis has been removed. The converter now always uses the built-in y normalization path.',
-      );
+    if (token === '--spz-compression-level') {
+      const raw = requireValue(token);
+      const value = Number.parseInt(raw, 10);
+      if (!Number.isInteger(value)) {
+        throw new ConversionError(
+          `Invalid integer for --spz-compression-level: ${raw}`,
+        );
+      }
+      args.spzCompressionLevel = value;
+      continue;
     }
     if (token === '--transform') {
       args.transform = requireValue(token);
@@ -462,15 +460,29 @@ function parseArgs(argv) {
       args.sampleMode = requireValue(token);
       continue;
     }
-    if (token === '--content-workers') {
+    if (token === '--memory-budget') {
       const raw = requireValue(token);
-      const value = Number.parseInt(raw, 10);
-      if (!Number.isInteger(value)) {
-        throw new ConversionError(
-          `Invalid integer for --content-workers: ${raw}`,
-        );
+      const value = Number.parseFloat(raw);
+      if (!Number.isFinite(value)) {
+        throw new ConversionError(`Invalid number for --memory-budget: ${raw}`);
       }
-      args.contentWorkers = value;
+      args.memoryBudget = value;
+      continue;
+    }
+    if (token === '--obb') {
+      args.orientedBoundingBoxes = true;
+      continue;
+    }
+    if (token === '--aabb') {
+      args.orientedBoundingBoxes = false;
+      continue;
+    }
+    if (token === '--open-inspector') {
+      args.openInspector = true;
+      continue;
+    }
+    if (token === '--no-open-inspector') {
+      args.openInspector = false;
       continue;
     }
     if (token === '--self-test') {
@@ -490,6 +502,10 @@ function parseArgs(argv) {
     }
     if (token === '--clean') {
       args.clean = true;
+      continue;
+    }
+    if (token === '--continue') {
+      args.clean = false;
       continue;
     }
     if (token.startsWith('--')) {
@@ -558,15 +574,17 @@ function makeConversionArgs(
       'Please provide either transform or coordinate, not both.',
     );
   }
-  if (
-    Object.prototype.hasOwnProperty.call(options, 'sourceUpAxis') ||
-    Object.prototype.hasOwnProperty.call(options, 'source-up-axis') ||
-    Object.prototype.hasOwnProperty.call(options, 'source_up_axis')
-  ) {
-    throw new ConversionError(
-      'sourceUpAxis / --source-up-axis has been removed. The converter now always uses the built-in y normalization path.',
-    );
-  }
+
+  const noOpenInspector = firstDefined(
+    options.noOpenInspector,
+    options['no-open-inspector'],
+    options.no_open_inspector,
+  );
+  const continueRequested = firstDefined(
+    options['continue'],
+    options.continueBuild,
+    options.continue_build,
+  );
 
   const merged = {
     ...DEFAULT_CONVERSION_ARGS,
@@ -619,21 +637,6 @@ function makeConversionArgs(
       ),
       '--leaf-limit',
     ),
-    tilingMode: firstDefined(
-      options.tilingMode,
-      options['tiling-mode'],
-      options.tiling_mode,
-      DEFAULT_CONVERSION_ARGS.tilingMode,
-    ),
-    subtreeLevels: normalizeToInt(
-      firstDefined(
-        options.subtreeLevels,
-        options['subtree-levels'],
-        options.subtree_levels,
-        DEFAULT_CONVERSION_ARGS.subtreeLevels,
-      ),
-      '--subtree-levels',
-    ),
     minGeometricError: firstDefined(
       options.minGeometricError,
       options['min-geometric-error'],
@@ -658,6 +661,15 @@ function makeConversionArgs(
       ),
       '--spz-sh-rest-bits',
     ),
+    spzCompressionLevel: normalizeToInt(
+      firstDefined(
+        options.spzCompressionLevel,
+        options['spz-compression-level'],
+        options.spz_compression_level,
+        DEFAULT_CONVERSION_ARGS.spzCompressionLevel,
+      ),
+      '--spz-compression-level',
+    ),
     coordinate: normalizeCoordinate(rawCoordinate, 'coordinate'),
     transform: null,
     samplingRatePerLevel: normalizeToFloat(
@@ -675,16 +687,39 @@ function makeConversionArgs(
       options.sample_mode,
       DEFAULT_CONVERSION_ARGS.sampleMode,
     ),
-    contentWorkers: normalizeToInt(
+    memoryBudget: normalizeToFloat(
       firstDefined(
-        options.contentWorkers,
-        options['content-workers'],
-        options.content_workers,
-        DEFAULT_CONVERSION_ARGS.contentWorkers,
+        options.memoryBudget,
+        options['memory-budget'],
+        options.memory_budget,
+        options.memoryBudgetGb,
+        options.memory_budget_gb,
+        DEFAULT_CONVERSION_ARGS.memoryBudget,
       ),
-      '--content-workers',
+      '--memory-budget',
     ),
-    clean: firstDefined(options.clean, DEFAULT_CONVERSION_ARGS.clean),
+    orientedBoundingBoxes: firstDefined(
+      options.orientedBoundingBoxes,
+      options['oriented-bounding-boxes'],
+      options.oriented_bounding_boxes,
+      options.obb,
+      options.useObb,
+      options.use_obb,
+      DEFAULT_CONVERSION_ARGS.orientedBoundingBoxes,
+    ),
+    openInspector:
+      noOpenInspector === true
+        ? false
+        : firstDefined(
+            options.openInspector,
+            options['open-inspector'],
+            options.open_inspector,
+            DEFAULT_CONVERSION_ARGS.openInspector,
+          ),
+    clean:
+      continueRequested === true
+        ? false
+        : firstDefined(options.clean, DEFAULT_CONVERSION_ARGS.clean),
     selfTest: firstDefined(
       options.selfTest,
       options['self-test'],
@@ -705,6 +740,20 @@ function makeConversionArgs(
       DEFAULT_CONVERSION_ARGS.help,
     ),
   };
+  delete merged.sourceUpAxis;
+  delete merged['source-up-axis'];
+  delete merged.source_up_axis;
+  delete merged.sourceCoordinateSystem;
+  delete merged.source_coordinate_system;
+  delete merged['source-coordinate-system'];
+  delete merged.resolvedSourceCoordinateSystem;
+  delete merged.resolved_source_coordinate_system;
+  delete merged.buildConcurrency;
+  delete merged['build-concurrency'];
+  delete merged.build_concurrency;
+  delete merged.contentWorkers;
+  delete merged['content-workers'];
+  delete merged.content_workers;
 
   merged.transform =
     merged.coordinate != null

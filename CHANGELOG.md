@@ -6,6 +6,32 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+### Added
+
+- Added a temp-file-backed large-PLY conversion pipeline for binary and ASCII input. The pipeline streams input into canonical leaf and handoff buckets, builds parent LODs from handoff data, removes successful temp workspaces, and can resume a preserved failed workspace with `--continue`.
+- Added `memoryBudget` / `--memory-budget` to size scan buffers, partition arenas, simplify scratch space, partition write concurrency, bottom-up build concurrency, and SPZ/GLB worker count from one GB-based budget.
+- Added `spzCompressionLevel` / `--spz-compression-level` to control the gzip compression level used for SPZ payloads.
+- Added root-PCA oriented bounding boxes by default, plus `orientedBoundingBoxes` and `--obb` / `--aabb` controls to switch emitted 3D Tiles `box` bounds and k-d split planes between OBB and AABB modes.
+- Added optional local inspection through `3dtiles-inspector`, controlled by `openInspector` and `--open-inspector` / `--no-open-inspector`.
+- Added build diagnostics to `build_summary.json`, including handoff encoding, memory budget plan, derived concurrency, checkpoint reuse state, timings, peak RSS, k-d tiling metadata, OBB mode, virtual node count, and SPZ compression level.
+- Added automatic source coordinate-system detection from PLY header comments, including projected/geospatial metadata such as `epsg` and `offset*`, with the resolved source frame recorded in `build_summary.json`.
+
+### Changed
+
+- Replaced the in-memory octree build path with a single explicit, visual-cost-balanced k-d tree pipeline that uses root PCA axes by default and keeps leaf buckets balanced by weighted splat count.
+- Replaced long, thin non-root k-d tiles with equal-length virtual segment paths so emitted intermediate tiles avoid extreme aspect ratios while logical LOD depth remains bounded by `maxDepth`.
+- Changed defaults: `maxDepth` is now `8`, `leafLimit` is now `100`, SPZ gzip compression level is now `8`, `clean` is now `true`, `selfTestCount` is now `1000000`, and inspector launch is enabled by default.
+- Changed resume semantics so the default conversion rebuilds from a clean output directory; use `--continue` or `clean: false` to reuse a preserved checkpoint.
+- Updated voxel simplification so retained splat targets drive voxel grouping directly and representative selection stays coarse-biased across `sample` and `merge` modes.
+- Improved large-file conversion throughput by staging position data when it fits the memory budget, prefetching binary PLY chunks, compacting partition writes, limiting active leaf file handles, batching GLB writes, streaming unsimplified bucket content directly to SPZ/GLB output, and running exact bucket simplification and content packing in the derived worker pool.
+- Changed progress reporting to concise spinner-style status lines with throttled phase detail logs.
+
+### Removed
+
+- Removed implicit tiling output and the `tilingMode` / `--tiling-mode` and `subtreeLevels` / `--subtree-levels` options.
+- Removed `buildConcurrency` / `--build-concurrency` and `contentWorkers` / `--content-workers`; conversion now derives internal concurrency from `memoryBudget`.
+- Reduced the published package API to the supported `convert` entry point only, removing package-root helper exports such as `convertPlyTo3DTiles`, `convertCloud`, `parseCommonGaussianPly`, `makeConversionArgs`, and `run`, plus the package `./cli` export.
+
 ## [0.1.6] - 2026-04-19
 
 ### Added

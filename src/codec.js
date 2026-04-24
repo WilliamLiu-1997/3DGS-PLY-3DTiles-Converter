@@ -7,6 +7,18 @@ const SPZ_MAGIC = 0x5053474e;
 const SPZ_STREAM_VERSION = 3;
 const SPZ_FRACTIONAL_BITS = 12;
 const SPZ_FIXED24_LIMIT = (1 << 23) - 1;
+const SPZ_HEADER_BYTES = 16;
+const DEFAULT_SPZ_COMPRESSION_LEVEL = 8;
+const GZIP_SPZ_OPTIONS = { level: DEFAULT_SPZ_COMPRESSION_LEVEL, memLevel: 9 };
+
+function firstDefined(...values) {
+  for (const value of values) {
+    if (value !== undefined) {
+      return value;
+    }
+  }
+  return undefined;
+}
 
 function spzExtraDimForDegree(degree) {
   const mapping = { 0: 0, 1: 3, 2: 8, 3: 15 };
@@ -14,6 +26,158 @@ function spzExtraDimForDegree(degree) {
     throw new ConversionError(`SPZ v3 supports degree up to 3, got ${degree}.`);
   }
   return mapping[degree];
+}
+
+function validateSpzQuantBits(sh1Bits, shRestBits) {
+  if (
+    !Number.isInteger(sh1Bits) ||
+    !Number.isInteger(shRestBits) ||
+    sh1Bits < 1 ||
+    sh1Bits > 8 ||
+    shRestBits < 1 ||
+    shRestBits > 8
+  ) {
+    throw new ConversionError('SPZ SH quant bits must be in [1, 8].');
+  }
+}
+
+function validateSpzCompressionLevel(level) {
+  if (!Number.isInteger(level) || level < 0 || level > 9) {
+    throw new ConversionError('SPZ compression level must be in [0, 9].');
+  }
+}
+
+function resolveSpzCompressionLevel(options = {}) {
+  options = options || {};
+  const rawLevel = firstDefined(
+    options.level,
+    options.compressionLevel,
+    options.spzCompressionLevel,
+    DEFAULT_SPZ_COMPRESSION_LEVEL,
+  );
+  const level =
+    typeof rawLevel === 'number' && Number.isFinite(rawLevel)
+      ? Math.trunc(rawLevel)
+      : Number.parseInt(String(rawLevel), 10);
+  validateSpzCompressionLevel(level);
+  return level;
+}
+
+function spzCoeffCountForDegree(shDegree) {
+  return 1 + spzExtraDimForDegree(shDegree);
+}
+
+function validateSpzCoeffCount(shDegree, coeffCount) {
+  const expected = spzCoeffCountForDegree(shDegree);
+  ensure(
+    coeffCount === expected,
+    `SPZ coefficient mismatch with degree=${shDegree}; cloud=${coeffCount}.`,
+  );
+}
+
+function spzBytesPerPoint(coeffCount) {
+  return 9 + 1 + 3 + 3 + 4 + (coeffCount > 1 ? (coeffCount - 1) * 3 : 0);
+}
+
+function makeSpzPacketLayout(pointCount, coeffCount) {
+  const bytesPerPoint = spzBytesPerPoint(coeffCount);
+  const positionsOffset = SPZ_HEADER_BYTES;
+  const opacityOffset = positionsOffset + pointCount * 9;
+  const colorOffset = opacityOffset + pointCount;
+  const scaleOffset = colorOffset + pointCount * 3;
+  const quatOffset = scaleOffset + pointCount * 3;
+  const extraShOffset = quatOffset + pointCount * 4;
+  const extraBytesPerPoint = coeffCount > 1 ? (coeffCount - 1) * 3 : 0;
+  return {
+    packet: Buffer.allocUnsafe(SPZ_HEADER_BYTES + pointCount * bytesPerPoint),
+    bytesPerPoint,
+    positionsOffset,
+    opacityOffset,
+    colorOffset,
+    scaleOffset,
+    quatOffset,
+    extraShOffset,
+    extraBytesPerPoint,
+  };
+}
+
+function writeSpzPacketHeader(packet, pointCount, shDegree) {
+  packet.writeUInt32LE(SPZ_MAGIC, 0);
+  packet.writeUInt32LE(SPZ_STREAM_VERSION, 4);
+  packet.writeUInt32LE(pointCount, 8);
+  packet[12] = shDegree;
+  packet[13] = SPZ_FRACTIONAL_BITS;
+  packet[14] = 0;
+  packet[15] = 0;
+}
+
+function writeFixed24Into(out, outOff, fixed) {
+  out[outOff + 0] = fixed & 0xff;
+  out[outOff + 1] = (fixed >>> 8) & 0xff;
+  out[outOff + 2] = (fixed >>> 16) & 0xff;
+}
+
+function quantizeSpzPosition(localValue) {
+  const fixed = roundHalfToEven(localValue * (1 << SPZ_FRACTIONAL_BITS));
+  ensure(
+    Math.abs(fixed) <= SPZ_FIXED24_LIMIT,
+    'Tile local coordinates exceed SPZ 24-bit fixed-point range.',
+  );
+  return fixed;
+}
+
+function quantizeSpzOpacity(opacity) {
+  return Math.max(
+    0,
+    Math.min(
+      255,
+      roundHalfToEven(Math.min(1.0, Math.max(0.0, opacity)) * 255.0),
+    ),
+  );
+}
+
+function quantizeSpzColor(coeff) {
+  return clamp(
+    roundHalfToEven(coeff * SPZ_COLOR_SCALE * 255.0 + 0.5 * 255.0),
+    0,
+    255,
+  );
+}
+
+function quantizeSpzScale(scaleLog) {
+  return clamp(roundHalfToEven((scaleLog + 10.0) * 16.0), 0, 255);
+}
+
+function makeSpzShQuantBuckets(coeffCount, sh1Bits, shRestBits) {
+  validateSpzQuantBits(sh1Bits, shRestBits);
+  const buckets = new Uint8Array(coeffCount);
+  const halfBuckets = new Float64Array(coeffCount);
+  const invBuckets = new Float64Array(coeffCount);
+  for (let coeff = 1; coeff < coeffCount; coeff++) {
+    const bits = coeff <= 3 ? sh1Bits : shRestBits;
+    const bucket = 1 << (8 - bits);
+    buckets[coeff] = bucket;
+    halfBuckets[coeff] = bucket / 2.0;
+    invBuckets[coeff] = 1.0 / bucket;
+  }
+  return { buckets, halfBuckets, invBuckets };
+}
+
+function quantizeSpzExtraSh(coeff, bucket, halfBucket, invBucket) {
+  const q = roundHalfToEven(coeff * 128.0 + 128.0);
+  return clamp(Math.floor((q + halfBucket) * invBucket) * bucket, 0, 255);
+}
+
+function gzipSpzPacket(packet, byteLength = packet.length, options = {}) {
+  if (byteLength && typeof byteLength === 'object') {
+    options = byteLength;
+    byteLength = packet.length;
+  }
+  const level = resolveSpzCompressionLevel(options);
+  return zlib.gzipSync(packet.subarray(0, byteLength), {
+    ...GZIP_SPZ_OPTIONS,
+    level,
+  });
 }
 
 const SQRT_HALF = Math.sqrt(0.5);
@@ -55,15 +219,38 @@ function packQuaternionSmallestThreeInto(quats, idx, out, outOff) {
   if (aw > lv) {
     largest = 3;
   }
-  const vals = [x, y, z, w];
-  const negate = vals[largest] < 0.0;
+  const negate =
+    largest === 0 ? x < 0.0 :
+    largest === 1 ? y < 0.0 :
+    largest === 2 ? z < 0.0 :
+    w < 0.0;
   let comp = largest;
-  const invS = SQRT_HALF;
-  for (let i = 0; i < 4; i++) {
-    if (i === largest) continue;
-    const v = vals[i];
+
+  if (largest !== 0) {
+    const v = x;
     const negbit = (v < 0.0) ^ negate ? 1 : 0;
-    let mag = Math.floor(MAG_SCALE * (Math.abs(v) / invS) + 0.5);
+    let mag = Math.floor(MAG_SCALE * (Math.abs(v) / SQRT_HALF) + 0.5);
+    if (mag > MAG_SCALE) mag = MAG_SCALE;
+    comp = (comp << 10) | (negbit << 9) | mag;
+  }
+  if (largest !== 1) {
+    const v = y;
+    const negbit = (v < 0.0) ^ negate ? 1 : 0;
+    let mag = Math.floor(MAG_SCALE * (Math.abs(v) / SQRT_HALF) + 0.5);
+    if (mag > MAG_SCALE) mag = MAG_SCALE;
+    comp = (comp << 10) | (negbit << 9) | mag;
+  }
+  if (largest !== 2) {
+    const v = z;
+    const negbit = (v < 0.0) ^ negate ? 1 : 0;
+    let mag = Math.floor(MAG_SCALE * (Math.abs(v) / SQRT_HALF) + 0.5);
+    if (mag > MAG_SCALE) mag = MAG_SCALE;
+    comp = (comp << 10) | (negbit << 9) | mag;
+  }
+  if (largest !== 3) {
+    const v = w;
+    const negbit = (v < 0.0) ^ negate ? 1 : 0;
+    let mag = Math.floor(MAG_SCALE * (Math.abs(v) / SQRT_HALF) + 0.5);
     if (mag > MAG_SCALE) mag = MAG_SCALE;
     comp = (comp << 10) | (negbit << 9) | mag;
   }
@@ -73,190 +260,98 @@ function packQuaternionSmallestThreeInto(quats, idx, out, outOff) {
   out[outOff + 3] = (comp >>> 24) & 0xff;
 }
 
-function packCloudToSpz(cloudLocal, sh1Bits, shRestBits, translation = null) {
-  if (
-    !Number.isInteger(sh1Bits) ||
-    !Number.isInteger(shRestBits) ||
-    sh1Bits < 1 ||
-    sh1Bits > 8 ||
-    shRestBits < 1 ||
-    shRestBits > 8
-  ) {
-    throw new ConversionError('SPZ SH quant bits must be in [1, 8].');
-  }
+function packCloudToSpz(
+  cloudLocal,
+  sh1Bits,
+  shRestBits,
+  translation = null,
+  options = {},
+) {
+  validateSpzQuantBits(sh1Bits, shRestBits);
 
   const n = cloudLocal.length;
-  const extra = spzExtraDimForDegree(cloudLocal.shDegree);
-  const expected = 1 + extra;
   const coeffCount = cloudLocal.shCoeffs.length / (n * 3);
-  ensure(
-    coeffCount === expected,
-    `SPZ coefficient mismatch with degree=${cloudLocal.shDegree}; cloud=${coeffCount}.`,
-  );
+  validateSpzCoeffCount(cloudLocal.shDegree, coeffCount);
 
-  // Pre-allocate payload buffer: positions(9) + alpha(1) + color(3) + scale(3) + quat(4) + extra SH
-  const bytesPerPoint =
-    9 + 1 + 3 + 3 + 4 + (extra > 0 ? (coeffCount - 1) * 3 : 0);
-  const payload = new Uint8Array(n * bytesPerPoint);
-  let off = 0;
+  const extra = coeffCount - 1;
+  const layout = makeSpzPacketLayout(n, coeffCount);
+  const { packet } = layout;
   const tx = translation ? translation[0] : 0.0;
   const ty = translation ? translation[1] : 0.0;
   const tz = translation ? translation[2] : 0.0;
+  const shBuckets =
+    extra > 0 ? makeSpzShQuantBuckets(coeffCount, sh1Bits, shRestBits) : null;
 
-  const scale = 1 << SPZ_FRACTIONAL_BITS;
   for (let i = 0; i < n; i++) {
     const i3 = i * 3;
+    const pointBase = i * coeffCount * 3;
+
     const localX = translation
       ? Math.fround(cloudLocal.positions[i3 + 0] - tx)
       : cloudLocal.positions[i3 + 0];
-    const fixedX = roundHalfToEven(localX * scale);
-    ensure(
-      Math.abs(fixedX) <= SPZ_FIXED24_LIMIT,
-      'Tile local coordinates exceed SPZ 24-bit fixed-point range.',
-    );
-    payload[off++] = fixedX & 0xff;
-    payload[off++] = (fixedX >>> 8) & 0xff;
-    payload[off++] = (fixedX >>> 16) & 0xff;
+    const posBase = layout.positionsOffset + i * 9;
+    writeFixed24Into(packet, posBase + 0, quantizeSpzPosition(localX));
 
     const localY = translation
       ? Math.fround(cloudLocal.positions[i3 + 1] - ty)
       : cloudLocal.positions[i3 + 1];
-    const fixedY = roundHalfToEven(localY * scale);
-    ensure(
-      Math.abs(fixedY) <= SPZ_FIXED24_LIMIT,
-      'Tile local coordinates exceed SPZ 24-bit fixed-point range.',
-    );
-    payload[off++] = fixedY & 0xff;
-    payload[off++] = (fixedY >>> 8) & 0xff;
-    payload[off++] = (fixedY >>> 16) & 0xff;
+    writeFixed24Into(packet, posBase + 3, quantizeSpzPosition(localY));
 
     const localZ = translation
       ? Math.fround(cloudLocal.positions[i3 + 2] - tz)
       : cloudLocal.positions[i3 + 2];
-    const fixedZ = roundHalfToEven(localZ * scale);
-    ensure(
-      Math.abs(fixedZ) <= SPZ_FIXED24_LIMIT,
-      'Tile local coordinates exceed SPZ 24-bit fixed-point range.',
-    );
-    payload[off++] = fixedZ & 0xff;
-    payload[off++] = (fixedZ >>> 8) & 0xff;
-    payload[off++] = (fixedZ >>> 16) & 0xff;
-  }
+    writeFixed24Into(packet, posBase + 6, quantizeSpzPosition(localZ));
 
-  for (let i = 0; i < n; i++) {
-    payload[off++] = Math.max(
-      0,
-      Math.min(
-        255,
-        roundHalfToEven(
-          Math.min(1.0, Math.max(0.0, cloudLocal.opacity[i])) * 255.0,
-        ),
-      ),
-    );
-  }
+    packet[layout.opacityOffset + i] = quantizeSpzOpacity(cloudLocal.opacity[i]);
 
-  const colorScale255 = SPZ_COLOR_SCALE * 255.0;
-  const half255 = 0.5 * 255.0;
-  for (let i = 0; i < n; i++) {
-    const pointBase = i * coeffCount * 3;
-    payload[off++] = clamp(
-      roundHalfToEven(
-        cloudLocal.shCoeffs[pointBase + 0] * colorScale255 + half255,
-      ),
-      0,
-      255,
-    );
-    payload[off++] = clamp(
-      roundHalfToEven(
-        cloudLocal.shCoeffs[pointBase + 1] * colorScale255 + half255,
-      ),
-      0,
-      255,
-    );
-    payload[off++] = clamp(
-      roundHalfToEven(
-        cloudLocal.shCoeffs[pointBase + 2] * colorScale255 + half255,
-      ),
-      0,
-      255,
-    );
-  }
+    const colorBase = layout.colorOffset + i * 3;
+    packet[colorBase + 0] = quantizeSpzColor(cloudLocal.shCoeffs[pointBase + 0]);
+    packet[colorBase + 1] = quantizeSpzColor(cloudLocal.shCoeffs[pointBase + 1]);
+    packet[colorBase + 2] = quantizeSpzColor(cloudLocal.shCoeffs[pointBase + 2]);
 
-  for (let i = 0; i < n; i++) {
-    const i3 = i * 3;
-    payload[off++] = clamp(
-      roundHalfToEven((cloudLocal.scaleLog[i3 + 0] + 10.0) * 16.0),
-      0,
-      255,
-    );
-    payload[off++] = clamp(
-      roundHalfToEven((cloudLocal.scaleLog[i3 + 1] + 10.0) * 16.0),
-      0,
-      255,
-    );
-    payload[off++] = clamp(
-      roundHalfToEven((cloudLocal.scaleLog[i3 + 2] + 10.0) * 16.0),
-      0,
-      255,
-    );
-  }
+    const scaleBase = layout.scaleOffset + i * 3;
+    packet[scaleBase + 0] = quantizeSpzScale(cloudLocal.scaleLog[i3 + 0]);
+    packet[scaleBase + 1] = quantizeSpzScale(cloudLocal.scaleLog[i3 + 1]);
+    packet[scaleBase + 2] = quantizeSpzScale(cloudLocal.scaleLog[i3 + 2]);
 
-  for (let i = 0; i < n; i++) {
-    packQuaternionSmallestThreeInto(cloudLocal.quatsXYZW, i, payload, off);
-    off += 4;
-  }
+    packQuaternionSmallestThreeInto(
+      cloudLocal.quatsXYZW,
+      i,
+      packet,
+      layout.quatOffset + i * 4,
+    );
 
-  if (extra > 0) {
-    // Pre-compute bucket values per coefficient index
-    const buckets = new Uint8Array(coeffCount);
-    const halfBuckets = new Float64Array(coeffCount);
-    const invBuckets = new Float64Array(coeffCount);
-    for (let coeff = 1; coeff < coeffCount; coeff++) {
-      const bits = coeff <= 3 ? sh1Bits : shRestBits;
-      const b = 1 << (8 - bits);
-      buckets[coeff] = b;
-      halfBuckets[coeff] = b / 2.0;
-      invBuckets[coeff] = 1.0 / b;
-    }
-    for (let i = 0; i < n; i++) {
-      const pointBase = i * coeffCount * 3;
+    if (extra > 0) {
+      let shBase = layout.extraShOffset + i * layout.extraBytesPerPoint;
       for (let coeff = 1; coeff < coeffCount; coeff++) {
-        const bkt = buckets[coeff];
-        const hb = halfBuckets[coeff];
-        const ib = invBuckets[coeff];
+        const bkt = shBuckets.buckets[coeff];
+        const hb = shBuckets.halfBuckets[coeff];
+        const ib = shBuckets.invBuckets[coeff];
         const coeffBase = pointBase + coeff * 3;
-        const q0 = roundHalfToEven(
-          cloudLocal.shCoeffs[coeffBase + 0] * 128.0 + 128.0,
+        packet[shBase++] = quantizeSpzExtraSh(
+          cloudLocal.shCoeffs[coeffBase + 0],
+          bkt,
+          hb,
+          ib,
         );
-        const q1 = roundHalfToEven(
-          cloudLocal.shCoeffs[coeffBase + 1] * 128.0 + 128.0,
+        packet[shBase++] = quantizeSpzExtraSh(
+          cloudLocal.shCoeffs[coeffBase + 1],
+          bkt,
+          hb,
+          ib,
         );
-        const q2 = roundHalfToEven(
-          cloudLocal.shCoeffs[coeffBase + 2] * 128.0 + 128.0,
+        packet[shBase++] = quantizeSpzExtraSh(
+          cloudLocal.shCoeffs[coeffBase + 2],
+          bkt,
+          hb,
+          ib,
         );
-        payload[off++] = clamp(Math.floor((q0 + hb) * ib) * bkt, 0, 255);
-        payload[off++] = clamp(Math.floor((q1 + hb) * ib) * bkt, 0, 255);
-        payload[off++] = clamp(Math.floor((q2 + hb) * ib) * bkt, 0, 255);
       }
     }
   }
 
-  const header = Buffer.alloc(13);
-  header.writeUInt32LE(SPZ_MAGIC, 0);
-  header.writeUInt32LE(SPZ_STREAM_VERSION, 4);
-  header.writeUInt32LE(n, 8);
-  header[12] = cloudLocal.shDegree;
-  const tail = Buffer.from([SPZ_FRACTIONAL_BITS, 0, 0]);
-  return zlib.gzipSync(
-    Buffer.concat([
-      header,
-      tail,
-      Buffer.from(payload.buffer, payload.byteOffset, off),
-    ]),
-    {
-      level: 9,
-    },
-  );
+  writeSpzPacketHeader(packet, n, cloudLocal.shDegree);
+  return gzipSpzPacket(packet, packet.length, options);
 }
 
 function serializeCloudForWorkerTask(cloud) {
@@ -287,7 +382,28 @@ function transferListForCloud(cloud) {
 }
 
 module.exports = {
+  DEFAULT_SPZ_COMPRESSION_LEVEL,
+  SPZ_COLOR_SCALE,
+  SPZ_MAGIC,
   SPZ_STREAM_VERSION,
+  SPZ_FRACTIONAL_BITS,
+  SPZ_FIXED24_LIMIT,
+  SPZ_HEADER_BYTES,
+  gzipSpzPacket,
+  makeSpzPacketLayout,
+  makeSpzShQuantBuckets,
+  quantizeSpzColor,
+  quantizeSpzExtraSh,
+  quantizeSpzOpacity,
+  quantizeSpzPosition,
+  quantizeSpzScale,
+  validateSpzCoeffCount,
+  validateSpzCompressionLevel,
+  validateSpzQuantBits,
+  writeFixed24Into,
+  writeSpzPacketHeader,
+  spzExtraDimForDegree,
+  packQuaternionSmallestThreeInto,
   packCloudToSpz,
   serializeCloudForWorkerTask,
   transferListForCloud,
