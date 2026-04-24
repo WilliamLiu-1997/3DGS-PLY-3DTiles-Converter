@@ -21,7 +21,7 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 - Streamed unsimplified bucket-backed content directly into SPZ/GLB output with content-worker support, avoiding full `GaussianCloud` materialization when no simplification is needed.
 - Reduced large binary PLY conversion time by staging position-only scan data, using shallow typed-array count tables, tracking bucket row counts in node metadata, overlapping handoff cleanup, prefetching binary PLY chunks, and double-buffering partition write arenas.
 - Changed the default `buildConcurrency` from `2` to `4`.
-- Reduced partition write bottlenecks by limiting active leaf file handles and writing leaf buckets with bounded concurrency.
+- Reduced partition write bottlenecks by increasing the partition buffer budget to 256 MB, compacting scattered rows into larger per-leaf writes, limiting active leaf file handles, and writing leaf buckets with bounded concurrency.
 - Added progress reporting for the large-PLY leaf bucket partitioning scan.
 
 ### Removed

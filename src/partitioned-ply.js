@@ -63,7 +63,11 @@ const LEAF_BUCKET_DIR = 'leaf';
 const HANDOFF_BUCKET_DIR = 'handoff';
 const LEAF_BUCKET_ENCODING = 'canonical32';
 const HANDOFF_BUCKET_ENCODING = 'canonical32';
-const PARTITION_ARENA_BYTES = 4 * 1024 * 1024;
+const PARTITION_BUFFER_BUDGET_BYTES = 256 * 1024 * 1024;
+const PARTITION_ARENA_COUNT = 2;
+// Budget two read arenas plus two worst-case compaction buffers during flush.
+const PARTITION_ARENA_BYTES =
+  PARTITION_BUFFER_BUDGET_BYTES / (PARTITION_ARENA_COUNT * 2);
 const PARTITION_LEAF_HANDLE_LIMIT = 256;
 const PARTITION_LEAF_WRITE_CONCURRENCY = 128;
 const PARTITION_PROGRESS_ROW_INTERVAL = 8192;
@@ -823,6 +827,34 @@ async function writeChunksToHandle(handle, filePath, chunks) {
   }
 }
 
+async function writeArenaRunsToHandle(handle, filePath, sourceBuffer, entry) {
+  if (!entry || entry.byteLength <= 0 || entry.runs.length === 0) {
+    return;
+  }
+
+  if (entry.runs.length === 2) {
+    const start = entry.runs[0];
+    const byteLength = entry.runs[1];
+    await writeBufferToHandle(
+      handle,
+      sourceBuffer.subarray(start, start + byteLength),
+      byteLength,
+      filePath,
+    );
+    return;
+  }
+
+  const compacted = Buffer.allocUnsafe(entry.byteLength);
+  let writeOffset = 0;
+  for (let i = 0; i < entry.runs.length; i += 2) {
+    const start = entry.runs[i];
+    const byteLength = entry.runs[i + 1];
+    sourceBuffer.copy(compacted, writeOffset, start, start + byteLength);
+    writeOffset += byteLength;
+  }
+  await writeBufferToHandle(handle, compacted, compacted.length, filePath);
+}
+
 async function partitionLeafBuckets(
   handle,
   filePath,
@@ -836,26 +868,18 @@ async function partitionLeafBuckets(
   const ensuredDirs = new Set();
   const leafHandles = new Map();
   const progress = options.progress || null;
-  const totalLeafCount = Number.isInteger(options.leafCount)
-    ? options.leafCount
-    : null;
   const rowByteSize = layout.canonicalByteSize;
   const arenaByteSize = Math.max(PARTITION_ARENA_BYTES, rowByteSize);
-  const arenas = [0, 1].map(() => ({
+  const arenas = Array.from({ length: PARTITION_ARENA_COUNT }, () => ({
     buffer: Buffer.allocUnsafe(arenaByteSize),
     offset: 0,
     activeLeaves: [],
-    leafChunks: new Map(),
+    leafRuns: new Map(),
     flushPromise: null,
   }));
   let activeArenaIndex = 0;
   let flushError = null;
   let processedRows = 0;
-
-  const progressMessage = () =>
-    totalLeafCount == null
-      ? `leaves=${touchedLeaves.length}`
-      : `leaves=${touchedLeaves.length}/${totalLeafCount}`;
 
   const updateProgress = (force = false) => {
     if (!progress) {
@@ -864,7 +888,7 @@ async function partitionLeafBuckets(
     if (!force && processedRows % PARTITION_PROGRESS_ROW_INTERVAL !== 0) {
       return;
     }
-    progress.update(processedRows, progressMessage());
+    progress.update(processedRows);
   };
 
   const tickProgress = () => {
@@ -940,36 +964,60 @@ async function partitionLeafBuckets(
   const resetArena = (arena) => {
     arena.offset = 0;
     arena.activeLeaves = [];
-    arena.leafChunks = new Map();
+    arena.leafRuns = new Map();
   };
 
   const scheduleArenaFlush = (arena) => {
     if (arena.flushPromise) {
       return arena.flushPromise;
     }
-    if (arena.leafChunks.size === 0) {
+    if (arena.leafRuns.size === 0) {
       arena.offset = 0;
       return Promise.resolve();
     }
 
-    arena.flushPromise = runWithConcurrency(
-      arena.activeLeaves,
-      PARTITION_LEAF_WRITE_CONCURRENCY,
-      async (leaf) => {
-        const chunks = arena.leafChunks.get(leaf);
-        if (!chunks || chunks.length === 0) {
-          return;
-        }
-        const writePromise = leaf._partitionWriteChain.then(async () => {
+    const writeTasks = [];
+    for (const leaf of arena.activeLeaves) {
+      const runEntry = arena.leafRuns.get(leaf);
+      if (!runEntry || runEntry.byteLength <= 0) {
+        continue;
+      }
+      let startWrite;
+      const startPromise = new Promise((resolve) => {
+        startWrite = resolve;
+      });
+      const writePromise = leaf._partitionWriteChain
+        .then(() => startPromise)
+        .then(async () => {
           const entry = await acquireLeafHandle(leaf);
           try {
-            await writeChunksToHandle(entry.fh, leaf.bucketPath, chunks);
+            await writeArenaRunsToHandle(
+              entry.fh,
+              leaf.bucketPath,
+              arena.buffer,
+              runEntry,
+            );
           } finally {
             releaseLeafHandle(entry);
           }
         });
-        leaf._partitionWriteChain = writePromise;
-        await writePromise;
+      leaf._partitionWriteChain = writePromise;
+      writePromise.catch(() => {});
+      writeTasks.push({ startWrite, writePromise });
+    }
+
+    arena.flushPromise = runWithConcurrency(
+      writeTasks,
+      PARTITION_LEAF_WRITE_CONCURRENCY,
+      async (task) => {
+        task.startWrite();
+        try {
+          await task.writePromise;
+        } catch (err) {
+          if (!flushError) {
+            flushError = err;
+          }
+        }
       },
     )
       .catch((err) => {
@@ -989,7 +1037,7 @@ async function partitionLeafBuckets(
   const switchArena = async () => {
     const currentArena = arenas[activeArenaIndex];
     scheduleArenaFlush(currentArena);
-    activeArenaIndex = 1 - activeArenaIndex;
+    activeArenaIndex = (activeArenaIndex + 1) % arenas.length;
     const nextArena = arenas[activeArenaIndex];
     if (nextArena.flushPromise) {
       await nextArena.flushPromise;
@@ -1004,16 +1052,28 @@ async function partitionLeafBuckets(
     }
     touchLeaf(leaf);
 
-    let chunks = arena.leafChunks.get(leaf);
-    if (!chunks) {
-      chunks = [];
-      arena.leafChunks.set(leaf, chunks);
+    let runEntry = arena.leafRuns.get(leaf);
+    if (!runEntry) {
+      runEntry = {
+        runs: [],
+        byteLength: 0,
+      };
+      arena.leafRuns.set(leaf, runEntry);
       arena.activeLeaves.push(leaf);
     }
+    const lastRunIndex = runEntry.runs.length - 2;
+    if (
+      lastRunIndex >= 0 &&
+      runEntry.runs[lastRunIndex] + runEntry.runs[lastRunIndex + 1] ===
+        arena.offset
+    ) {
+      runEntry.runs[lastRunIndex + 1] += rowByteSize;
+    } else {
+      runEntry.runs.push(arena.offset, rowByteSize);
+    }
+    runEntry.byteLength += rowByteSize;
+
     rowBuffer.copy(arena.buffer, arena.offset, 0, rowByteSize);
-    chunks.push(
-      arena.buffer.subarray(arena.offset, arena.offset + rowByteSize),
-    );
     arena.offset += rowByteSize;
     leaf.bucketRowCount = (leaf.bucketRowCount || 0) + 1;
     return null;
@@ -3471,12 +3531,9 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
         tempDir,
         {
           progress: partitionProgress,
-          leafCount: treeStats.leaves.length,
         },
       );
-      partitionProgress.done(
-        `rows=${partitionResult.rowCount} leaves=${partitionResult.leafCount}/${treeStats.leaves.length}`,
-      );
+      partitionProgress.done(`rows=${partitionResult.rowCount}`);
       pipelineState.rootNode = serializeNodeMeta(rootNodeMeta);
       pipelineState.stage = PIPELINE_STAGE_BUCKETED;
       pipelineState.updatedAt = new Date().toISOString();
