@@ -66,6 +66,7 @@ const { convert } = require('3dgs-ply-3dtiles-converter');
     leafLimit: 100,
     spzSh1Bits: 8,
     spzShRestBits: 8,
+    spzCompressionLevel: 8,
     memoryBudget: 2,
   });
   console.log(result.outputDir, result.splatCount);
@@ -89,6 +90,7 @@ Examples:
 
 - CLI `--max-depth 8` equals API `{ maxDepth: 8 }`
 - CLI `--spz-sh1-bits 6` equals API `{ spzSh1Bits: 6 }`
+- CLI `--spz-compression-level 6` equals API `{ spzCompressionLevel: 6 }`
 - CLI `--sample-mode merge` equals API `{ sampleMode: 'merge' }`
 - CLI `--memory-budget 4` equals API `{ memoryBudget: 4 }`
 - CLI `--coordinate "[31.2304,121.4737,30]"` equals API `{ coordinate: [31.2304, 121.4737, 30] }`
@@ -113,6 +115,7 @@ Examples:
 | Min geometric error     | number  | `--min-geometric-error`     | `minGeometricError`    | `null`                | any finite number                           | Minimum geometric error for the deepest emitted level.                                                                                                                                                                                                            |
 | SH1 bits                | integer | `--spz-sh1-bits`            | `spzSh1Bits`           | `8`                   | `1..8`                                      | SPZ quantization bits for DC SH coefficients.                                                                                                                                                                                                                     |
 | SH rest bits            | integer | `--spz-sh-rest-bits`        | `spzShRestBits`        | `8`                   | `1..8`                                      | SPZ quantization bits for higher SH coefficients.                                                                                                                                                                                                                 |
+| SPZ compression level   | integer | `--spz-compression-level`   | `spzCompressionLevel`  | `8`                   | `0..9`                                      | gzip compression `level` used for SPZ payloads. Does not expose or change gzip `memLevel`.                                                                                                                                                                        |
 | Root transform          | matrix4 | `--transform`               | `transform`            | `null`                | 4x4 JSON matrix or 16 numbers               | Writes `tileset.root.transform` directly. Nested `[[...]]` matrices are read as row-major and converted to 3D Tiles column-major storage.                                                                                                                         |
 | Root coordinate         | vec3    | `--coordinate`              | `coordinate`           | `null`                | `[lat, long, height]`                       | Generates `tileset.root.transform` from WGS84 degrees/meters as a standard ENU frame in 3D Tiles tile coordinates. The API also accepts object forms such as `{ lat, lon, height }` and `{ latitude, longitude, altitude }`. Mutually exclusive with `transform`. |
 | Sampling rate per level | number  | `--sampling-rate-per-level` | `samplingRatePerLevel` | `0.5`                 | `(0,1]`                                     | LOD sampling ratio between levels.                                                                                                                                                                                                                                |

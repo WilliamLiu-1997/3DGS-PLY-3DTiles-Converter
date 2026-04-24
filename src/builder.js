@@ -7,9 +7,8 @@ const SOURCE_REPOSITORY = '3DGS-PLY-3DTiles-Converter';
 const DEFAULT_WORKER_SCRIPT = path.join(__dirname, 'convert-core.js');
 
 class ConsoleProgressBar {
-  constructor(label, total = 0, width = 28) {
+  constructor(label, total = 0) {
     this.label = label;
-    this.width = Math.max(10, width);
     this.current = 0;
     this.total =
       Number.isFinite(total) && total > 0 ? Math.max(1, Math.floor(total)) : 0;
@@ -19,7 +18,14 @@ class ConsoleProgressBar {
     this._spinnerPos = 0;
     this._last = 0;
     this._lastMessage = '';
+    this._lastStatus = '';
+    this._lineActive = false;
+    this._lastDetailMessage = '';
+    this._lastDetailLogAt = 0;
     this._done = false;
+    this._onResize = () => this._render(true);
+    this._resizeListenerAttached = false;
+    this._attachResizeListener();
   }
 
   setTotal(total) {
@@ -28,10 +34,22 @@ class ConsoleProgressBar {
     this._render();
   }
 
+  reset(total = 0, message = '') {
+    this.current = 0;
+    this.total =
+      Number.isFinite(total) && total > 0 ? Math.max(1, Math.floor(total)) : 0;
+    this._done = false;
+    if (message) {
+      this._setMessage(message);
+    }
+    this._attachResizeListener();
+    this._render(true);
+  }
+
   update(current, message = '') {
     this.current = Math.max(this.current, current);
     if (message) {
-      this._lastMessage = message;
+      this._setMessage(message);
     }
     this._render();
   }
@@ -46,12 +64,14 @@ class ConsoleProgressBar {
     }
     this._done = true;
     if (message) {
-      this._lastMessage = message;
+      this._setMessage(message);
     }
     if (this.enabled) {
       this.current = this.total > 0 ? this.total : this.current;
       this._render(true);
       process.stdout.write('\n');
+      this._lineActive = false;
+      this._detachResizeListener();
     } else if (this._lastMessage) {
       console.log(`[${this.label}] ${this._lastMessage}`);
     }
@@ -66,45 +86,163 @@ class ConsoleProgressBar {
       return;
     }
     this._last = now;
-    const ratio = this.total > 0 ? Math.min(1, this.current / this.total) : 0.0;
-    const done = this.total > 0 ? Math.floor(ratio * this.width) : 0;
-    const fill = done > 0 ? '='.repeat(done) : '';
-    const remain =
-      this.total > 0 ? Math.max(0, this.width - done - 1) : this.width - 1;
+    const spin = this._spinner[this._spinnerPos];
+    this._spinnerPos = (this._spinnerPos + 1) & 3;
 
     if (this.total > 0) {
-      const bar = `[${fill}${done === this.width ? '' : '>'}${' '.repeat(remain)}]`;
-      const percent = `${Math.round(ratio * 100)
-        .toString()
-        .padStart(3, ' ')}%`;
+      const ratio = Math.min(1, this.current / this.total);
+      const percent = `${Math.round(ratio * 100)}%`;
       this._renderLine(
-        `${this.label} ${bar} ${percent} (${this.current}/${this.total}) ${this._lastMessage}`,
+        `${this.label} ${spin} ${percent} (${this.current}/${this.total}) ${this._lastStatus}`,
       );
       return;
     }
 
-    const spin = this._spinner[this._spinnerPos];
-    this._spinnerPos = (this._spinnerPos + 1) & 3;
-    const bar = `[${spin}${' '.repeat(this.width - 1)}]`;
     this._renderLine(
-      `${this.label} ${bar} (${this.current}) ${this._lastMessage}`,
+      `${this.label} ${spin} (${this.current}) ${this._lastStatus}`,
     );
   }
 
   _renderLine(text) {
     if (!this.enabled) return;
+    const line = this._fitAsciiLine(text);
     if (
       typeof process.stdout.clearLine === 'function' &&
       typeof process.stdout.cursorTo === 'function'
     ) {
-      process.stdout.clearLine(0);
       process.stdout.cursorTo(0);
-      process.stdout.write(text);
+      process.stdout.clearLine(0);
+      process.stdout.write(line);
+      this._lineActive = true;
       return;
     }
     process.stdout.write(
-      `\r${text}${' '.repeat(Math.max(0, 120 - text.length))}`,
+      `\r${line}${' '.repeat(Math.max(0, this._maxLineLength() - line.length))}`,
     );
+    this._lineActive = true;
+  }
+
+  _setMessage(message) {
+    const text = String(message).replace(/[\r\n]+/g, ' ').trim();
+    this._lastMessage = text;
+    this._lastStatus = this._compactStatus(text);
+    this._maybeLogDetail(text);
+  }
+
+  _compactStatus(text) {
+    if (!text) {
+      return '';
+    }
+    if (text.includes('extra virtual long-tile work')) {
+      const splits = text.match(/splits=([0-9,]+)/);
+      const segments = text.match(/segments=([0-9,]+)/);
+      return [
+        'extra-work',
+        splits ? `splits=${splits[1]}` : '',
+        segments ? `segments=${segments[1]}` : '',
+      ]
+        .filter(Boolean)
+        .join(' ');
+    }
+    const splitCandidates = text.match(/split candidates=([0-9,]+)/);
+    if (splitCandidates) {
+      return `split candidates=${splitCandidates[1]}`;
+    }
+    const bucketSplits = text.match(/bucket splits=([0-9,]+)/);
+    if (bucketSplits) {
+      return `bucket splits=${bucketSplits[1]}`;
+    }
+    const parts = text.split('|').map((part) => part.trim()).filter(Boolean);
+    const status = parts.length > 1 ? parts[parts.length - 1] : text;
+    return this._ascii(status).slice(0, 36).trim();
+  }
+
+  _maybeLogDetail(text) {
+    if (!this.enabled || !text) {
+      return;
+    }
+    const shouldLog =
+      text.includes('|') ||
+      text.includes('extra virtual long-tile work') ||
+      this._ascii(text).length > 48;
+    if (!shouldLog) {
+      return;
+    }
+    const now = Date.now();
+    if (
+      text === this._lastDetailMessage ||
+      now - this._lastDetailLogAt < 5000
+    ) {
+      return;
+    }
+    this._clearActiveLine();
+    process.stdout.write(`[info] ${this.label} ${text}\n`);
+    this._lastDetailMessage = text;
+    this._lastDetailLogAt = now;
+  }
+
+  _clearActiveLine() {
+    if (
+      !this._lineActive ||
+      typeof process.stdout.clearLine !== 'function' ||
+      typeof process.stdout.cursorTo !== 'function'
+    ) {
+      return;
+    }
+    process.stdout.cursorTo(0);
+    process.stdout.clearLine(0);
+    this._lineActive = false;
+  }
+
+  _maxLineLength() {
+    const columns =
+      process.stdout && Number.isFinite(process.stdout.columns)
+        ? Math.floor(process.stdout.columns)
+        : 0;
+    return columns > 1 ? columns - 1 : 120;
+  }
+
+  _fitAsciiLine(text) {
+    const maxLineLength = this._maxLineLength();
+    const line = this._ascii(text);
+    if (line.length <= maxLineLength) {
+      return line;
+    }
+    if (maxLineLength <= 3) {
+      return line.slice(0, maxLineLength);
+    }
+    return `${line.slice(0, maxLineLength - 3)}...`;
+  }
+
+  _ascii(text) {
+    return String(text)
+      .replace(/[\r\n]+/g, ' ')
+      .replace(/[^\x20-\x7e]/g, '?');
+  }
+
+  _attachResizeListener() {
+    if (
+      !this.enabled ||
+      this._resizeListenerAttached ||
+      !process.stdout ||
+      typeof process.stdout.on !== 'function'
+    ) {
+      return;
+    }
+    process.stdout.on('resize', this._onResize);
+    this._resizeListenerAttached = true;
+  }
+
+  _detachResizeListener() {
+    if (
+      !this._resizeListenerAttached ||
+      !process.stdout ||
+      typeof process.stdout.removeListener !== 'function'
+    ) {
+      return;
+    }
+    process.stdout.removeListener('resize', this._onResize);
+    this._resizeListenerAttached = false;
   }
 }
 

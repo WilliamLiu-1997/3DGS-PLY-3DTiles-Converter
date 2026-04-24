@@ -67,8 +67,10 @@ const BUILD_MIN_TASK_MEMORY_BYTES = 32 * 1024 * 1024;
 const PARTITION_ARENA_COUNT = 2;
 const PARTITION_LEAF_HANDLE_LIMIT = 256;
 const PARTITION_PROGRESS_ROW_INTERVAL = 8192;
+const TILING_TREE_PROGRESS_ROW_INTERVAL = 65536;
 const POSITION_TMP_FILE = 'positions.tmp';
 const POSITION_ROW_BYTE_SIZE = 12;
+const POSITION_INDEX_ROW_BYTE_SIZE = Uint32Array.BYTES_PER_ELEMENT;
 const POSITION_TMP_BUFFER_BYTES = 256 * 1024;
 const WRITEV_BATCH_CHUNKS = 1024;
 const SPZ_CLOUD_ASYNC_WRITE_THRESHOLD = 4096;
@@ -81,6 +83,7 @@ const ROUTE_MODE_KD = 'kd';
 const ROUTE_MODE_AXIS_SEGMENTS = 'axis_segments';
 const LONG_TILE_SPLIT_MODE = 'virtual_equal_length_axis_segments';
 const ADAPTIVE_SPLIT_HISTOGRAM_BINS = 64;
+const ADAPTIVE_DENSE_CHILD_BUCKET_LIMIT = 4096;
 const ADAPTIVE_MAX_LONG_WIDTH_RATIO = 2.0;
 const ADAPTIVE_SPLIT_EPSILON = 1e-9;
 const IS_LITTLE_ENDIAN = (() => {
@@ -224,6 +227,19 @@ function makeMemoryBudgetPlan(args, { header = null, layout = null } = {}) {
   const positionBytes = header
     ? header.vertexCount * POSITION_ROW_BYTE_SIZE
     : null;
+  const positionIndexBytes = header
+    ? header.vertexCount * POSITION_INDEX_ROW_BYTE_SIZE
+    : null;
+  const positionTilingBytes =
+    positionBytes == null || positionIndexBytes == null
+      ? null
+      : positionBytes + positionIndexBytes;
+  const positionScanBytes =
+    positionBytes == null ? null : positionBytes + streamChunkBytes;
+  const positionMemoryPeakBytes =
+    positionTilingBytes == null || positionScanBytes == null
+      ? null
+      : Math.max(positionTilingBytes, positionScanBytes);
   const positionFloatCount = header ? header.vertexCount * 3 : null;
   const positionTmpBufferMax = Math.max(
     POSITION_ROW_BYTE_SIZE,
@@ -269,10 +285,14 @@ function makeMemoryBudgetPlan(args, { header = null, layout = null } = {}) {
     scanChunkBytes: streamChunkBytes,
     bucketChunkBytes,
     positionBytes,
+    positionIndexBytes,
+    positionTilingBytes,
+    positionScanBytes,
+    positionMemoryPeakBytes,
     inMemoryPositions:
-      positionBytes == null
+      positionMemoryPeakBytes == null
         ? null
-        : positionBytes <= usableBudgetBytes &&
+        : positionMemoryPeakBytes <= usableBudgetBytes &&
           positionFloatCount <= 0x7fffffff,
     positionTmpBufferBytes,
     partitionArenaBytes,
@@ -294,6 +314,10 @@ function serializeMemoryBudgetPlan(plan) {
     partition_arena_bytes: plan.partitionArenaBytes,
     in_memory_positions: plan.inMemoryPositions,
     position_bytes: plan.positionBytes,
+    position_index_bytes: plan.positionIndexBytes,
+    position_tiling_bytes: plan.positionTilingBytes,
+    position_scan_bytes: plan.positionScanBytes,
+    position_memory_peak_bytes: plan.positionMemoryPeakBytes,
     position_tmp_buffer_bytes: plan.positionTmpBufferBytes,
     simplify_scratch_bytes: plan.simplifyScratchBytes,
     bucket_entry_cache_bytes: plan.bucketEntryCacheBytes,
@@ -820,6 +844,7 @@ function makePipelineFingerprint(inputPath, inputStat, args) {
     colorSpace: args.colorSpace,
     spzSh1Bits: args.spzSh1Bits,
     spzShRestBits: args.spzShRestBits,
+    spzCompressionLevel: args.spzCompressionLevel,
   };
 }
 
@@ -2001,7 +2026,7 @@ async function packBucketEntriesToSpz(
   );
 
   writeSpzPacketHeader(packet, n, shDegree);
-  return gzipSpzPacket(packet);
+  return gzipSpzPacket(packet, packet.length, options);
 }
 
 async function writeBufferToHandle(handle, buffer, byteLength, targetPath) {
@@ -3577,6 +3602,7 @@ async function writeContentFile(
         outPath,
         sh1Bits: params.spzSh1Bits,
         shRestBits: params.spzShRestBits,
+        compressionLevel: params.spzCompressionLevel,
         colorSpace: params.colorSpace,
         translation: resolvedTranslation,
         cloud: serializeCloudForWorkerTask(cloud),
@@ -3592,6 +3618,7 @@ async function writeContentFile(
     params.colorSpace,
     params.spzSh1Bits,
     params.spzShRestBits,
+    params.spzCompressionLevel,
     resolvedTranslation,
   );
   return relPath;
@@ -3603,6 +3630,7 @@ function writeCloudGlbOutput(
   colorSpace,
   sh1Bits,
   shRestBits,
+  compressionLevel,
   translation = null,
 ) {
   const resolvedTranslation = translation || computeBounds(cloud).center();
@@ -3611,6 +3639,7 @@ function writeCloudGlbOutput(
     sh1Bits,
     shRestBits,
     resolvedTranslation,
+    { compressionLevel },
   );
   const builder = new GltfBuilder();
   builder.writeSpzStreamGlb(
@@ -3647,7 +3676,10 @@ async function writeBucketGlbTaskOutput(task) {
     task.sh1Bits,
     task.shRestBits,
     translation,
-    { bucketChunkBytes: task.bucketChunkBytes },
+    {
+      bucketChunkBytes: task.bucketChunkBytes,
+      compressionLevel: task.compressionLevel,
+    },
   );
   const builder = new GltfBuilder();
   builder.writeSpzStreamGlb(
@@ -3694,6 +3726,7 @@ async function writeSimplifiedBucketGlbTaskOutput(task) {
       task.colorSpace,
       task.sh1Bits,
       task.shRestBits,
+      task.compressionLevel,
       task.translation,
     );
   })();
@@ -3736,6 +3769,7 @@ async function writeSimplifiedBucketContentFile(
     sampleMode: params.sampleMode,
     sh1Bits: params.spzSh1Bits,
     shRestBits: params.spzShRestBits,
+    compressionLevel: params.spzCompressionLevel,
     colorSpace: params.colorSpace,
     translation: options.translation || null,
     bucketChunkBytes: options.bucketChunkBytes,
@@ -3780,6 +3814,7 @@ async function writeBucketContentFile(
     shDegree,
     sh1Bits: params.spzSh1Bits,
     shRestBits: params.spzShRestBits,
+    compressionLevel: params.spzCompressionLevel,
     colorSpace: params.colorSpace,
     translation,
     bucketChunkBytes: params.bucketChunkBytes,
@@ -4045,25 +4080,49 @@ function aspectSegmentCount(aspect) {
 }
 
 function updateAdaptiveSplitStats(stats, x, y, z) {
-  const values = [x, y, z];
   const bounds = stats.node.bounds;
+  const boundMin = bounds.minimum;
+  const boundMax = bounds.maximum;
+  const minimum = stats.minimum;
+  const maximum = stats.maximum;
+  const histograms = stats.histograms;
   stats.count += 1;
-  for (let axis = 0; axis < 3; axis++) {
-    const value = values[axis];
-    if (value < stats.minimum[axis]) stats.minimum[axis] = value;
-    if (value > stats.maximum[axis]) stats.maximum[axis] = value;
 
-    const min = bounds.minimum[axis];
-    const extent = bounds.maximum[axis] - min;
-    let bin = 0;
-    if (Number.isFinite(extent) && extent > 0.0) {
-      bin = Math.floor(
-        ((value - min) / extent) * ADAPTIVE_SPLIT_HISTOGRAM_BINS,
-      );
-      bin = Math.max(0, Math.min(ADAPTIVE_SPLIT_HISTOGRAM_BINS - 1, bin));
-    }
-    stats.histograms[axis][bin] += 1;
+  if (x < minimum[0]) minimum[0] = x;
+  if (x > maximum[0]) maximum[0] = x;
+  let extent = boundMax[0] - boundMin[0];
+  let bin = 0;
+  if (Number.isFinite(extent) && extent > 0.0) {
+    bin = Math.floor(
+      ((x - boundMin[0]) / extent) * ADAPTIVE_SPLIT_HISTOGRAM_BINS,
+    );
+    bin = Math.max(0, Math.min(ADAPTIVE_SPLIT_HISTOGRAM_BINS - 1, bin));
   }
+  histograms[0][bin] += 1;
+
+  if (y < minimum[1]) minimum[1] = y;
+  if (y > maximum[1]) maximum[1] = y;
+  extent = boundMax[1] - boundMin[1];
+  bin = 0;
+  if (Number.isFinite(extent) && extent > 0.0) {
+    bin = Math.floor(
+      ((y - boundMin[1]) / extent) * ADAPTIVE_SPLIT_HISTOGRAM_BINS,
+    );
+    bin = Math.max(0, Math.min(ADAPTIVE_SPLIT_HISTOGRAM_BINS - 1, bin));
+  }
+  histograms[1][bin] += 1;
+
+  if (z < minimum[2]) minimum[2] = z;
+  if (z > maximum[2]) maximum[2] = z;
+  extent = boundMax[2] - boundMin[2];
+  bin = 0;
+  if (Number.isFinite(extent) && extent > 0.0) {
+    bin = Math.floor(
+      ((z - boundMin[2]) / extent) * ADAPTIVE_SPLIT_HISTOGRAM_BINS,
+    );
+    bin = Math.max(0, Math.min(ADAPTIVE_SPLIT_HISTOGRAM_BINS - 1, bin));
+  }
+  histograms[2][bin] += 1;
 }
 
 function chooseAdaptiveAxisSplit(stats, axis) {
@@ -4277,6 +4336,19 @@ function childSlotForAdaptiveAction(stats, x, y, z) {
   );
 }
 
+function kdSplitAxisForAction(action) {
+  if (!action || action.kind !== ROUTE_MODE_KD) {
+    return null;
+  }
+  const axes = action.splitAxes || [];
+  for (let axis = 0; axis < 3; axis++) {
+    if (axes[axis]) {
+      return axis;
+    }
+  }
+  return null;
+}
+
 function updateAdaptiveChildStats(stats, slot, x, y, z) {
   if (!stats.childStats) {
     stats.childStats = new Map();
@@ -4307,6 +4379,522 @@ function sortedAdaptiveChildStats(stats) {
     return [];
   }
   return Array.from(stats.childStats.values()).sort((a, b) => a.slot - b.slot);
+}
+
+function makeAdaptiveChildEntry(slot, start = null, end = null) {
+  return {
+    slot,
+    count: 0,
+    minimum: [Infinity, Infinity, Infinity],
+    maximum: [-Infinity, -Infinity, -Infinity],
+    start,
+    end,
+  };
+}
+
+function updateAdaptiveChildEntry(entry, x, y, z) {
+  entry.count += 1;
+  if (x < entry.minimum[0]) entry.minimum[0] = x;
+  if (y < entry.minimum[1]) entry.minimum[1] = y;
+  if (z < entry.minimum[2]) entry.minimum[2] = z;
+  if (x > entry.maximum[0]) entry.maximum[0] = x;
+  if (y > entry.maximum[1]) entry.maximum[1] = y;
+  if (z > entry.maximum[2]) entry.maximum[2] = z;
+}
+
+function makeAdaptiveRootNode(rootBounds, vertexCount) {
+  return makePartitionTreeNode({
+    level: 0,
+    depth: 0,
+    x: 0,
+    y: 0,
+    z: 0,
+    bounds: cloneBounds(rootBounds),
+    count: vertexCount,
+    leaf: true,
+  });
+}
+
+function makePositionIndexArray(vertexCount) {
+  const indices = new Uint32Array(vertexCount);
+  for (let rowIndex = 0; rowIndex < vertexCount; rowIndex++) {
+    indices[rowIndex] = rowIndex;
+  }
+  return indices;
+}
+
+function setNodePositionIndexRange(node, start, end) {
+  node._positionIndexStart = start;
+  node._positionIndexEnd = end;
+}
+
+function clearNodePositionIndexRanges(node) {
+  delete node._positionIndexStart;
+  delete node._positionIndexEnd;
+  for (const child of node.children) {
+    clearNodePositionIndexRanges(child);
+  }
+}
+
+function makeTilingProgressState(progress, vertexCount, maxDepth) {
+  if (!progress) {
+    return null;
+  }
+  const rows = Math.max(1, Math.floor(vertexCount || 1));
+  const depthRounds = Math.max(1, Math.floor(maxDepth || 1));
+  const total = rows * depthRounds * 2;
+  const state = {
+    progress,
+    total,
+    estimatedTotal: total,
+    current: 0,
+    message: 'building k-d tree',
+    estimateExpanded: false,
+    virtualSegmentActions: 0,
+    virtualSegmentCount: 0,
+  };
+  if (typeof progress.reset === 'function') {
+    progress.reset(total, formatTilingProgressMessage(state));
+  } else {
+    progress.current = 0;
+    progress.setTotal(total);
+    progress.update(0, formatTilingProgressMessage(state));
+  }
+  return state;
+}
+
+function formatProgressInteger(value) {
+  return Math.max(0, Math.floor(value || 0)).toLocaleString('en-US');
+}
+
+function formatTilingProgressMessage(state, message = null) {
+  const base = message || (state ? state.message : '') || 'building k-d tree';
+  if (!state || !state.estimateExpanded) {
+    return base;
+  }
+  const overEstimateRows = Math.max(0, state.current - state.estimatedTotal);
+  if (state.virtualSegmentActions > 0) {
+    return (
+      `${base} | extra virtual long-tile work ` +
+      `splits=${state.virtualSegmentActions} ` +
+      `segments=${state.virtualSegmentCount} ` +
+      `over=${formatProgressInteger(overEstimateRows)} rows`
+    );
+  }
+  return `${base} | work estimate expanded`;
+}
+
+function noteTilingVirtualSegmentAction(progressState, action) {
+  if (
+    !progressState ||
+    !action ||
+    action.kind !== ROUTE_MODE_AXIS_SEGMENTS
+  ) {
+    return;
+  }
+  progressState.virtualSegmentActions += 1;
+  progressState.virtualSegmentCount += Math.max(
+    0,
+    Math.floor(action.segmentCount || 0),
+  );
+}
+
+function maybeExpandTilingProgressTotal(state) {
+  if (!state || state.current < state.total) {
+    return;
+  }
+  const increment = Math.max(
+    TILING_TREE_PROGRESS_ROW_INTERVAL,
+    Math.floor(state.total * 0.1),
+  );
+  state.estimateExpanded = true;
+  state.total = state.current + increment;
+  state.progress.setTotal(state.total);
+}
+
+function startTilingProgressPhase(progressState, total, message) {
+  if (!progressState) {
+    return null;
+  }
+  if (message) {
+    progressState.message = message;
+    progressState.progress.update(
+      progressState.current,
+      formatTilingProgressMessage(progressState, message),
+    );
+  }
+  return {
+    overall: progressState,
+    total: Math.max(0, Math.floor(total || 0)),
+    current: 0,
+    nextUpdate: TILING_TREE_PROGRESS_ROW_INTERVAL,
+  };
+}
+
+function advanceTilingProgress(state, rows, { force = false } = {}) {
+  if (!state || rows < 0) {
+    return;
+  }
+  if (rows > 0) {
+    state.current += rows;
+    state.overall.current += rows;
+  }
+  if (!force && state.current < state.nextUpdate) {
+    return;
+  }
+  maybeExpandTilingProgressTotal(state.overall);
+  const visibleCurrent =
+    state.overall.total > 0
+      ? Math.min(state.overall.current, state.overall.total)
+      : state.overall.current;
+  state.overall.progress.update(
+    visibleCurrent,
+    formatTilingProgressMessage(state.overall),
+  );
+  state.nextUpdate =
+    state.current + Math.max(1, TILING_TREE_PROGRESS_ROW_INTERVAL);
+}
+
+function childSlotForAdaptiveActionAtRow(stats, positions, rowIndex) {
+  const base = rowIndex * 3;
+  return childSlotForAdaptiveAction(
+    stats,
+    positions[base + 0],
+    positions[base + 1],
+    positions[base + 2],
+  );
+}
+
+function updateAdaptiveSplitStatsForPositionIndexRange(
+  stats,
+  positions,
+  indices,
+  start,
+  end,
+  progressState = null,
+) {
+  let pendingProgressRows = 0;
+  for (let offset = start; offset < end; offset++) {
+    const base = indices[offset] * 3;
+    updateAdaptiveSplitStats(
+      stats,
+      positions[base + 0],
+      positions[base + 1],
+      positions[base + 2],
+    );
+    pendingProgressRows += 1;
+    if (pendingProgressRows >= TILING_TREE_PROGRESS_ROW_INTERVAL) {
+      advanceTilingProgress(progressState, pendingProgressRows);
+      pendingProgressRows = 0;
+    }
+  }
+  if (pendingProgressRows > 0) {
+    advanceTilingProgress(progressState, pendingProgressRows);
+  }
+}
+
+function makeAdaptiveChildBucketStats(action) {
+  const bucketCount =
+    action.kind === ROUTE_MODE_AXIS_SEGMENTS ? action.segmentCount : 8;
+  if (
+    action.kind === ROUTE_MODE_AXIS_SEGMENTS &&
+    bucketCount > ADAPTIVE_DENSE_CHILD_BUCKET_LIMIT
+  ) {
+    return {
+      sparse: true,
+      actionBucketCount: bucketCount,
+      bucketCount: 0,
+      entriesBySlot: new Map(),
+      orderedEntries: null,
+      starts: null,
+      ends: null,
+      slotToBucketIndex: null,
+    };
+  }
+  const minimumX = new Float64Array(bucketCount);
+  const minimumY = new Float64Array(bucketCount);
+  const minimumZ = new Float64Array(bucketCount);
+  const maximumX = new Float64Array(bucketCount);
+  const maximumY = new Float64Array(bucketCount);
+  const maximumZ = new Float64Array(bucketCount);
+  minimumX.fill(Infinity);
+  minimumY.fill(Infinity);
+  minimumZ.fill(Infinity);
+  maximumX.fill(-Infinity);
+  maximumY.fill(-Infinity);
+  maximumZ.fill(-Infinity);
+  return {
+    sparse: false,
+    actionBucketCount: bucketCount,
+    bucketCount,
+    counts: new Uint32Array(bucketCount),
+    minimumX,
+    minimumY,
+    minimumZ,
+    maximumX,
+    maximumY,
+    maximumZ,
+    starts: null,
+    ends: null,
+  };
+}
+
+function updateAdaptiveChildBucketStats(bucketStats, slot, x, y, z) {
+  if (bucketStats.sparse) {
+    let entry = bucketStats.entriesBySlot.get(slot);
+    if (!entry) {
+      entry = makeAdaptiveChildEntry(slot);
+      bucketStats.entriesBySlot.set(slot, entry);
+    }
+    updateAdaptiveChildEntry(entry, x, y, z);
+    return;
+  }
+  bucketStats.counts[slot] += 1;
+  if (x < bucketStats.minimumX[slot]) bucketStats.minimumX[slot] = x;
+  if (y < bucketStats.minimumY[slot]) bucketStats.minimumY[slot] = y;
+  if (z < bucketStats.minimumZ[slot]) bucketStats.minimumZ[slot] = z;
+  if (x > bucketStats.maximumX[slot]) bucketStats.maximumX[slot] = x;
+  if (y > bucketStats.maximumY[slot]) bucketStats.maximumY[slot] = y;
+  if (z > bucketStats.maximumZ[slot]) bucketStats.maximumZ[slot] = z;
+}
+
+function collectAdaptiveChildBucketStatsForPositionRange(
+  stats,
+  positions,
+  indices,
+  start,
+  end,
+  progressState = null,
+) {
+  const bucketStats = makeAdaptiveChildBucketStats(stats.action);
+  let pendingProgressRows = 0;
+  for (let offset = start; offset < end; offset++) {
+    const rowIndex = indices[offset];
+    const base = rowIndex * 3;
+    const x = positions[base + 0];
+    const y = positions[base + 1];
+    const z = positions[base + 2];
+    const slot = childSlotForAdaptiveAction(stats, x, y, z);
+    updateAdaptiveChildBucketStats(bucketStats, slot, x, y, z);
+    pendingProgressRows += 1;
+    if (pendingProgressRows >= TILING_TREE_PROGRESS_ROW_INTERVAL) {
+      advanceTilingProgress(progressState, pendingProgressRows);
+      pendingProgressRows = 0;
+    }
+  }
+  if (pendingProgressRows > 0) {
+    advanceTilingProgress(progressState, pendingProgressRows);
+  }
+  return bucketStats;
+}
+
+function assignAdaptiveChildBucketRanges(bucketStats, start, end) {
+  if (bucketStats.sparse) {
+    const orderedEntries = Array.from(bucketStats.entriesBySlot.values()).sort(
+      (a, b) => a.slot - b.slot,
+    );
+    const starts = new Uint32Array(orderedEntries.length);
+    const ends = new Uint32Array(orderedEntries.length);
+    const slotToBucketIndex = new Map();
+    let cursor = start;
+    for (let index = 0; index < orderedEntries.length; index++) {
+      const entry = orderedEntries[index];
+      starts[index] = cursor;
+      entry.start = cursor;
+      cursor += entry.count;
+      entry.end = cursor;
+      ends[index] = cursor;
+      slotToBucketIndex.set(entry.slot, index);
+    }
+    ensure(
+      cursor === end,
+      `Adaptive child bucket range mismatch. Expected ${end}, got ${cursor}.`,
+    );
+    bucketStats.bucketCount = orderedEntries.length;
+    bucketStats.orderedEntries = orderedEntries;
+    bucketStats.starts = starts;
+    bucketStats.ends = ends;
+    bucketStats.slotToBucketIndex = slotToBucketIndex;
+    return;
+  }
+
+  const starts = new Uint32Array(bucketStats.bucketCount);
+  const ends = new Uint32Array(bucketStats.bucketCount);
+  let cursor = start;
+  for (let slot = 0; slot < bucketStats.bucketCount; slot++) {
+    starts[slot] = cursor;
+    cursor += bucketStats.counts[slot];
+    ends[slot] = cursor;
+  }
+  ensure(
+    cursor === end,
+    `Adaptive child bucket range mismatch. Expected ${end}, got ${cursor}.`,
+  );
+  bucketStats.starts = starts;
+  bucketStats.ends = ends;
+}
+
+function adaptiveChildBucketEntries(bucketStats) {
+  if (bucketStats.sparse) {
+    return bucketStats.orderedEntries || [];
+  }
+
+  const entries = [];
+  for (let slot = 0; slot < bucketStats.bucketCount; slot++) {
+    const count = bucketStats.counts[slot];
+    if (count <= 0) {
+      continue;
+    }
+    entries.push({
+      slot,
+      count,
+      start: bucketStats.starts ? bucketStats.starts[slot] : null,
+      end: bucketStats.ends ? bucketStats.ends[slot] : null,
+      minimum: [
+        bucketStats.minimumX[slot],
+        bucketStats.minimumY[slot],
+        bucketStats.minimumZ[slot],
+      ],
+      maximum: [
+        bucketStats.maximumX[slot],
+        bucketStats.maximumY[slot],
+        bucketStats.maximumZ[slot],
+      ],
+    });
+  }
+  return entries;
+}
+
+function partitionKdPositionIndexRange(
+  stats,
+  positions,
+  indices,
+  start,
+  end,
+  progressState = null,
+) {
+  const action = stats.action;
+  const axis = kdSplitAxisForAction(action);
+  ensure(
+    Number.isInteger(axis) && axis >= 0 && axis < 3,
+    `Missing k-d split axis for node ${stats.node.key}.`,
+  );
+  const split = action.splitPoint[axis];
+  ensure(
+    Number.isFinite(split),
+    `Missing k-d split point for node ${stats.node.key}.`,
+  );
+
+  const lower = makeAdaptiveChildEntry(0, start, null);
+  const upper = makeAdaptiveChildEntry(1 << axis, null, end);
+  let left = start;
+  let right = end - 1;
+  let pendingProgressRows = 0;
+
+  while (left <= right) {
+    pendingProgressRows += 1;
+    if (pendingProgressRows >= TILING_TREE_PROGRESS_ROW_INTERVAL) {
+      advanceTilingProgress(progressState, pendingProgressRows);
+      pendingProgressRows = 0;
+    }
+
+    const rowIndex = indices[left];
+    const base = rowIndex * 3;
+    const x = positions[base + 0];
+    const y = positions[base + 1];
+    const z = positions[base + 2];
+    const coordinate = coordinateForAxis(axis, x, y, z);
+
+    if (coordinate >= split) {
+      updateAdaptiveChildEntry(upper, x, y, z);
+      const swap = indices[right];
+      indices[right] = rowIndex;
+      indices[left] = swap;
+      right -= 1;
+    } else {
+      updateAdaptiveChildEntry(lower, x, y, z);
+      left += 1;
+    }
+  }
+
+  lower.end = left;
+  upper.start = left;
+  ensure(
+    lower.count + upper.count === end - start,
+    `K-d child partition row mismatch for node ${stats.node.key}.`,
+  );
+  ensure(
+    lower.end - lower.start === lower.count &&
+      upper.end - upper.start === upper.count,
+    `K-d child partition range mismatch for node ${stats.node.key}.`,
+  );
+
+  if (pendingProgressRows > 0) {
+    advanceTilingProgress(progressState, pendingProgressRows);
+  }
+
+  const occupied = [];
+  if (lower.count > 0) {
+    occupied.push(lower);
+  }
+  if (upper.count > 0) {
+    occupied.push(upper);
+  }
+  return occupied;
+}
+
+function partitionPositionIndexRangeByAdaptiveSlot(
+  stats,
+  bucketStats,
+  positions,
+  indices,
+  progressState = null,
+) {
+  const starts = bucketStats.starts;
+  const ends = bucketStats.ends;
+  const next = new Uint32Array(starts);
+  let pendingProgressRows = 0;
+  for (let bucket = 0; bucket < bucketStats.bucketCount; bucket++) {
+    let offset = next[bucket];
+    const bucketEnd = ends[bucket];
+    while (offset < bucketEnd) {
+      pendingProgressRows += 1;
+      if (pendingProgressRows >= TILING_TREE_PROGRESS_ROW_INTERVAL) {
+        advanceTilingProgress(progressState, pendingProgressRows);
+        pendingProgressRows = 0;
+      }
+      const rowIndex = indices[offset];
+      const slot = childSlotForAdaptiveActionAtRow(stats, positions, rowIndex);
+      let targetBucket = slot;
+      if (bucketStats.sparse) {
+        targetBucket = bucketStats.slotToBucketIndex.get(slot);
+        ensure(
+          Number.isInteger(targetBucket),
+          `Adaptive child slot ${slot} is not occupied while partitioning node ${stats.node.key}.`,
+        );
+      }
+      if (targetBucket === bucket) {
+        offset += 1;
+        next[bucket] = offset;
+        continue;
+      }
+      ensure(
+        targetBucket >= 0 && targetBucket < bucketStats.bucketCount,
+        `Adaptive child slot ${slot} is outside bucket count ${bucketStats.actionBucketCount}.`,
+      );
+      const target = next[targetBucket];
+      ensure(
+        target < ends[targetBucket],
+        `Adaptive child bucket ${slot} overflow while partitioning node ${stats.node.key}.`,
+      );
+      next[targetBucket] = target + 1;
+      indices[offset] = indices[target];
+      indices[target] = rowIndex;
+    }
+  }
+  if (pendingProgressRows > 0) {
+    advanceTilingProgress(progressState, pendingProgressRows);
+  }
 }
 
 async function forEachStagedPosition(source, callback) {
@@ -4379,6 +4967,32 @@ async function buildAdaptiveNodeTreeFromPositions(
   rootBounds,
   maxDepth,
   leafLimit,
+  options = {},
+) {
+  if (source.positions) {
+    return buildAdaptiveNodeTreeFromMemoryPositions(
+      source,
+      rootBounds,
+      maxDepth,
+      leafLimit,
+      options,
+    );
+  }
+  return buildAdaptiveNodeTreeFromStreamingPositions(
+    source,
+    rootBounds,
+    maxDepth,
+    leafLimit,
+    options,
+  );
+}
+
+async function buildAdaptiveNodeTreeFromMemoryPositions(
+  source,
+  rootBounds,
+  maxDepth,
+  leafLimit,
+  options = {},
 ) {
   let nextPhysicalCoordinate = 1;
   const allocateChildCoordinates = (parent) => ({
@@ -4388,16 +5002,244 @@ async function buildAdaptiveNodeTreeFromPositions(
     z: 0,
   });
 
-  const root = makePartitionTreeNode({
-    level: 0,
-    depth: 0,
-    x: 0,
+  const root = makeAdaptiveRootNode(rootBounds, source.vertexCount);
+
+  if (maxDepth <= 0 || source.vertexCount <= 1) {
+    return root;
+  }
+
+  const positions = source.positions;
+  ensure(
+    positions && positions.length >= source.vertexCount * 3,
+    'In-memory staged positions are missing or truncated.',
+  );
+  const indices = makePositionIndexArray(source.vertexCount);
+  const progress = makeTilingProgressState(
+    options.progress || null,
+    source.vertexCount,
+    maxDepth,
+  );
+  setNodePositionIndexRange(root, 0, source.vertexCount);
+
+  try {
+    while (true) {
+      const candidates = [];
+      collectAdaptiveSplitCandidates(root, maxDepth, leafLimit, candidates);
+      if (candidates.length === 0) {
+        break;
+      }
+
+      const candidateRanges = [];
+      let candidateRowTotal = 0;
+      for (const node of candidates) {
+        const start = node._positionIndexStart;
+        const end = node._positionIndexEnd;
+        ensure(
+          Number.isInteger(start) && Number.isInteger(end) && end >= start,
+          `Missing in-memory position index range for node ${node.key}.`,
+        );
+        candidateRanges.push({ node, start, end });
+        candidateRowTotal += end - start;
+      }
+      const splitProgress = startTilingProgressPhase(
+        progress,
+        candidateRowTotal,
+        `building k-d tree | split candidates=${candidates.length}`,
+      );
+      const statsByNode = new Map();
+      for (const range of candidateRanges) {
+        const node = range.node;
+        const stats = makeAdaptiveSplitStats(node);
+        updateAdaptiveSplitStatsForPositionIndexRange(
+          stats,
+          positions,
+          indices,
+          range.start,
+          range.end,
+          splitProgress,
+        );
+        statsByNode.set(node, stats);
+      }
+      advanceTilingProgress(splitProgress, 0, { force: true });
+
+      const splittableStats = [];
+      for (const stats of statsByNode.values()) {
+        stats.node.count = stats.count;
+        const tightBounds = boundsFromMinMax(
+          stats.minimum,
+          stats.maximum,
+          stats.node.bounds,
+        );
+        const action = chooseAdaptiveSplitAction(
+          stats,
+          tightBounds,
+          maxDepth,
+          leafLimit,
+        );
+        if (!action.kind) {
+          stats.node.bounds = tightBounds;
+          if (action.aspectExhausted) {
+            stats.node.aspectSplitExhausted = true;
+          }
+          if (action.splitExhausted) {
+            stats.node.splitExhausted = true;
+          }
+          continue;
+        }
+        stats.node.bounds = tightBounds;
+        stats.action = action;
+        if (action.kind === ROUTE_MODE_KD) {
+          stats.node.splitPoint = action.splitPoint;
+          stats.node.splitAxes = action.splitAxes;
+          stats.node.routeMode = ROUTE_MODE_KD;
+        } else {
+          stats.node.splitPoint = null;
+          stats.node.splitAxes = null;
+          stats.node.routeMode = ROUTE_MODE_AXIS_SEGMENTS;
+          stats.node.segmentAxis = action.axis;
+          stats.node.segmentCount = action.segmentCount;
+          stats.node.segmentMin = action.segmentMin;
+          stats.node.segmentMax = action.segmentMax;
+        }
+        splittableStats.push(stats);
+      }
+
+      if (splittableStats.length === 0) {
+        break;
+      }
+
+      let bucketProgressRowTotal = 0;
+      for (const stats of splittableStats) {
+        const rowCount =
+          stats.node._positionIndexEnd - stats.node._positionIndexStart;
+        noteTilingVirtualSegmentAction(progress, stats.action);
+        bucketProgressRowTotal +=
+          rowCount * (stats.action.kind === ROUTE_MODE_KD ? 1 : 2);
+      }
+      const bucketProgress = startTilingProgressPhase(
+        progress,
+        bucketProgressRowTotal,
+        `building k-d tree | bucket splits=${splittableStats.length}`,
+      );
+      let splitNodeCount = 0;
+      for (const stats of splittableStats) {
+        const node = stats.node;
+        const start = node._positionIndexStart;
+        const end = node._positionIndexEnd;
+        let occupied;
+        if (stats.action.kind === ROUTE_MODE_KD) {
+          occupied = partitionKdPositionIndexRange(
+            stats,
+            positions,
+            indices,
+            start,
+            end,
+            bucketProgress,
+          );
+        } else {
+          const bucketStats = collectAdaptiveChildBucketStatsForPositionRange(
+            stats,
+            positions,
+            indices,
+            start,
+            end,
+            bucketProgress,
+          );
+          assignAdaptiveChildBucketRanges(bucketStats, start, end);
+          occupied = adaptiveChildBucketEntries(bucketStats);
+
+          if (occupied.length > 1) {
+            partitionPositionIndexRangeByAdaptiveSlot(
+              stats,
+              bucketStats,
+              positions,
+              indices,
+              bucketProgress,
+            );
+          } else {
+            advanceTilingProgress(bucketProgress, end - start);
+          }
+        }
+
+        if (occupied.length <= 1) {
+          node.splitPoint = null;
+          node.splitAxes = null;
+          node.segmentAxis = null;
+          node.segmentCount = null;
+          node.segmentMin = null;
+          node.segmentMax = null;
+          node.routeMode = ROUTE_MODE_KD;
+          node.leaf = true;
+          if (stats.action.kind === ROUTE_MODE_AXIS_SEGMENTS) {
+            node.aspectSplitExhausted = true;
+          } else {
+            node.splitExhausted = true;
+          }
+          continue;
+        }
+
+        node.leaf = false;
+        node.virtual = stats.action.kind === ROUTE_MODE_AXIS_SEGMENTS;
+        node.children = [];
+        node.childrenByOct = new Array(8).fill(null);
+        node.childrenBySegment = node.virtual ? new Map() : null;
+        node.occupiedChildCount = occupied.length;
+        for (const entry of occupied) {
+          const slot = entry.slot;
+          const coords = allocateChildCoordinates(node);
+          const child = makePartitionTreeNode({
+            level: coords.level,
+            depth:
+              stats.action.kind === ROUTE_MODE_AXIS_SEGMENTS
+                ? node.depth
+                : node.depth + 1,
+            x: coords.x,
+            y: coords.y,
+            z: coords.z,
+            childSlot: slot,
+            bounds: boundsFromMinMax(entry.minimum, entry.maximum, node.bounds),
+            count: entry.count,
+            leaf: true,
+          });
+          setNodePositionIndexRange(child, entry.start, entry.end);
+          node.children.push(child);
+          if (node.virtual) {
+            ensureChildrenBySegment(node).set(slot, child);
+          } else {
+            node.childrenByOct[slot] = child;
+          }
+        }
+        splitNodeCount += 1;
+      }
+
+      advanceTilingProgress(bucketProgress, 0, { force: true });
+      if (splitNodeCount === 0) {
+        break;
+      }
+    }
+  } finally {
+    clearNodePositionIndexRanges(root);
+  }
+
+  return root;
+}
+
+async function buildAdaptiveNodeTreeFromStreamingPositions(
+  source,
+  rootBounds,
+  maxDepth,
+  leafLimit,
+  _options = {},
+) {
+  let nextPhysicalCoordinate = 1;
+  const allocateChildCoordinates = (parent) => ({
+    level: parent.level + 1,
+    x: nextPhysicalCoordinate++,
     y: 0,
     z: 0,
-    bounds: cloneBounds(rootBounds),
-    count: source.vertexCount,
-    leaf: true,
   });
+
+  const root = makeAdaptiveRootNode(rootBounds, source.vertexCount);
 
   if (maxDepth <= 0 || source.vertexCount <= 1) {
     return root;
@@ -5207,6 +6049,7 @@ function makeBuildSummary(
     spz_version: SPZ_STREAM_VERSION,
     spz_sh1_bits: args.spzSh1Bits,
     spz_sh_rest_bits: args.spzShRestBits,
+    spz_compression_level: args.spzCompressionLevel,
     root_transform: args.transform ? args.transform.slice() : null,
     root_coordinate: args.coordinate ? args.coordinate.slice() : null,
     root_transform_source: args.coordinate
@@ -5274,6 +6117,7 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
     sampleMode: args.sampleMode,
     spzSh1Bits: args.spzSh1Bits,
     spzShRestBits: args.spzShRestBits,
+    spzCompressionLevel: args.spzCompressionLevel,
     minGeometricError: args.minGeometricError,
     bucketChunkBytes: memoryPlan.bucketChunkBytes,
     contentWorkerPool:
@@ -5283,13 +6127,19 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
   };
 
   if (fs.existsSync(outputDirAbs) && args.clean) {
-    fs.rmSync(outputDirAbs, { recursive: true, force: true });
+    const cleanStartedAt = Date.now();
+    console.log(`[info] cleaning output directory: ${outputDirAbs}`);
+    await fs.promises.rm(outputDirAbs, { recursive: true, force: true });
+    timingsMs.clean_output_ms = elapsedMsSince(cleanStartedAt);
+    console.log(
+      `[info] cleaned output directory | ms=${timingsMs.clean_output_ms}`,
+    );
   }
-  fs.mkdirSync(outputDirAbs, { recursive: true });
+  await fs.promises.mkdir(outputDirAbs, { recursive: true });
   if (fs.existsSync(path.join(outputDirAbs, 'viewer.html'))) {
-    fs.unlinkSync(path.join(outputDirAbs, 'viewer.html'));
+    await removeFileIfExists(path.join(outputDirAbs, 'viewer.html'));
   }
-  fs.rmSync(path.join(outputDirAbs, 'subtrees'), {
+  await fs.promises.rm(path.join(outputDirAbs, 'subtrees'), {
     recursive: true,
     force: true,
   });
@@ -5375,6 +6225,10 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
             '[info] scan 2/4 | building count-balanced k-d tiling tree from memory',
           );
           const tilingStartedAt = Date.now();
+          const tilingProgress = new ConsoleProgressBar(
+            'tiling',
+            header.vertexCount,
+          );
           rootNodeMeta = await buildAdaptiveNodeTreeFromPositions(
             {
               positions: staged.positions,
@@ -5383,8 +6237,10 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
             rootBounds,
             args.maxDepth,
             args.leafLimit,
+            { progress: tilingProgress },
           );
           timingsMs.build_tiling_tree_ms = elapsedMsSince(tilingStartedAt);
+          tilingProgress.done(`ms=${timingsMs.build_tiling_tree_ms}`);
           staged.positions = null;
         } else {
           rootBounds = await scanGlobalBoundsAndWritePositions(

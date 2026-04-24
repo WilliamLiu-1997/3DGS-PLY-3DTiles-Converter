@@ -76,6 +76,7 @@ function writeCloudGlbTaskOutput(task, cloud, translation) {
     task.sh1Bits,
     task.shRestBits,
     translation,
+    { compressionLevel: task.compressionLevel },
   );
   const builder = new GltfBuilder();
   builder.writeSpzStreamGlb(

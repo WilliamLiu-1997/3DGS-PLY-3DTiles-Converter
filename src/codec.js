@@ -8,7 +8,17 @@ const SPZ_STREAM_VERSION = 3;
 const SPZ_FRACTIONAL_BITS = 12;
 const SPZ_FIXED24_LIMIT = (1 << 23) - 1;
 const SPZ_HEADER_BYTES = 16;
-const GZIP_SPZ_OPTIONS = { level: 9, memLevel: 9 };
+const DEFAULT_SPZ_COMPRESSION_LEVEL = 8;
+const GZIP_SPZ_OPTIONS = { level: DEFAULT_SPZ_COMPRESSION_LEVEL, memLevel: 9 };
+
+function firstDefined(...values) {
+  for (const value of values) {
+    if (value !== undefined) {
+      return value;
+    }
+  }
+  return undefined;
+}
 
 function spzExtraDimForDegree(degree) {
   const mapping = { 0: 0, 1: 3, 2: 8, 3: 15 };
@@ -29,6 +39,28 @@ function validateSpzQuantBits(sh1Bits, shRestBits) {
   ) {
     throw new ConversionError('SPZ SH quant bits must be in [1, 8].');
   }
+}
+
+function validateSpzCompressionLevel(level) {
+  if (!Number.isInteger(level) || level < 0 || level > 9) {
+    throw new ConversionError('SPZ compression level must be in [0, 9].');
+  }
+}
+
+function resolveSpzCompressionLevel(options = {}) {
+  options = options || {};
+  const rawLevel = firstDefined(
+    options.level,
+    options.compressionLevel,
+    options.spzCompressionLevel,
+    DEFAULT_SPZ_COMPRESSION_LEVEL,
+  );
+  const level =
+    typeof rawLevel === 'number' && Number.isFinite(rawLevel)
+      ? Math.trunc(rawLevel)
+      : Number.parseInt(String(rawLevel), 10);
+  validateSpzCompressionLevel(level);
+  return level;
 }
 
 function spzCoeffCountForDegree(shDegree) {
@@ -136,8 +168,16 @@ function quantizeSpzExtraSh(coeff, bucket, halfBucket, invBucket) {
   return clamp(Math.floor((q + halfBucket) * invBucket) * bucket, 0, 255);
 }
 
-function gzipSpzPacket(packet, byteLength = packet.length) {
-  return zlib.gzipSync(packet.subarray(0, byteLength), GZIP_SPZ_OPTIONS);
+function gzipSpzPacket(packet, byteLength = packet.length, options = {}) {
+  if (byteLength && typeof byteLength === 'object') {
+    options = byteLength;
+    byteLength = packet.length;
+  }
+  const level = resolveSpzCompressionLevel(options);
+  return zlib.gzipSync(packet.subarray(0, byteLength), {
+    ...GZIP_SPZ_OPTIONS,
+    level,
+  });
 }
 
 const SQRT_HALF = Math.sqrt(0.5);
@@ -220,7 +260,13 @@ function packQuaternionSmallestThreeInto(quats, idx, out, outOff) {
   out[outOff + 3] = (comp >>> 24) & 0xff;
 }
 
-function packCloudToSpz(cloudLocal, sh1Bits, shRestBits, translation = null) {
+function packCloudToSpz(
+  cloudLocal,
+  sh1Bits,
+  shRestBits,
+  translation = null,
+  options = {},
+) {
   validateSpzQuantBits(sh1Bits, shRestBits);
 
   const n = cloudLocal.length;
@@ -305,7 +351,7 @@ function packCloudToSpz(cloudLocal, sh1Bits, shRestBits, translation = null) {
   }
 
   writeSpzPacketHeader(packet, n, cloudLocal.shDegree);
-  return gzipSpzPacket(packet);
+  return gzipSpzPacket(packet, packet.length, options);
 }
 
 function serializeCloudForWorkerTask(cloud) {
@@ -336,6 +382,7 @@ function transferListForCloud(cloud) {
 }
 
 module.exports = {
+  DEFAULT_SPZ_COMPRESSION_LEVEL,
   SPZ_COLOR_SCALE,
   SPZ_MAGIC,
   SPZ_STREAM_VERSION,
@@ -351,6 +398,7 @@ module.exports = {
   quantizeSpzPosition,
   quantizeSpzScale,
   validateSpzCoeffCount,
+  validateSpzCompressionLevel,
   validateSpzQuantBits,
   writeFixed24Into,
   writeSpzPacketHeader,

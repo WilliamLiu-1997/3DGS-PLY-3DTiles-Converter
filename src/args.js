@@ -18,6 +18,7 @@ function usage() {
     '  --min-geometric-error <number>',
     '  --spz-sh1-bits <1..8>',
     '  --spz-sh-rest-bits <1..8>',
+    '  --spz-compression-level <0..9>',
     '  --transform <json_matrix4>',
     '  --coordinate <json_[lat,long,height]>',
     '  --sampling-rate-per-level <0..1]',
@@ -42,6 +43,7 @@ const DEFAULT_CONVERSION_ARGS = {
   minGeometricError: null,
   spzSh1Bits: 8,
   spzShRestBits: 8,
+  spzCompressionLevel: 8,
   transform: null,
   coordinate: null,
   samplingRatePerLevel: 0.5,
@@ -291,6 +293,13 @@ function validateConversionArgs(args, { requireInput = false } = {}) {
   if (args.spzShRestBits < 1 || args.spzShRestBits > 8) {
     throw new ConversionError('--spz-sh-rest-bits must be in [1, 8]');
   }
+  if (
+    !Number.isInteger(args.spzCompressionLevel) ||
+    args.spzCompressionLevel < 0 ||
+    args.spzCompressionLevel > 9
+  ) {
+    throw new ConversionError('--spz-compression-level must be in [0, 9]');
+  }
   if (args.samplingRatePerLevel <= 0.0 || args.samplingRatePerLevel > 1.0) {
     throw new ConversionError('--sampling-rate-per-level must be in (0, 1]');
   }
@@ -410,6 +419,17 @@ function parseArgs(argv) {
         );
       }
       args.spzShRestBits = value;
+      continue;
+    }
+    if (token === '--spz-compression-level') {
+      const raw = requireValue(token);
+      const value = Number.parseInt(raw, 10);
+      if (!Number.isInteger(value)) {
+        throw new ConversionError(
+          `Invalid integer for --spz-compression-level: ${raw}`,
+        );
+      }
+      args.spzCompressionLevel = value;
       continue;
     }
     if (token === '--transform') {
@@ -608,6 +628,15 @@ function makeConversionArgs(
         DEFAULT_CONVERSION_ARGS.spzShRestBits,
       ),
       '--spz-sh-rest-bits',
+    ),
+    spzCompressionLevel: normalizeToInt(
+      firstDefined(
+        options.spzCompressionLevel,
+        options['spz-compression-level'],
+        options.spz_compression_level,
+        DEFAULT_CONVERSION_ARGS.spzCompressionLevel,
+      ),
+      '--spz-compression-level',
     ),
     coordinate: normalizeCoordinate(rawCoordinate, 'coordinate'),
     transform: null,
