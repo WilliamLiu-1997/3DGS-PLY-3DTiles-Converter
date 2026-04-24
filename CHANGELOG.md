@@ -8,37 +8,28 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ### Added
 
-- Added a temp-file-backed large-PLY conversion pipeline that streams binary or ASCII PLY input into leaf buckets, builds parent LODs from handoff data, and can resume from a preserved temp workspace when rerun without `--clean`.
-- Added `memoryBudget` / `--memory-budget` to control the partition and bottom-up build memory budget in GB and derive partition write concurrency, bottom-up build concurrency, and SPZ/GLB worker count.
-- Added `handoff_encoding`, `memory_budget_gb`, `build_concurrency`, `content_workers`, `partition_write_concurrency`, `checkpoint_reused`, and `checkpoint_reused_stage` metadata to generated `build_summary.json` files.
-- Added `spzCompressionLevel` / `--spz-compression-level` to control the gzip `level` used for SPZ payloads, and record `spz_compression_level` in generated `build_summary.json` files.
+- Added a temp-file-backed large-PLY conversion pipeline for binary and ASCII input. The pipeline streams input into canonical leaf and handoff buckets, builds parent LODs from handoff data, removes successful temp workspaces, and can resume a preserved failed workspace with `--continue`.
+- Added `memoryBudget` / `--memory-budget` to size scan buffers, partition arenas, simplify scratch space, partition write concurrency, bottom-up build concurrency, and SPZ/GLB worker count from one GB-based budget.
+- Added `spzCompressionLevel` / `--spz-compression-level` to control the gzip compression level used for SPZ payloads.
+- Added root-PCA oriented bounding boxes by default, plus `orientedBoundingBoxes` and `--obb` / `--aabb` controls to switch emitted 3D Tiles `box` bounds and k-d split planes between OBB and AABB modes.
+- Added optional local inspection through `3dtiles-inspector`, controlled by `openInspector` and `--open-inspector` / `--no-open-inspector`.
+- Added build diagnostics to `build_summary.json`, including handoff encoding, memory budget plan, derived concurrency, checkpoint reuse state, timings, peak RSS, k-d tiling metadata, OBB mode, virtual node count, and SPZ compression level.
 
 ### Changed
 
-- Changed the default `maxDepth` from `4` to `8`.
-- Changed the default `leafLimit` from `10000` to `100`.
-- Changed the default SPZ gzip compression `level` to `8`; gzip `memLevel` remains an internal fixed setting.
-- Updated voxel simplification so retained splat targets also drive voxel grouping and representative selection stays coarse-biased across sampling paths, replacing the earlier expanded/detail-first merge planning.
-- Reduced bottom-up build overhead in the temp-file-backed pipeline by throttling checkpoint rewrites across node levels, batch-cleaning consumed handoff buckets per level, and linking leaf handoff buckets to existing leaf bucket files when possible instead of rewriting the same canonical payload.
-- Streamed unsimplified bucket-backed content directly into SPZ/GLB output with content-worker support, avoiding full `GaussianCloud` materialization when no simplification is needed.
-- Reduced large binary PLY conversion time by staging position-only scan data, tracking bucket row counts in node metadata, overlapping handoff cleanup, prefetching binary PLY chunks, and double-buffering partition write arenas.
-- Reduced bottom-up tile build time by using the configurable memory budget, scheduling nodes by estimated memory use, lowering the SPZ worker threshold for bucket-backed content, and reusing safe node-center translations to avoid an extra bounds scan before packing GLB content.
-- Reduced internal-node bottom-up build time by moving exact bucket simplification, handoff materialization, and SPZ/GLB packing into the same budget-derived worker pool used for content generation.
-- Reduced SPZ/GLB and simplification overhead by batching GLB writes, avoiding per-row quaternion packing allocations, using a configurable gzip compression level with a fixed high gzip memory setting, and reusing planning-time radius data through merge and exact own-error passes when it fits the scratch budget.
-- Reduced partition write bottlenecks by using the configurable memory budget for partition buffers, compacting scattered rows into larger per-leaf writes, limiting active leaf file handles, and writing leaf buckets with bounded concurrency.
-- Reduced scan/tiling and simplify overhead by staging positions in memory when they fit the memory budget, sizing stream chunks from the budget, combining merge covariance work with the first SH merge pass, and skipping fallback row materialization when it is unnecessary.
-- Reduced in-memory count-balanced k-d tree build overhead by keeping staged position index ranges per node and partitioning ordinary k-d splits in one pass.
-- Capped bottom-up node scheduling and SPZ/GLB content workers at eight workers, then derive per-worker scratch/cache and partition write concurrency from `memoryBudget`.
-- Added `memory_budget_plan`, `timings_ms`, and `peak_rss_bytes` diagnostics to generated `build_summary.json` files.
-- Changed progress reporting to use short single-line spinner status with detailed phase messages emitted as separate throttled logs.
-- Changed tiling to an explicit count-balanced k-d tree that chooses one histogram-median split plane per node, so leaf buckets stay balanced by splat count without relying on fixed octree subdivision.
-- Replaced non-root k-d tiles whose tight longest-to-width aspect ratio exceeds `2:1` with equal-length virtual segments, so long intermediate tiles are not emitted while logical LOD depth remains bounded by `maxDepth`.
+- Replaced the in-memory octree build path with a single explicit, visual-cost-balanced k-d tree pipeline that uses root PCA axes by default and keeps leaf buckets balanced by weighted splat count.
+- Replaced long, thin non-root k-d tiles with equal-length virtual segment paths so emitted intermediate tiles avoid extreme aspect ratios while logical LOD depth remains bounded by `maxDepth`.
+- Changed defaults: `maxDepth` is now `8`, `leafLimit` is now `100`, SPZ gzip compression level is now `8`, `clean` is now `true`, `selfTestCount` is now `1000000`, and inspector launch is enabled by default.
+- Changed resume semantics so the default conversion rebuilds from a clean output directory; use `--continue` or `clean: false` to reuse a preserved checkpoint.
+- Updated voxel simplification so retained splat targets drive voxel grouping directly and representative selection stays coarse-biased across `sample` and `merge` modes.
+- Improved large-file conversion throughput by staging position data when it fits the memory budget, prefetching binary PLY chunks, compacting partition writes, limiting active leaf file handles, batching GLB writes, streaming unsimplified bucket content directly to SPZ/GLB output, and running exact bucket simplification and content packing in the derived worker pool.
+- Changed progress reporting to concise spinner-style status lines with throttled phase detail logs.
 
 ### Removed
 
-- Reduced the published package surface to the supported `convert` entry point only, removing package-root re-exports such as `convertPlyTo3DTiles`, `convertCloud`, `parseCommonGaussianPly`, `makeConversionArgs`, and `run`, plus the package `./cli` export.
-- Removed `buildConcurrency` / `--build-concurrency` and `contentWorkers` / `--content-workers`; conversion now derives those internal concurrency values from `memoryBudget`.
 - Removed implicit tiling output and the `tilingMode` / `--tiling-mode` and `subtreeLevels` / `--subtree-levels` options.
+- Removed `buildConcurrency` / `--build-concurrency` and `contentWorkers` / `--content-workers`; conversion now derives internal concurrency from `memoryBudget`.
+- Reduced the published package API to the supported `convert` entry point only, removing package-root helper exports such as `convertPlyTo3DTiles`, `convertCloud`, `parseCommonGaussianPly`, `makeConversionArgs`, and `run`, plus the package `./cli` export.
 
 ## [0.1.6] - 2026-04-19
 

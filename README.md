@@ -12,10 +12,7 @@
 
 </div>
 
-This package targets **Node.js** and exposes both:
-
-- A CLI entry (`3dgs-ply-3dtiles-converter`)
-- A library API (`convert`)
+Node.js CLI and library for converting GraphDECO or KHR-native Gaussian Splatting PLY files into explicit 3D Tiles. The converter writes SPZ-compressed GLB tile content, uses a temp-file-backed pipeline for large inputs, and supports optional geospatial placement through a root transform or WGS84 coordinate.
 
 ## Install
 
@@ -25,156 +22,142 @@ npm install 3dgs-ply-3dtiles-converter
 
 Requires Node.js 14.14 or newer.
 
-## Run from CLI
+## CLI
 
 ```bash
 3dgs-ply-3dtiles-converter [options] <input.ply> <output_dir>
-3dgs-ply-3dtiles-converter --self-test <output_dir>
 ```
 
+Example:
+
 ```bash
-npx 3dgs-ply-3dtiles-converter [options] <input.ply> <output_dir>
+3dgs-ply-3dtiles-converter scene.ply out_tiles
+```
+
+You can also run it without installing globally:
+
+```bash
+npx 3dgs-ply-3dtiles-converter scene.ply out_tiles
 ```
 
 From a cloned repository:
 
 ```bash
-node ./bin/3dgs-ply-3dtiles-converter.js [options] <input.ply> <output_dir>
-node ./bin/3dgs-ply-3dtiles-converter.js --self-test <output_dir>
+node ./bin/3dgs-ply-3dtiles-converter.js scene.ply out_tiles
 ```
 
-Output is written under:
+Self-test:
 
-- `tileset.json` (main tileset root, written as compact single-line JSON)
-- `build_summary.json` (conversion metadata, timing diagnostics, `memory_budget_plan`, `peak_rss_bytes`, and placement fields such as `root_transform`, `root_coordinate`, and `root_transform_source`, written as compact single-line JSON)
-- `tiles/{level}/{x}/{y}/{z}.glb` (tile content)
+```bash
+3dgs-ply-3dtiles-converter --self-test out_self_test --no-open-inspector
+```
 
-Generated `tileset.json` files declare the top-level `3DTILES_content_gltf` tileset extension metadata that CesiumJS uses to detect `KHR_gaussian_splatting` and `KHR_gaussian_splatting_compression_spz_2` glTF tile content.
+By default, conversion removes the existing `output_dir` before rebuilding and opens the generated tileset in `3dtiles-inspector` after success. Use `--continue` to resume from a preserved failed workspace, and use `--no-open-inspector` for batch or CI runs.
 
-Tiling is explicit and uses a root-PCA-basis, visual-cost-balanced k-d tree by default. The converter computes one 3x3 covariance of all splat centers, uses its PCA axes as the shared OBB frame, and each logical split chooses the shared basis axis with the longest projected extent before placing a projection-histogram median split plane using splat weight `max(opacity, 1e-4) * radius3sigma^2`. Leaf buckets are still routed by splat center point, but split planes and emitted 3D Tiles `box` half-axes use the same root PCA basis. With `--aabb`, emitted boxes and k-d split planes both use axis-aligned AABB axes instead.
+## Output
 
-Large PLY conversion through `convert(...)` now uses a temp-file-backed pipeline. That path writes canonical leaf/handoff buckets, builds parent LODs from handoff data, uses exact streaming simplify so internal nodes do not need a full in-memory SH payload up front, and processes each level with memory-budgeted concurrency. Successful conversions remove the temp workspace; failed conversions preserve it so the same output directory can resume when rerun with `--continue`.
+Generated output includes:
 
-## API usage
+- `tileset.json` - compact explicit 3D Tiles tileset.
+- `build_summary.json` - compact conversion metadata, timings, memory plan, checkpoint state, tiling metadata, and placement fields.
+- `tiles/{level}/{x}/{y}/{z}.glb` - SPZ-compressed tile content.
+
+Generated `tileset.json` files declare top-level `3DTILES_content_gltf` extension metadata so CesiumJS can detect `KHR_gaussian_splatting` and `KHR_gaussian_splatting_compression_spz_2` content.
+
+## API
 
 ```js
 const { convert } = require('3dgs-ply-3dtiles-converter');
 
 (async () => {
   const result = await convert('data/scene.ply', './out/tileset', {
+    memoryBudget: 4,
     maxDepth: 8,
     leafLimit: 100,
-    spzSh1Bits: 8,
-    spzShRestBits: 8,
-    spzCompressionLevel: 8,
-    memoryBudget: 2,
+    openInspector: false,
   });
+
   console.log(result.outputDir, result.splatCount);
 })();
 ```
 
-## API return values
+`convert(inputPath, outputDir, options)` returns:
 
-- `convert(...)` returns
-  - `inputPath`: absolute input path
-  - `outputDir`: absolute output path
-  - `splatCount`: point count
-  - `shDegree`: inferred SH degree
-  - `args`: normalized and validated parameters; when `coordinate` is provided, `args.transform` contains the generated ENU root transform
+| Field        | Description                                                                                                               |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------- |
+| `inputPath`  | Absolute input PLY path.                                                                                                  |
+| `outputDir`  | Absolute output directory.                                                                                                |
+| `splatCount` | Parsed splat count.                                                                                                       |
+| `shDegree`   | Inferred spherical-harmonics degree.                                                                                      |
+| `args`       | Normalized conversion arguments. If `coordinate` is provided, `args.transform` contains the generated ENU root transform. |
 
-## Parameters (CLI + API)
+The library API accepts the same option names as the CLI, using camelCase fields. For example, `--memory-budget 4` maps to `{ memoryBudget: 4 }`.
 
-The library API accepts the same option names as CLI flags, with camelCase names.
+## Options
 
-Examples:
+| Area | CLI | API | Default | Notes |
+| ---- | --- | --- | ------- | ----- |
+| Input convention | `--input-convention <value>` | `inputConvention` | `graphdeco` | Use `graphdeco` or `khr_native`; controls quaternion interpretation and opacity mapping. |
+| Linear scale input | `--linear-scale-input` | `linearScaleInput` | `false` | Converts linear scale values to log scale. |
+| Color space | `--color-space <value>` | `colorSpace` | `srgb_rec709_display` | Use `lin_rec709_display` or `srgb_rec709_display`; written to tileset extension metadata. |
+| Tiling depth | `--max-depth <int>` | `maxDepth` | `8` | Maximum logical k-d tree LOD depth. |
+| Leaf size | `--leaf-limit <int>` | `leafLimit` | `100` | Max splats per leaf before splitting stops. |
+| Geometric error floor | `--min-geometric-error <number>` | `minGeometricError` | `null` | Minimum geometric error for the deepest emitted level. |
+| SPZ quantization | `--spz-sh1-bits <1..8>` and `--spz-sh-rest-bits <1..8>` | `spzSh1Bits`, `spzShRestBits` | `8`, `8` | SH coefficient quantization bits. |
+| SPZ compression | `--spz-compression-level <0..9>` | `spzCompressionLevel` | `8` | gzip compression level for SPZ payloads. |
+| Placement matrix | `--transform <json_matrix4>` | `transform` | `null` | Writes `tileset.root.transform` directly. |
+| Placement coordinate | `--coordinate <json_[lat,long,height]>` | `coordinate` | `null` | Generates an ENU root transform from WGS84 degrees/meters. |
+| LOD sampling | `--sampling-rate-per-level <0..1]` | `samplingRatePerLevel` | `0.5` | Sampling ratio between LOD levels. |
+| Sampling mode | `--sample-mode <value>` | `sampleMode` | `merge` | Use `sample` or `merge`; `sample` keeps representatives and `merge` merges assigned splats. |
+| Memory budget | `--memory-budget <gb>` | `memoryBudget` | `2` | Sizes scan buffers, bucket buffers, simplify scratch space, write concurrency, and workers. |
+| Bounds mode | `--obb` or `--aabb` | `orientedBoundingBoxes` | `true` | Emits root-PCA OBB bounds by default; `--aabb` uses axis-aligned bounds and split planes. |
+| Inspector | `--open-inspector` or `--no-open-inspector` | `openInspector` | `true` | Opens the generated tileset in `3dtiles-inspector` after success. |
+| Self-test count | `--self-test-count <int>` | `selfTestCount` | `1000000` | Number of synthetic splats when using `--self-test`. |
+| Output cleanup | `--clean` or `--continue` | `clean` | `true` | `--continue` preserves the output directory and resumes a failed checkpoint. |
 
-- CLI `--max-depth 8` equals API `{ maxDepth: 8 }`
-- CLI `--spz-sh1-bits 6` equals API `{ spzSh1Bits: 6 }`
-- CLI `--spz-compression-level 6` equals API `{ spzCompressionLevel: 6 }`
-- CLI `--sample-mode merge` equals API `{ sampleMode: 'merge' }`
-- CLI `--memory-budget 4` equals API `{ memoryBudget: 4 }`
-- CLI `--coordinate "[31.2304,121.4737,30]"` equals API `{ coordinate: [31.2304, 121.4737, 30] }`
+Use `--help` to print the CLI usage text.
 
-### Common positional args
+## Tiling and Performance
 
-| Type     | CLI             | API          | Description                                               |
-| -------- | --------------- | ------------ | --------------------------------------------------------- |
-| required | `input.ply`     | `inputPath`  | Path to input PLY. Required unless `--self-test` is used. |
-| required | `output_dir`    | `outputDir`  | Output directory path. Required unless `--help` is used.  |
-| optional | `--help` / `-h` | `help: true` | Print help text and exit.                                 |
+The converter always writes explicit 3D Tiles. It builds a visual-cost-balanced k-d tree, uses root-PCA oriented bounding boxes by default, and falls back to AABB behavior when `--aabb` is set.
 
-### Conversion options
+Large PLY files are processed through a temp-file-backed pipeline. The pipeline streams PLY records into leaf and handoff buckets, builds parent LODs bottom-up, and derives internal concurrency from `memoryBudget`. Successful conversions remove the temp workspace. Failed conversions preserve it so a later run with `--continue` can reuse checkpoints.
 
-| Option                  | Type    | CLI flag                                   | API field               | Default               | Valid range                                 | Notes                                                                                                                                                                                                                                                             |
-| ----------------------- | ------- | ------------------------------------------ | ----------------------- | --------------------- | ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Input convention        | string  | `--input-convention`                       | `inputConvention`       | `graphdeco`           | `graphdeco`, `khr_native`                   | Controls PLY quaternion interpretation and opacity mapping.                                                                                                                                                                                                       |
-| Linear scale input      | boolean | `--linear-scale-input`                     | `linearScaleInput`      | `false`               | `true`/`false`                              | If enabled, converts scale values as `ln(max(v, 1e-8))`.                                                                                                                                                                                                          |
-| Color space             | string  | `--color-space`                            | `colorSpace`            | `srgb_rec709_display` | `lin_rec709_display`, `srgb_rec709_display` | Emitted in tileset extension metadata.                                                                                                                                                                                                                            |
-| Max depth               | integer | `--max-depth`                              | `maxDepth`              | `8`                   | `>= 0`                                      | Maximum logical k-d tree LOD depth. Virtual long-tile segment paths may be physically deeper.                                                                                                                                                                     |
-| Leaf limit              | integer | `--leaf-limit`                             | `leafLimit`             | `100`                 | `>= 1`                                      | Max splat count per leaf tile before split stops.                                                                                                                                                                                                                 |
-| Min geometric error     | number  | `--min-geometric-error`                    | `minGeometricError`     | `null`                | any finite number                           | Minimum geometric error for the deepest emitted level.                                                                                                                                                                                                            |
-| SH1 bits                | integer | `--spz-sh1-bits`                           | `spzSh1Bits`            | `8`                   | `1..8`                                      | SPZ quantization bits for DC SH coefficients.                                                                                                                                                                                                                     |
-| SH rest bits            | integer | `--spz-sh-rest-bits`                       | `spzShRestBits`         | `8`                   | `1..8`                                      | SPZ quantization bits for higher SH coefficients.                                                                                                                                                                                                                 |
-| SPZ compression level   | integer | `--spz-compression-level`                  | `spzCompressionLevel`   | `8`                   | `0..9`                                      | gzip compression `level` used for SPZ payloads. Does not expose or change gzip `memLevel`.                                                                                                                                                                        |
-| Root transform          | matrix4 | `--transform`                              | `transform`             | `null`                | 4x4 JSON matrix or 16 numbers               | Writes `tileset.root.transform` directly. Nested `[[...]]` matrices are read as row-major and converted to 3D Tiles column-major storage.                                                                                                                         |
-| Root coordinate         | vec3    | `--coordinate`                             | `coordinate`            | `null`                | `[lat, long, height]`                       | Generates `tileset.root.transform` from WGS84 degrees/meters as a standard ENU frame in 3D Tiles tile coordinates. The API also accepts object forms such as `{ lat, lon, height }` and `{ latitude, longitude, altitude }`. Mutually exclusive with `transform`. |
-| Sampling rate per level | number  | `--sampling-rate-per-level`                | `samplingRatePerLevel`  | `0.5`                 | `(0,1]`                                     | LOD sampling ratio between levels.                                                                                                                                                                                                                                |
-| Sampling mode           | string  | `--sample-mode`                            | `sampleMode`            | `merge`               | `sample`, `merge`                           | `sample` keeps representative splats; `merge` merges assigned splats into the target count. Voxel representative picks are always coarse-biased.                                                                                                                  |
-| Memory budget           | number  | `--memory-budget`                          | `memoryBudget`          | `2`                   | `> 0` GB                                    | Shared memory budget, in GB, used to size scan/bucket buffers, partition arenas, simplify scratch buffers, partition write concurrency, bottom-up build concurrency, and SPZ/GLB worker count.                                                                    |
-| Oriented bounds         | boolean | `--obb` / `--aabb`                         | `orientedBoundingBoxes` | `true`                | `true`/`false`                              | Emits root-PCA-oriented 3D Tiles `box` bounding volumes by default. Use `--aabb` to write axis-aligned boxes and align k-d split planes to AABB axes instead.                                                                                                     |
-| Open inspector          | boolean | `--open-inspector` / `--no-open-inspector` | `openInspector`         | `true`                | `true`/`false`                              | Opens the generated `tileset.json` in `3dtiles-inspector` after conversion completes by default. Use `--no-open-inspector` to skip launching the local inspector server.                                                                                          |
-| Self-test               | boolean | `--self-test`                              | `selfTest`              | `false`               | `true`/`false`                              | Generates synthetic cloud and writes sample PLY.                                                                                                                                                                                                                  |
-| Self-test count         | integer | `--self-test-count`                        | `selfTestCount`         | `1000000`             | integer                                     | Number of synthetic splats.                                                                                                                                                                                                                                       |
-| Clean output            | boolean | `--clean` / `--continue`                   | `clean`                 | `true`                | `true`/`false`                              | Removes the existing output directory before conversion by default. Use `--continue` to preserve the output directory and resume from a failed build checkpoint.                                                                                                  |
+## Global Placement
 
-## Global placement
+When the tileset needs geospatial placement, use one placement option:
 
-Use one of the following options when the generated tileset should be geolocated:
+- `--coordinate "[lat,long,height]"` or `{ coordinate: [lat, long, height] }` anchors the tileset origin at a WGS84 coordinate and generates a standard ENU transform.
+- `--transform "[...16 numbers...]"` or `{ transform: [...] }` writes `tileset.root.transform` directly.
 
-- `transform`: Directly provide the final `tileset.root.transform`.
-- `coordinate`: Provide `[lat, long, height]` in WGS84 degrees/meters and let the converter generate an ENU transform automatically.
-
-`transform` is interpreted in final 3D Tiles tile coordinates, not raw glTF Y-up node space. The converter now always applies its built-in source normalization path internally, so `--source-up-axis` / `sourceUpAxis` is no longer supported.
-
-Tile bounding volumes are emitted in the same 3D Tiles tile frame as content and root transforms.
-
-`coordinate` anchors the tileset's local origin at the provided geodetic position. If you need to place another local point at that position, provide a custom `transform` instead. In the API, `coordinate` also accepts object forms such as `{ lat, lon, height }`.
+`transform` is interpreted in final 3D Tiles tile coordinates, not raw glTF Y-up node space. The old `--source-up-axis` / `sourceUpAxis` option is not supported.
 
 Examples:
 
 ```bash
-3dgs-ply-3dtiles-converter --coordinate "[31.2304,121.4737,30]" scene.ply out_tiles
+3dgs-ply-3dtiles-converter scene.ply out_tiles --coordinate "[31.2304,121.4737,30]" --no-open-inspector
 ```
 
 ```js
 await convert('scene.ply', './out_tiles', {
   coordinate: [31.2304, 121.4737, 30],
+  openInspector: false,
 });
 ```
 
-## Pipeline notes
+## Repository Layout
 
-- The converter uses a single temp-file-backed build pipeline and is designed for multi-GB inputs.
-- If a build fails, rerun against the same `outputDir` with `--continue` to resume from the preserved temp workspace. The default behavior, equivalent to `--clean`, discards the checkpoint and rebuilds from scratch.
+- `src/index.js` - package export.
+- `src/cli.js` - CLI runner.
+- `src/args.js` - CLI/API argument parsing and validation.
+- `src/parser.js` - PLY streaming helpers and self-test data.
+- `src/codec.js` - SPZ encoding and worker payload helpers.
+- `src/gltf.js` - GLB assembly.
+- `src/builder.js` - shared simplify planning, progress, and worker-pool utilities.
+- `src/partitioned-ply.js` - temp-file-backed conversion pipeline.
+- `src/convert-core.js` - top-level conversion wiring and worker entry.
+- `bin/3dgs-ply-3dtiles-converter.js` - npm binary entry.
 
-## Entry files
+## Errors
 
-- `src/index.js` - main package export (`module.exports`)
-- `src/cli.js` - CLI runner
-- `src/args.js` - CLI/API argument parsing, normalization, validation
-- `src/parser.js` - cloud model, PLY streaming helpers, self-test data helpers
-- `src/codec.js` - SPZ stream encoding and worker payload helpers
-- `src/gltf.js` - GLB/gltf assembly for Gaussian Splatting content
-- `src/builder.js` - shared simplify planning, progress, and worker-pool utilities
-- `src/convert-core.js` - CLI/options, worker entry, top-level conversion wiring
-- `bin/3dgs-ply-3dtiles-converter.js` - npm binary entry
-
-## Error handling
-
-Conversion failures throw `ConversionError`.  
-Examples:
-
-- Invalid option values
-- Missing input/output paths
-- Invalid PLY fields
-- Missing required PLY properties
+Conversion failures throw `ConversionError`. Common causes include invalid option values, missing input/output paths, unsupported PLY fields, or missing required Gaussian PLY properties.
