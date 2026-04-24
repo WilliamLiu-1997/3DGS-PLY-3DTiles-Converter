@@ -245,6 +245,7 @@ async function readPlyHeaderFromHandle(handle, filePath) {
   let format = null;
   let vertexCount = null;
   const vertexProps = [];
+  const comments = [];
   let currentElement = null;
   let sawMagic = false;
   let cursor = 0;
@@ -295,7 +296,12 @@ async function readPlyHeaderFromHandle(handle, filePath) {
         break;
       }
 
-      if (!line || line.startsWith('comment')) {
+      if (!line) {
+        continue;
+      }
+
+      if (line.startsWith('comment')) {
+        comments.push(line.slice('comment'.length).trim());
         continue;
       }
 
@@ -328,7 +334,7 @@ async function readPlyHeaderFromHandle(handle, filePath) {
     vertexCount != null && vertexProps.length > 0,
     'No vertex element or vertex properties found in PLY header.',
   );
-  return { format, vertexCount, vertexProps, dataOffset: cursor };
+  return { format, vertexCount, vertexProps, comments, dataOffset: cursor };
 }
 
 async function readExact(handle, buffer, length, position, eofMessage) {

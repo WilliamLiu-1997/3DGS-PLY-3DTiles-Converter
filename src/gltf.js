@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { ensure } = require('./parser');
+const { sourceCoordinateSystemInfo } = require('./coordinates');
 
 const GLTF_ACCESSOR_COMPONENTS = {
   SCALAR: 1,
@@ -12,12 +13,6 @@ const GLTF_ACCESSOR_COMPONENTS = {
   MAT3: 9,
   MAT4: 16,
 };
-
-const Y_AXIS_SOURCE_TO_GLTF_Y_UP = [
-  [1.0, 0.0, 0.0],
-  [0.0, -1.0, 0.0],
-  [0.0, 0.0, -1.0],
-];
 
 function pad4Length(length) {
   const rem = length % 4;
@@ -55,24 +50,24 @@ function mat4ToGltfColumnMajorList(m) {
   ];
 }
 
-function make3DTilesGltfRootMatrix(translation) {
+function make3DTilesGltfRootMatrix(translation, sourceCoordinateSystem = null) {
   const t0 = translation[0];
   const t1 = translation[1];
   const t2 = translation[2];
-  // Many 3DGS PLY datasets that are described as "y-axis" content still use
-  // the common camera-style basis (+Y down, +Z forward). Normalize that to
-  // glTF's Y-up local space before the 3D Tiles runtime applies its standard
-  // glTF Y-up -> tile Z-up rotation.
+  const sourceInfo = sourceCoordinateSystemInfo(sourceCoordinateSystem);
+  // Normalize source PLY coordinates to glTF Y-up before the 3D Tiles runtime
+  // applies its standard glTF Y-up -> tile Z-up rotation.
+  const sourceToGltfYUp = sourceInfo.sourceToGltfYUp;
   const r = [
-    Y_AXIS_SOURCE_TO_GLTF_Y_UP[0][0],
-    Y_AXIS_SOURCE_TO_GLTF_Y_UP[0][1],
-    Y_AXIS_SOURCE_TO_GLTF_Y_UP[0][2],
-    Y_AXIS_SOURCE_TO_GLTF_Y_UP[1][0],
-    Y_AXIS_SOURCE_TO_GLTF_Y_UP[1][1],
-    Y_AXIS_SOURCE_TO_GLTF_Y_UP[1][2],
-    Y_AXIS_SOURCE_TO_GLTF_Y_UP[2][0],
-    Y_AXIS_SOURCE_TO_GLTF_Y_UP[2][1],
-    Y_AXIS_SOURCE_TO_GLTF_Y_UP[2][2],
+    sourceToGltfYUp[0][0],
+    sourceToGltfYUp[0][1],
+    sourceToGltfYUp[0][2],
+    sourceToGltfYUp[1][0],
+    sourceToGltfYUp[1][1],
+    sourceToGltfYUp[1][2],
+    sourceToGltfYUp[2][0],
+    sourceToGltfYUp[2][1],
+    sourceToGltfYUp[2][2],
   ];
   const t = [
     r[0] * t0 + r[1] * t1 + r[2] * t2,
@@ -220,7 +215,14 @@ class GltfBuilder {
     return this.accessors.length - 1;
   }
 
-  writeSpzStreamGlb(filePath, spzBytes, cloud, colorSpace, translation) {
+  writeSpzStreamGlb(
+    filePath,
+    spzBytes,
+    cloud,
+    colorSpace,
+    translation,
+    sourceCoordinateSystem = null,
+  ) {
     const bufferViewIndex = this.addBufferView(spzBytes);
     const n = cloud.length;
     const attributes = {};
@@ -328,7 +330,10 @@ class GltfBuilder {
       nodes: [
         {
           mesh: 0,
-          matrix: make3DTilesGltfRootMatrix(translation),
+          matrix: make3DTilesGltfRootMatrix(
+            translation,
+            sourceCoordinateSystem,
+          ),
         },
       ],
       materials: [{ extensions: { KHR_materials_unlit: {} } }],

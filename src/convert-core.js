@@ -85,6 +85,7 @@ function writeCloudGlbTaskOutput(task, cloud, translation) {
     cloud,
     task.colorSpace,
     translation,
+    task.sourceCoordinateSystem,
   );
 }
 

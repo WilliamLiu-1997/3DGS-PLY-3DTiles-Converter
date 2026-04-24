@@ -743,6 +743,11 @@ function makeConversionArgs(
   delete merged.sourceUpAxis;
   delete merged['source-up-axis'];
   delete merged.source_up_axis;
+  delete merged.sourceCoordinateSystem;
+  delete merged.source_coordinate_system;
+  delete merged['source-coordinate-system'];
+  delete merged.resolvedSourceCoordinateSystem;
+  delete merged.resolved_source_coordinate_system;
   delete merged.buildConcurrency;
   delete merged['build-concurrency'];
   delete merged.build_concurrency;

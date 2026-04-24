@@ -14,6 +14,7 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 - Added root-PCA oriented bounding boxes by default, plus `orientedBoundingBoxes` and `--obb` / `--aabb` controls to switch emitted 3D Tiles `box` bounds and k-d split planes between OBB and AABB modes.
 - Added optional local inspection through `3dtiles-inspector`, controlled by `openInspector` and `--open-inspector` / `--no-open-inspector`.
 - Added build diagnostics to `build_summary.json`, including handoff encoding, memory budget plan, derived concurrency, checkpoint reuse state, timings, peak RSS, k-d tiling metadata, OBB mode, virtual node count, and SPZ compression level.
+- Added automatic source coordinate-system detection from PLY header comments, including projected/geospatial metadata such as `epsg` and `offset*`, with the resolved source frame recorded in `build_summary.json`.
 
 ### Changed
 

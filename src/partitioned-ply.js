@@ -14,6 +14,11 @@ const {
   _buildGaussianPlyLayout,
   _forEachGaussianPlyCanonicalRecord,
 } = require('./parser');
+const {
+  DEFAULT_SOURCE_COORDINATE_SYSTEM,
+  detectSourceCoordinateSystemFromPlyHeader,
+  sourceCoordinateSystemInfo,
+} = require('./coordinates');
 
 const {
   SPZ_STREAM_VERSION,
@@ -56,7 +61,7 @@ const {
 const DEFAULT_WORKER_SCRIPT = path.join(__dirname, 'convert-core.js');
 const TEMP_WORKSPACE_NAME = '.tmp-ply-partitions';
 const PIPELINE_STATE_FILE = 'pipeline-state.json';
-const PIPELINE_STATE_VERSION = 13;
+const PIPELINE_STATE_VERSION = 14;
 const PIPELINE_STAGE_BUCKETED = 'bucketed';
 const LEAF_BUCKET_DIR = 'leaf';
 const HANDOFF_BUCKET_DIR = 'handoff';
@@ -99,11 +104,6 @@ const IS_LITTLE_ENDIAN = (() => {
   const probe = new Uint8Array(new Uint16Array([0x0102]).buffer);
   return probe[0] === 0x02;
 })();
-const BUILT_IN_SOURCE_TO_TILE_Z_UP = [
-  [1.0, 0.0, 0.0],
-  [0.0, 0.0, 1.0],
-  [0.0, -1.0, 0.0],
-];
 const GLTF_TILESET_CONTENT_EXTENSION = '3DTILES_content_gltf';
 const GAUSSIAN_SPLATTING_GLTF_EXTENSIONS = [
   'KHR_gaussian_splatting',
@@ -386,28 +386,31 @@ function applyRootTransform(root, transform) {
   return root;
 }
 
-function applyContentBoxTransform(box) {
+function applyContentBoxTransform(box, sourceCoordinateSystem = null) {
   if (!Array.isArray(box) || box.length !== 12) {
     return box;
   }
 
+  const sourceToTileZUp = sourceCoordinateSystemInfo(
+    sourceCoordinateSystem,
+  ).sourceToTileZUp;
   const out = box.slice();
   for (const base of [0, 3, 6, 9]) {
     const x = out[base];
     const y = out[base + 1];
     const z = out[base + 2];
     out[base] =
-      BUILT_IN_SOURCE_TO_TILE_Z_UP[0][0] * x +
-      BUILT_IN_SOURCE_TO_TILE_Z_UP[0][1] * y +
-      BUILT_IN_SOURCE_TO_TILE_Z_UP[0][2] * z;
+      sourceToTileZUp[0][0] * x +
+      sourceToTileZUp[0][1] * y +
+      sourceToTileZUp[0][2] * z;
     out[base + 1] =
-      BUILT_IN_SOURCE_TO_TILE_Z_UP[1][0] * x +
-      BUILT_IN_SOURCE_TO_TILE_Z_UP[1][1] * y +
-      BUILT_IN_SOURCE_TO_TILE_Z_UP[1][2] * z;
+      sourceToTileZUp[1][0] * x +
+      sourceToTileZUp[1][1] * y +
+      sourceToTileZUp[1][2] * z;
     out[base + 2] =
-      BUILT_IN_SOURCE_TO_TILE_Z_UP[2][0] * x +
-      BUILT_IN_SOURCE_TO_TILE_Z_UP[2][1] * y +
-      BUILT_IN_SOURCE_TO_TILE_Z_UP[2][2] * z;
+      sourceToTileZUp[2][0] * x +
+      sourceToTileZUp[2][1] * y +
+      sourceToTileZUp[2][2] * z;
   }
   return out;
 }
@@ -953,13 +956,20 @@ function resetNodeArtifacts(node) {
   }
 }
 
-function makePipelineFingerprint(inputPath, inputStat, args) {
+function makePipelineFingerprint(
+  inputPath,
+  inputStat,
+  args,
+  sourceCoordinateSystem,
+) {
   return {
     inputPath: path.resolve(inputPath),
     inputSize: inputStat.size,
     inputMtimeMs: inputStat.mtimeMs,
     inputConvention: args.inputConvention,
     linearScaleInput: args.linearScaleInput,
+    sourceCoordinateSystem:
+      sourceCoordinateSystem || DEFAULT_SOURCE_COORDINATE_SYSTEM,
     maxDepth: args.maxDepth,
     leafLimit: args.leafLimit,
     tilingStrategy: TILING_STRATEGY_KD_TREE,
@@ -3739,6 +3749,7 @@ async function writeContentFile(
         shRestBits: params.spzShRestBits,
         compressionLevel: params.spzCompressionLevel,
         colorSpace: params.colorSpace,
+        sourceCoordinateSystem: params.sourceCoordinateSystem,
         translation: resolvedTranslation,
         cloud: serializeCloudForWorkerTask(cloud),
       },
@@ -3755,6 +3766,7 @@ async function writeContentFile(
     params.spzShRestBits,
     params.spzCompressionLevel,
     resolvedTranslation,
+    params.sourceCoordinateSystem,
   );
   return relPath;
 }
@@ -3767,6 +3779,7 @@ function writeCloudGlbOutput(
   shRestBits,
   compressionLevel,
   translation = null,
+  sourceCoordinateSystem = null,
 ) {
   const resolvedTranslation = translation || computeBounds(cloud).center();
   const spzBytes = packCloudToSpz(
@@ -3783,6 +3796,7 @@ function writeCloudGlbOutput(
     cloud,
     colorSpace,
     resolvedTranslation,
+    sourceCoordinateSystem,
   );
 }
 
@@ -3823,6 +3837,7 @@ async function writeBucketGlbTaskOutput(task) {
     { length: task.pointCount, shDegree: task.shDegree },
     task.colorSpace,
     translation,
+    task.sourceCoordinateSystem,
   );
   return true;
 }
@@ -3863,6 +3878,7 @@ async function writeSimplifiedBucketGlbTaskOutput(task) {
       task.shRestBits,
       task.compressionLevel,
       task.translation,
+      task.sourceCoordinateSystem,
     );
   })();
   await Promise.all([handoffPromise, contentPromise]);
@@ -3906,6 +3922,7 @@ async function writeSimplifiedBucketContentFile(
     shRestBits: params.spzShRestBits,
     compressionLevel: params.spzCompressionLevel,
     colorSpace: params.colorSpace,
+    sourceCoordinateSystem: params.sourceCoordinateSystem,
     translation: options.translation || null,
     bucketChunkBytes: options.bucketChunkBytes,
     simplifyScratchBytes: options.simplifyScratchBytes,
@@ -3951,6 +3968,7 @@ async function writeBucketContentFile(
     shRestBits: params.spzShRestBits,
     compressionLevel: params.spzCompressionLevel,
     colorSpace: params.colorSpace,
+    sourceCoordinateSystem: params.sourceCoordinateSystem,
     translation,
     bucketChunkBytes: params.bucketChunkBytes,
   };
@@ -6885,18 +6903,20 @@ function buildEmittedTileChildren(
   return children;
 }
 
-function tileToJson(node) {
+function tileToJson(node, sourceCoordinateSystem = null) {
   const box = node.orientedBox || node.bounds.toBoxArray();
   const obj = {
     boundingVolume: {
-      box: applyContentBoxTransform(box),
+      box: applyContentBoxTransform(box, sourceCoordinateSystem),
     },
     geometricError: node.error,
     refine: 'REPLACE',
     content: { uri: node.contentUri },
   };
   if (node.children.length > 0) {
-    obj.children = node.children.map((child) => tileToJson(child));
+    obj.children = node.children.map((child) =>
+      tileToJson(child, sourceCoordinateSystem),
+    );
   }
   return obj;
 }
@@ -6981,6 +7001,12 @@ function makeBuildSummary(
     spz_sh1_bits: args.spzSh1Bits,
     spz_sh_rest_bits: args.spzShRestBits,
     spz_compression_level: args.spzCompressionLevel,
+    source_coordinate_system:
+      args.resolvedSourceCoordinateSystem || DEFAULT_SOURCE_COORDINATE_SYSTEM,
+    source_coordinate_system_source:
+      args.resolvedSourceCoordinateSystemSource || 'default',
+    source_coordinate_system_reason:
+      args.resolvedSourceCoordinateSystemReason || null,
     root_transform: args.transform ? args.transform.slice() : null,
     root_coordinate: args.coordinate ? args.coordinate.slice() : null,
     root_transform_source: args.coordinate
@@ -7051,6 +7077,7 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
     spzCompressionLevel: args.spzCompressionLevel,
     minGeometricError: args.minGeometricError,
     bucketChunkBytes: memoryPlan.bucketChunkBytes,
+    sourceCoordinateSystem: DEFAULT_SOURCE_COORDINATE_SYSTEM,
     contentWorkerPool:
       contentWorkers > 0
         ? new SpzContentWorkerPool(contentWorkers, DEFAULT_WORKER_SCRIPT)
@@ -7076,41 +7103,28 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
   });
 
   const inputStat = await fs.promises.stat(inputPath);
-  const fingerprint = makePipelineFingerprint(inputPath, inputStat, args);
+  const handle = await fs.promises.open(inputPath, 'r');
   let checkpointInfo = { reused: false, stage: null };
   let pipelineState = null;
-
-  if (!args.clean) {
-    pipelineState = await readPipelineState(tempDir);
-    if (
-      pipelineState &&
-      pipelineState.version === PIPELINE_STATE_VERSION &&
-      fingerprintsMatch(pipelineState.fingerprint, fingerprint)
-    ) {
-      checkpointInfo = {
-        reused: true,
-        stage: pipelineState.stage || 'init',
-      };
-      console.log(`[info] reusing checkpoint | stage=${checkpointInfo.stage}`);
-    } else {
-      pipelineState = null;
-    }
-  }
-
-  if (!pipelineState) {
-    await fs.promises.rm(tempDir, { recursive: true, force: true });
-    await fs.promises.mkdir(tempDir, { recursive: true });
-    pipelineState = makeEmptyPipelineState(fingerprint);
-  } else {
-    await fs.promises.mkdir(tempDir, { recursive: true });
-  }
-
-  const handle = await fs.promises.open(inputPath, 'r');
   let success = false;
   try {
     console.log(`[info] scanning PLY header: ${inputPath}`);
     const headerStartedAt = Date.now();
     const header = await _readPlyHeaderFromHandle(handle, inputPath);
+    const sourceCoordinateSystemDetection =
+      detectSourceCoordinateSystemFromPlyHeader(header);
+    args.resolvedSourceCoordinateSystem =
+      sourceCoordinateSystemDetection.sourceCoordinateSystem;
+    args.resolvedSourceCoordinateSystemSource =
+      sourceCoordinateSystemDetection.source;
+    args.resolvedSourceCoordinateSystemReason =
+      sourceCoordinateSystemDetection.reason;
+    params.sourceCoordinateSystem =
+      sourceCoordinateSystemDetection.sourceCoordinateSystem;
+    console.log(
+      `[info] source coordinate system: ${sourceCoordinateSystemDetection.sourceCoordinateSystem} | source=${sourceCoordinateSystemDetection.source}`,
+    );
+
     const layout = _buildGaussianPlyLayout(
       header.vertexProps,
       inputPath,
@@ -7118,6 +7132,40 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
       args.linearScaleInput,
     );
     timingsMs.header_ms = elapsedMsSince(headerStartedAt);
+    const fingerprint = makePipelineFingerprint(
+      inputPath,
+      inputStat,
+      args,
+      sourceCoordinateSystemDetection.sourceCoordinateSystem,
+    );
+
+    if (!args.clean) {
+      pipelineState = await readPipelineState(tempDir);
+      if (
+        pipelineState &&
+        pipelineState.version === PIPELINE_STATE_VERSION &&
+        fingerprintsMatch(pipelineState.fingerprint, fingerprint)
+      ) {
+        checkpointInfo = {
+          reused: true,
+          stage: pipelineState.stage || 'init',
+        };
+        console.log(
+          `[info] reusing checkpoint | stage=${checkpointInfo.stage}`,
+        );
+      } else {
+        pipelineState = null;
+      }
+    }
+
+    if (!pipelineState) {
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+      await fs.promises.mkdir(tempDir, { recursive: true });
+      pipelineState = makeEmptyPipelineState(fingerprint);
+    } else {
+      await fs.promises.mkdir(tempDir, { recursive: true });
+    }
+
     memoryPlan = makeMemoryBudgetPlan(args, { header, layout });
     params.bucketChunkBytes = memoryPlan.bucketChunkBytes;
 
@@ -7364,7 +7412,10 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
     const tileset = applyTilesetGltfContentExtensions({
       asset: makeTilesetAsset(),
       geometricError: rootTileNode.error,
-      root: applyRootTransform(tileToJson(rootTileNode), args.transform),
+      root: applyRootTransform(
+        tileToJson(rootTileNode, args.resolvedSourceCoordinateSystem),
+        args.transform,
+      ),
     });
 
     const writeMetadataStartedAt = Date.now();

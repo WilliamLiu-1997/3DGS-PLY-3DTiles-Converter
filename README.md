@@ -64,6 +64,12 @@ Generated output includes:
 
 Generated `tileset.json` files declare top-level `3DTILES_content_gltf` extension metadata so CesiumJS can detect `KHR_gaussian_splatting` and `KHR_gaussian_splatting_compression_spz_2` content.
 
+## Source Coordinates
+
+The converter inspects PLY header comments for explicit coordinate metadata. PLYs with projected/geospatial comments such as `epsg` or `offsetx/offsety/offsetz` are treated as source Z-up data. PLYs without usable coordinate-system metadata keep the default GraphDECO/COLMAP camera-style basis: +Y down and +Z forward.
+
+The resolved source coordinate system is written to `build_summary.json` as `source_coordinate_system`, with source and reason fields for auditability.
+
 ## API
 
 ```js
