@@ -6,6 +6,8 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-04-25
+
 ### Added
 
 - Added a temp-file-backed large-PLY conversion pipeline for binary and ASCII input. The pipeline streams input into canonical leaf and handoff buckets, builds parent LODs from handoff data, removes successful temp workspaces, and can resume a preserved failed workspace with `--continue`.
