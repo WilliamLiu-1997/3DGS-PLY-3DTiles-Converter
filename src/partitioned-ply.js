@@ -381,9 +381,12 @@ function pointOctantForNode(node, x, y, z) {
   return pointOctant(node.bounds, x, y, z, node.splitPoint, node.splitAxes);
 }
 
+function coordinateForAxis(axis, x, y, z) {
+  return axis === 1 ? y : axis === 2 ? z : x;
+}
+
 function pointSegmentForNode(node, x, y, z) {
   const axis = Number.isInteger(node.segmentAxis) ? node.segmentAxis : 0;
-  const values = [x, y, z];
   const segmentCount =
     Number.isInteger(node.segmentCount) && node.segmentCount > 0
       ? node.segmentCount
@@ -398,7 +401,9 @@ function pointSegmentForNode(node, x, y, z) {
   if (!Number.isFinite(extent) || extent <= 0.0 || segmentCount <= 1) {
     return 0;
   }
-  const slot = Math.floor(((values[axis] - min) / extent) * segmentCount);
+  const slot = Math.floor(
+    ((coordinateForAxis(axis, x, y, z) - min) / extent) * segmentCount,
+  );
   return Math.max(0, Math.min(segmentCount - 1, slot));
 }
 
@@ -488,6 +493,19 @@ function normalizeSplitAxes(splitAxes) {
     : null;
 }
 
+function usesSegmentRouting(node) {
+  return (
+    !!node && (node.routeMode === ROUTE_MODE_AXIS_SEGMENTS || !!node.virtual)
+  );
+}
+
+function ensureChildrenBySegment(node) {
+  if (!node.childrenBySegment) {
+    node.childrenBySegment = new Map();
+  }
+  return node.childrenBySegment;
+}
+
 function makePartitionTreeNode({
   level,
   depth = level,
@@ -531,7 +549,9 @@ function makePartitionTreeNode({
     tilingStrategy: TILING_STRATEGY_KD_TREE,
     children: [],
     childrenByOct: new Array(8).fill(null),
-    childrenBySegment: new Map(),
+    childrenBySegment: usesSegmentRouting({ routeMode, virtual })
+      ? new Map()
+      : null,
     occupiedChildCount: 0,
     bucketPath: null,
     contentUri: null,
@@ -545,38 +565,93 @@ function makePartitionTreeNode({
 }
 
 function serializeNodeMeta(node) {
-  return {
+  const meta = {
     key: node.key,
     level: node.level,
-    depth: node.depth,
     x: node.x,
     y: node.y,
     z: node.z,
-    childSlot: node.childSlot,
     count: node.count,
     bounds: serializeBoundsState(node.bounds),
-    leaf: node.leaf,
-    virtual: !!node.virtual,
-    routeMode: node.routeMode || ROUTE_MODE_KD,
-    splitPoint: node.splitPoint ? node.splitPoint.slice() : null,
-    splitAxes: node.splitAxes ? node.splitAxes.slice() : null,
-    segmentAxis: node.segmentAxis,
-    segmentCount: node.segmentCount,
-    segmentMin: node.segmentMin,
-    segmentMax: node.segmentMax,
-    contentTargetOverride: node.contentTargetOverride,
-    tilingStrategy: node.tilingStrategy || TILING_STRATEGY_KD_TREE,
-    occupiedChildCount: node.occupiedChildCount,
-    bucketPath: node.bucketPath,
-    contentUri: node.contentUri,
-    handoffPath: node.handoffPath,
-    bucketRowCount: node.bucketRowCount,
-    handoffRowCount: node.handoffRowCount,
-    handoffConsumed: !!node.handoffConsumed,
-    ownError: node.ownError,
-    buildState: node.buildState,
-    children: node.children.map((child) => serializeNodeMeta(child)),
   };
+  if (node.depth !== node.level) {
+    meta.depth = node.depth;
+  }
+  if (Number.isInteger(node.childSlot)) {
+    meta.childSlot = node.childSlot;
+  }
+  if (node.leaf === false) {
+    meta.leaf = false;
+  }
+  if (node.virtual) {
+    meta.virtual = true;
+  }
+  const routeMode = node.routeMode || ROUTE_MODE_KD;
+  if (routeMode !== ROUTE_MODE_KD) {
+    meta.routeMode = routeMode;
+  }
+  if (node.splitPoint) {
+    meta.splitPoint = node.splitPoint.slice();
+  }
+  if (node.splitAxes) {
+    meta.splitAxes = node.splitAxes.slice();
+  }
+  if (Number.isInteger(node.segmentAxis)) {
+    meta.segmentAxis = node.segmentAxis;
+  }
+  if (Number.isInteger(node.segmentCount) && node.segmentCount > 0) {
+    meta.segmentCount = node.segmentCount;
+  }
+  if (Number.isFinite(node.segmentMin)) {
+    meta.segmentMin = node.segmentMin;
+  }
+  if (Number.isFinite(node.segmentMax)) {
+    meta.segmentMax = node.segmentMax;
+  }
+  if (
+    Number.isFinite(node.contentTargetOverride) &&
+    node.contentTargetOverride > 0
+  ) {
+    meta.contentTargetOverride = node.contentTargetOverride;
+  }
+  const tilingStrategy = node.tilingStrategy || TILING_STRATEGY_KD_TREE;
+  if (tilingStrategy !== TILING_STRATEGY_KD_TREE) {
+    meta.tilingStrategy = tilingStrategy;
+  }
+  if (
+    Number.isInteger(node.occupiedChildCount) &&
+    node.occupiedChildCount > 0
+  ) {
+    meta.occupiedChildCount = node.occupiedChildCount;
+  }
+  if (node.bucketPath) {
+    meta.bucketPath = node.bucketPath;
+  }
+  if (node.contentUri) {
+    meta.contentUri = node.contentUri;
+  }
+  if (node.handoffPath) {
+    meta.handoffPath = node.handoffPath;
+  }
+  if (Number.isFinite(node.bucketRowCount) && node.bucketRowCount >= 0) {
+    meta.bucketRowCount = node.bucketRowCount;
+  }
+  if (Number.isFinite(node.handoffRowCount) && node.handoffRowCount >= 0) {
+    meta.handoffRowCount = node.handoffRowCount;
+  }
+  if (node.handoffConsumed) {
+    meta.handoffConsumed = true;
+  }
+  if (Number.isFinite(node.ownError) || node.ownError === 0) {
+    meta.ownError = node.ownError;
+  }
+  if (node.buildState && node.buildState !== 'pending') {
+    meta.buildState = node.buildState;
+  }
+  if (node.children.length > 0) {
+    meta.children = node.children.map((child) => serializeNodeMeta(child));
+  }
+  return meta;
 }
 
 function deserializeNodeMeta(data) {
@@ -590,9 +665,9 @@ function deserializeNodeMeta(data) {
     childSlot: Number.isInteger(data.childSlot) ? data.childSlot : null,
     count: data.count,
     bounds: deserializeBoundsState(data.bounds),
-    leaf: data.leaf,
+    leaf: data.leaf !== false,
     virtual: !!data.virtual,
-    routeMode: data.routeMode || ROUTE_MODE_KD,
+    routeMode: data.routeMode ?? ROUTE_MODE_KD,
     splitPoint: normalizeSplitPoint(data.splitPoint),
     splitAxes: normalizeSplitAxes(data.splitAxes),
     segmentAxis: Number.isInteger(data.segmentAxis) ? data.segmentAxis : null,
@@ -607,14 +682,16 @@ function deserializeNodeMeta(data) {
       data.contentTargetOverride > 0
         ? data.contentTargetOverride
         : null,
-    tilingStrategy: data.tilingStrategy || TILING_STRATEGY_KD_TREE,
+    tilingStrategy: data.tilingStrategy ?? TILING_STRATEGY_KD_TREE,
     children: [],
     childrenByOct: new Array(8).fill(null),
-    childrenBySegment: new Map(),
-    occupiedChildCount: data.occupiedChildCount || 0,
-    bucketPath: data.bucketPath || null,
-    contentUri: data.contentUri || null,
-    handoffPath: data.handoffPath || null,
+    childrenBySegment: null,
+    occupiedChildCount: Number.isInteger(data.occupiedChildCount)
+      ? data.occupiedChildCount
+      : 0,
+    bucketPath: data.bucketPath ?? null,
+    contentUri: data.contentUri ?? null,
+    handoffPath: data.handoffPath ?? null,
     bucketRowCount:
       Number.isFinite(data.bucketRowCount) && data.bucketRowCount >= 0
         ? data.bucketRowCount
@@ -628,8 +705,11 @@ function deserializeNodeMeta(data) {
       Number.isFinite(data.ownError) || data.ownError === 0
         ? data.ownError
         : null,
-    buildState: data.buildState || 'pending',
+    buildState: data.buildState ?? 'pending',
   };
+  if (usesSegmentRouting(node)) {
+    node.childrenBySegment = new Map();
+  }
   if (Array.isArray(data.children)) {
     for (const childData of data.children) {
       const child = deserializeNodeMeta(childData);
@@ -638,12 +718,15 @@ function deserializeNodeMeta(data) {
         Number.isInteger(child.childSlot) && child.childSlot >= 0
           ? child.childSlot
           : ((child.x & 1) << 0) | ((child.y & 1) << 1) | ((child.z & 1) << 2);
-      if (node.routeMode === ROUTE_MODE_AXIS_SEGMENTS || node.virtual) {
-        node.childrenBySegment.set(slot, child);
+      if (usesSegmentRouting(node)) {
+        ensureChildrenBySegment(node).set(slot, child);
       } else {
         node.childrenByOct[slot] = child;
       }
     }
+  }
+  if (!Number.isInteger(data.occupiedChildCount) && node.children.length > 0) {
+    node.occupiedChildCount = node.children.length;
   }
   return node;
 }
@@ -686,9 +769,9 @@ function resolveLeafNodeForPoint(root, x, y, z) {
   while (!node.leaf) {
     let slot;
     let child;
-    if (node.routeMode === ROUTE_MODE_AXIS_SEGMENTS || node.virtual) {
+    if (usesSegmentRouting(node)) {
       slot = pointSegmentForNode(node, x, y, z);
-      child = node.childrenBySegment.get(slot);
+      child = ensureChildrenBySegment(node).get(slot);
     } else {
       slot = pointOctantForNode(node, x, y, z);
       child = node.childrenByOct[slot];
@@ -870,7 +953,20 @@ function bucketRowByteSize(encoding, coeffCount) {
 }
 
 function makeBucketFileSpec(filePath, encoding, rowCount) {
-  return { filePath, encoding, rowCount };
+  return { kind: 'file', filePath, encoding, rowCount };
+}
+
+function makeBucketAggregateSpec(sources) {
+  const resolvedSources = sources.filter(Boolean);
+  return {
+    kind: 'aggregate',
+    sources: resolvedSources,
+    rowCount: resolvedSources.reduce(
+      (sum, source) =>
+        sum + (Number.isInteger(source.rowCount) ? source.rowCount : 0),
+      0,
+    ),
+  };
 }
 
 function leafBucketSpec(node) {
@@ -881,12 +977,91 @@ function leafBucketSpec(node) {
   );
 }
 
-function handoffBucketSpec(node) {
+function fileHandoffBucketSpec(node) {
   return makeBucketFileSpec(
     node.handoffPath,
     HANDOFF_BUCKET_ENCODING,
     node.handoffRowCount,
   );
+}
+
+function isActiveHandoffSource(node) {
+  return (
+    !!node &&
+    !node.handoffConsumed &&
+    Number.isInteger(node.handoffRowCount) &&
+    node.handoffRowCount >= 0
+  );
+}
+
+function collectActiveHandoffSourceSpecs(node, out) {
+  if (!node) {
+    return;
+  }
+  if (!node.virtual) {
+    ensure(
+      isActiveHandoffSource(node) && !!node.handoffPath,
+      `Missing active handoff for node ${node.key}.`,
+    );
+    out.push(fileHandoffBucketSpec(node));
+    return;
+  }
+  if (node.handoffPath) {
+    ensure(
+      isActiveHandoffSource(node),
+      `Missing active materialized handoff for virtual node ${node.key}.`,
+    );
+    out.push(fileHandoffBucketSpec(node));
+    return;
+  }
+  for (const child of node.children) {
+    collectActiveHandoffSourceSpecs(child, out);
+  }
+}
+
+function handoffBucketSpec(node) {
+  if (!node.virtual) {
+    ensure(
+      isActiveHandoffSource(node) && !!node.handoffPath,
+      `Missing active handoff for node ${node.key}.`,
+    );
+    return fileHandoffBucketSpec(node);
+  }
+  if (node.handoffPath) {
+    ensure(
+      isActiveHandoffSource(node),
+      `Missing active materialized handoff for virtual node ${node.key}.`,
+    );
+    return fileHandoffBucketSpec(node);
+  }
+  const sources = [];
+  collectActiveHandoffSourceSpecs(node, sources);
+  ensure(
+    sources.length > 0,
+    `Missing active handoff sources for virtual node ${node.key}.`,
+  );
+  return makeBucketAggregateSpec(sources);
+}
+
+function flattenBucketSpec(fileSpec, out) {
+  if (!fileSpec) {
+    return;
+  }
+  if (fileSpec.kind === 'aggregate') {
+    for (const source of fileSpec.sources || []) {
+      flattenBucketSpec(source, out);
+    }
+    return;
+  }
+  out.push(fileSpec);
+}
+
+function flattenBucketSpecs(fileSpecs) {
+  const flattened = [];
+  for (const fileSpec of fileSpecs) {
+    flattenBucketSpec(fileSpec, flattened);
+  }
+  return flattened;
 }
 
 function makeRowScratch(coeffCount) {
@@ -1400,7 +1575,7 @@ async function partitionLeafBuckets(
 async function collectBucketEntries(fileSpecs, coeffCount) {
   const entries = [];
   let totalRows = 0;
-  for (const fileSpec of fileSpecs) {
+  for (const fileSpec of flattenBucketSpecs(fileSpecs)) {
     if (!fileSpec || !fileSpec.filePath) {
       continue;
     }
@@ -3166,8 +3341,14 @@ async function streamSimplifyBucketEntriesExact(
 }
 
 function resolveNodeContentTarget(node, ctx, inputSplatCount) {
-  if (Number.isFinite(node.contentTargetOverride) && node.contentTargetOverride > 0) {
-    return normalizeSplatTargetCount(node.contentTargetOverride, inputSplatCount);
+  if (
+    Number.isFinite(node.contentTargetOverride) &&
+    node.contentTargetOverride > 0
+  ) {
+    return normalizeSplatTargetCount(
+      node.contentTargetOverride,
+      inputSplatCount,
+    );
   }
   const targetRaw = targetSplatCountForDepth(
     node.depth,
@@ -3188,7 +3369,8 @@ function resolveVirtualNodeContentTarget(
   samplingRatePerLevel,
 ) {
   const targetRaw =
-    Number.isFinite(node.contentTargetOverride) && node.contentTargetOverride > 0
+    Number.isFinite(node.contentTargetOverride) &&
+    node.contentTargetOverride > 0
       ? node.contentTargetOverride
       : targetSplatCountForDepth(
           node.depth,
@@ -3200,13 +3382,78 @@ function resolveVirtualNodeContentTarget(
 }
 
 function minimumContentTargetForVirtualBudget(node) {
-  if (!node.virtual) {
-    return node.count > 0 ? 1 : 0;
+  if (
+    Number.isInteger(node._virtualBudgetMinimum) &&
+    node._virtualBudgetMinimum >= 0
+  ) {
+    return node._virtualBudgetMinimum;
   }
-  return node.children.reduce(
-    (sum, child) => sum + minimumContentTargetForVirtualBudget(child),
-    0,
-  );
+  return computeVirtualBudgetMinimums(node);
+}
+
+function computeVirtualBudgetMinimums(node) {
+  let minimum;
+  if (!node.virtual) {
+    minimum = node.count > 0 ? 1 : 0;
+  } else {
+    minimum = node.children.reduce(
+      (sum, child) => sum + computeVirtualBudgetMinimums(child),
+      0,
+    );
+  }
+  node._virtualBudgetMinimum = minimum;
+  return minimum;
+}
+
+function childSlotSortKey(child) {
+  return Number.isInteger(child.childSlot) ? child.childSlot : 0;
+}
+
+function compareContentAllocationPriority(a, b) {
+  if (b.remainder !== a.remainder) return b.remainder - a.remainder;
+  if (b.child.count !== a.child.count) return b.child.count - a.child.count;
+  return childSlotSortKey(a.child) - childSlotSortKey(b.child);
+}
+
+function distributeRemainingByPriority(allocations, remaining) {
+  const active = allocations
+    .filter((entry) => entry.capacity > 0)
+    .sort(compareContentAllocationPriority);
+  let activeCount = active.length;
+  while (remaining > 0 && activeCount > 0) {
+    if (remaining < activeCount) {
+      for (let i = 0; i < remaining; i++) {
+        active[i].allocation += 1;
+        active[i].capacity -= 1;
+      }
+      return 0;
+    }
+
+    let minCapacity = Infinity;
+    for (let i = 0; i < activeCount; i++) {
+      if (active[i].capacity < minCapacity) {
+        minCapacity = active[i].capacity;
+      }
+    }
+    const rounds = Math.min(minCapacity, Math.floor(remaining / activeCount));
+    if (rounds <= 0) {
+      break;
+    }
+    for (let i = 0; i < activeCount; i++) {
+      active[i].allocation += rounds;
+      active[i].capacity -= rounds;
+    }
+    remaining -= rounds * activeCount;
+
+    let writeIndex = 0;
+    for (let i = 0; i < activeCount; i++) {
+      if (active[i].capacity > 0) {
+        active[writeIndex++] = active[i];
+      }
+    }
+    activeCount = writeIndex;
+  }
+  return remaining;
 }
 
 function allocateContentTargetsByChildCount(node, totalTarget) {
@@ -3243,36 +3490,18 @@ function allocateContentTargetsByChildCount(node, totalTarget) {
       entry.capacity -= extra;
       entry.remainder = exact - extra;
     }
-    remaining = total - allocations.reduce((sum, entry) => sum + entry.allocation, 0);
+    remaining =
+      total - allocations.reduce((sum, entry) => sum + entry.allocation, 0);
   }
 
-  while (remaining > 0) {
-    const candidates = allocations
-      .filter((entry) => entry.capacity > 0)
-      .sort((a, b) => {
-        if (b.remainder !== a.remainder) return b.remainder - a.remainder;
-        if (b.child.count !== a.child.count) return b.child.count - a.child.count;
-        return (a.child.childSlot || 0) - (b.child.childSlot || 0);
-      });
-    if (candidates.length === 0) {
-      break;
-    }
-    for (const entry of candidates) {
-      if (remaining <= 0) {
-        break;
-      }
-      entry.allocation += 1;
-      entry.capacity -= 1;
-      remaining -= 1;
-    }
-  }
+  remaining = distributeRemainingByPriority(allocations, remaining);
 
   for (const entry of allocations) {
     entry.child.contentTargetOverride = entry.allocation;
   }
 }
 
-function assignVirtualSegmentContentTargets(
+function assignVirtualSegmentContentTargetsRecursive(
   node,
   lodMaxDepth,
   samplingRatePerLevel,
@@ -3286,8 +3515,25 @@ function assignVirtualSegmentContentTargets(
     allocateContentTargetsByChildCount(node, target);
   }
   for (const child of node.children) {
-    assignVirtualSegmentContentTargets(child, lodMaxDepth, samplingRatePerLevel);
+    assignVirtualSegmentContentTargetsRecursive(
+      child,
+      lodMaxDepth,
+      samplingRatePerLevel,
+    );
   }
+}
+
+function assignVirtualSegmentContentTargets(
+  node,
+  lodMaxDepth,
+  samplingRatePerLevel,
+) {
+  computeVirtualBudgetMinimums(node);
+  assignVirtualSegmentContentTargetsRecursive(
+    node,
+    lodMaxDepth,
+    samplingRatePerLevel,
+  );
 }
 
 function spzBytesPerBucketRow(coeffCount) {
@@ -3719,9 +3965,7 @@ async function readExactFromHandle(handle, buffer, length, position, message) {
 function collectAdaptiveSplitCandidates(node, maxDepth, leafLimit, out) {
   if (node.leaf) {
     const canSplitByCount =
-      !node.splitExhausted &&
-      node.depth < maxDepth &&
-      node.count > leafLimit;
+      !node.splitExhausted && node.depth < maxDepth && node.count > leafLimit;
     const canSplitByAspect =
       node.level > 0 &&
       !node.aspectSplitExhausted &&
@@ -4007,13 +4251,12 @@ function chooseAdaptiveSplitAction(stats, tightBounds, maxDepth, leafLimit) {
 }
 
 function pointSegmentForSplitAction(action, x, y, z) {
-  const values = [x, y, z];
   const extent = action.segmentMax - action.segmentMin;
   if (!Number.isFinite(extent) || extent <= 0.0) {
     return 0;
   }
   const slot = Math.floor(
-    ((values[action.axis] - action.segmentMin) / extent) *
+    ((coordinateForAxis(action.axis, x, y, z) - action.segmentMin) / extent) *
       action.segmentCount,
   );
   return Math.max(0, Math.min(action.segmentCount - 1, slot));
@@ -4268,7 +4511,7 @@ async function buildAdaptiveNodeTreeFromPositions(
       node.virtual = stats.action.kind === ROUTE_MODE_AXIS_SEGMENTS;
       node.children = [];
       node.childrenByOct = new Array(8).fill(null);
-      node.childrenBySegment = new Map();
+      node.childrenBySegment = node.virtual ? new Map() : null;
       node.occupiedChildCount = occupied.length;
       for (const entry of occupied) {
         const slot = entry.slot;
@@ -4283,17 +4526,13 @@ async function buildAdaptiveNodeTreeFromPositions(
           y: coords.y,
           z: coords.z,
           childSlot: slot,
-          bounds: boundsFromMinMax(
-            entry.minimum,
-            entry.maximum,
-            node.bounds,
-          ),
+          bounds: boundsFromMinMax(entry.minimum, entry.maximum, node.bounds),
           count: entry.count,
           leaf: true,
         });
         node.children.push(child);
         if (node.virtual) {
-          node.childrenBySegment.set(slot, child);
+          ensureChildrenBySegment(node).set(slot, child);
         } else {
           node.childrenByOct[slot] = child;
         }
@@ -4315,10 +4554,7 @@ async function isPartitionedNodeComplete(node, ctx) {
       return false;
     }
     if (node.depth > 0 && !node.handoffConsumed) {
-      if (!node.handoffPath) {
-        return false;
-      }
-      return pathExists(node.handoffPath);
+      return hasExistingActiveHandoffSources(node);
     }
     return true;
   }
@@ -4336,6 +4572,48 @@ async function isPartitionedNodeComplete(node, ctx) {
     return pathExists(node.handoffPath);
   }
   return true;
+}
+
+async function hasExistingActiveHandoffSources(node) {
+  let spec;
+  try {
+    spec = handoffBucketSpec(node);
+  } catch {
+    return false;
+  }
+  const sources = flattenBucketSpecs([spec]).filter(
+    (source) => source && source.filePath,
+  );
+  if (sources.length === 0) {
+    return false;
+  }
+  for (const source of sources) {
+    if (!(await pathExists(source.filePath))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function consumeHandoffSources(node, ctx) {
+  if (!node || node.handoffConsumed) {
+    return;
+  }
+  if (node.handoffPath) {
+    ctx.pendingHandoffCleanup.add(node.handoffPath);
+    node.handoffPath = null;
+    node.handoffRowCount = null;
+    node.handoffConsumed = true;
+    return;
+  }
+  if (node.virtual) {
+    for (const child of node.children) {
+      consumeHandoffSources(child, ctx);
+    }
+  }
+  node.handoffPath = null;
+  node.handoffRowCount = null;
+  node.handoffConsumed = true;
 }
 
 async function processPartitionedLeafNode(node, ctx) {
@@ -4381,44 +4659,23 @@ async function processPartitionedLeafNode(node, ctx) {
 }
 
 async function processPartitionedVirtualInternalNode(node, ctx) {
-  const inputSpecs = node.children.map((child) => {
-    ensure(
-      !!child.handoffPath,
-      `Missing active child handoff for virtual node ${node.key} <- ${child.key}.`,
-    );
-    return handoffBucketSpec(child);
-  });
+  const inputSpecs = node.children.map((child) => handoffBucketSpec(child));
   const { entries, totalRows } = await collectBucketEntries(
     inputSpecs,
     ctx.layout.coeffCount,
   );
 
-  if (node.depth > 0) {
-    node.handoffPath = canonicalNodePath(ctx.tempDir, HANDOFF_BUCKET_DIR, node);
-    await materializeCanonicalEntriesFile(
-      entries,
-      node.handoffPath,
-      ctx.layout.coeffCount,
-      { bucketChunkBytes: ctx.bucketChunkBytes },
-    );
-    node.handoffRowCount = totalRows;
-    node.handoffConsumed = false;
-  } else {
-    node.handoffPath = null;
-    node.handoffRowCount = null;
-    node.handoffConsumed = true;
-  }
+  ensure(
+    entries.length > 0 && totalRows > 0,
+    `Virtual node ${node.key} has no active handoff sources.`,
+  );
+  node.handoffPath = null;
+  node.handoffRowCount = totalRows;
+  node.handoffConsumed = node.depth <= 0;
 
   node.ownError = 0.0;
   node.contentUri = null;
   node.buildState = 'completed';
-  for (const child of node.children) {
-    child.handoffConsumed = true;
-    if (child.handoffPath) {
-      ctx.pendingHandoffCleanup.add(child.handoffPath);
-    }
-    child.handoffRowCount = null;
-  }
   enqueuePipelineStateSave(ctx, PIPELINE_STAGE_BUCKETED);
 }
 
@@ -4428,13 +4685,7 @@ async function processPartitionedInternalNode(node, ctx) {
     return;
   }
 
-  const inputSpecs = node.children.map((child) => {
-    ensure(
-      !!child.handoffPath,
-      `Missing active child handoff for node ${node.key} <- ${child.key}.`,
-    );
-    return handoffBucketSpec(child);
-  });
+  const inputSpecs = node.children.map((child) => handoffBucketSpec(child));
   const { entries, totalRows } = await collectBucketEntries(
     inputSpecs,
     ctx.layout.coeffCount,
@@ -4518,11 +4769,7 @@ async function processPartitionedInternalNode(node, ctx) {
   }
   node.buildState = 'completed';
   for (const child of node.children) {
-    child.handoffConsumed = true;
-    if (child.handoffPath) {
-      ctx.pendingHandoffCleanup.add(child.handoffPath);
-    }
-    child.handoffRowCount = null;
+    consumeHandoffSources(child, ctx);
   }
   enqueuePipelineStateSave(ctx, PIPELINE_STAGE_BUCKETED);
 }
@@ -4645,13 +4892,33 @@ async function runWithConcurrencyBudget(
 
 function estimateBuildNodeInputRows(node) {
   if (node.leaf) {
-    return Math.max(1, node.bucketRowCount || node.count || 1);
+    const bucketRows =
+      Number.isInteger(node.bucketRowCount) && node.bucketRowCount >= 0
+        ? node.bucketRowCount
+        : null;
+    return Math.max(1, bucketRows ?? node.count ?? 1);
   }
   let total = 0;
   for (const child of node.children) {
-    total += child.handoffRowCount || child.count || 0;
+    total += estimateHandoffSourceRows(child);
   }
-  return Math.max(1, total || node.count || 1);
+  return Math.max(1, total > 0 ? total : (node.count ?? 1));
+}
+
+function estimateHandoffSourceRows(node) {
+  if (!node || node.handoffConsumed) {
+    return 0;
+  }
+  if (Number.isInteger(node.handoffRowCount) && node.handoffRowCount >= 0) {
+    return node.handoffRowCount;
+  }
+  if (node.virtual && !node.handoffPath) {
+    return node.children.reduce(
+      (sum, child) => sum + estimateHandoffSourceRows(child),
+      0,
+    );
+  }
+  return Number.isInteger(node.count) && node.count > 0 ? node.count : 0;
 }
 
 function estimateBuildNodeMemoryBytes(node, ctx) {
@@ -4790,7 +5057,10 @@ function buildTileNodeTree(
   samplingRatePerLevel,
   nodesByKey,
 ) {
-  ensure(!node.virtual, `Virtual node ${node.key} cannot be emitted as a tile.`);
+  ensure(
+    !node.virtual,
+    `Virtual node ${node.key} cannot be emitted as a tile.`,
+  );
   const error =
     rootGeometricError *
     geometricErrorScaleForDepth(node.depth, lodMaxDepth, samplingRatePerLevel);

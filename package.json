@@ -20,10 +20,9 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node -e \"console.log('No tests configured')\"",
     "cli": "node ./bin/3dgs-ply-3dtiles-converter.js",
     "pack:check": "npm pack --dry-run",
-    "release:check": "npm test && npm run pack:check"
+    "release:check": "npm run pack:check"
   },
   "repository": {
     "type": "git",
