@@ -21,7 +21,6 @@ class ConsoleProgressBar {
     this._lastStatus = '';
     this._lineActive = false;
     this._lastDetailMessage = '';
-    this._lastDetailLogAt = 0;
     this._done = false;
     this._onResize = () => this._render(true);
     this._resizeListenerAttached = false;
@@ -82,7 +81,7 @@ class ConsoleProgressBar {
       return;
     }
     const now = Date.now();
-    if (!force && now - this._last < 45 && this.current > 0) {
+    if (!force && now - this._last < 100 && this.current > 0) {
       return;
     }
     this._last = now;
@@ -126,7 +125,20 @@ class ConsoleProgressBar {
     const text = String(message).replace(/[\r\n]+/g, ' ').trim();
     this._lastMessage = text;
     this._lastStatus = this._compactStatus(text);
-    this._maybeLogDetail(text);
+  }
+
+  logDetail(message) {
+    const text = String(message).replace(/[\r\n]+/g, ' ').trim();
+    if (!text || text === this._lastDetailMessage) {
+      return;
+    }
+    if (this.enabled) {
+      this._clearActiveLine();
+      process.stdout.write(`[info] ${this.label} ${this._ascii(text)}\n`);
+    } else {
+      console.log(`[info] ${this.label} ${text}`);
+    }
+    this._lastDetailMessage = text;
   }
 
   _compactStatus(text) {
@@ -155,30 +167,6 @@ class ConsoleProgressBar {
     const parts = text.split('|').map((part) => part.trim()).filter(Boolean);
     const status = parts.length > 1 ? parts[parts.length - 1] : text;
     return this._ascii(status).slice(0, 36).trim();
-  }
-
-  _maybeLogDetail(text) {
-    if (!this.enabled || !text) {
-      return;
-    }
-    const shouldLog =
-      text.includes('|') ||
-      text.includes('extra virtual long-tile work') ||
-      this._ascii(text).length > 48;
-    if (!shouldLog) {
-      return;
-    }
-    const now = Date.now();
-    if (
-      text === this._lastDetailMessage ||
-      now - this._lastDetailLogAt < 5000
-    ) {
-      return;
-    }
-    this._clearActiveLine();
-    process.stdout.write(`[info] ${this.label} ${text}\n`);
-    this._lastDetailMessage = text;
-    this._lastDetailLogAt = now;
   }
 
   _clearActiveLine() {

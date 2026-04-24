@@ -66,6 +66,7 @@ const HANDOFF_BUCKET_ENCODING = 'canonical32';
 const BUILD_MIN_TASK_MEMORY_BYTES = 32 * 1024 * 1024;
 const PARTITION_ARENA_COUNT = 2;
 const PARTITION_LEAF_HANDLE_LIMIT = 256;
+const SCAN_PROGRESS_ROW_INTERVAL = 8192;
 const PARTITION_PROGRESS_ROW_INTERVAL = 8192;
 const TILING_TREE_PROGRESS_ROW_INTERVAL = 65536;
 const POSITION_TMP_FILE = 'positions.tmp';
@@ -3867,6 +3868,16 @@ async function scanGlobalBoundsAndWritePositions(
       : null;
   let bufferedRows = 0;
   let count = 0;
+  const progress = options.progress || null;
+  const updateProgress = (force = false) => {
+    if (!progress) {
+      return;
+    }
+    if (!force && count % SCAN_PROGRESS_ROW_INTERVAL !== 0) {
+      return;
+    }
+    progress.update(count);
+  };
 
   await fs.promises.mkdir(path.dirname(positionsPath), { recursive: true });
   await removeFileIfExists(positionsPath);
@@ -3919,6 +3930,7 @@ async function scanGlobalBoundsAndWritePositions(
 
         bufferedRows += 1;
         count += 1;
+        updateProgress();
         if (bufferedRows === rowsPerBuffer) {
           flush();
         }
@@ -3926,6 +3938,7 @@ async function scanGlobalBoundsAndWritePositions(
       { chunkBytes: options.chunkBytes },
     );
     flush();
+    updateProgress(true);
   } finally {
     fs.closeSync(positionFd);
   }
@@ -3949,6 +3962,16 @@ async function scanGlobalBoundsAndStagePositionsInMemory(
   const maximum = [-Infinity, -Infinity, -Infinity];
   const positions = new Float32Array(header.vertexCount * 3);
   let count = 0;
+  const progress = options.progress || null;
+  const updateProgress = (force = false) => {
+    if (!progress) {
+      return;
+    }
+    if (!force && count % SCAN_PROGRESS_ROW_INTERVAL !== 0) {
+      return;
+    }
+    progress.update(count);
+  };
 
   await _forEachGaussianPlyPosition(
     handle,
@@ -3966,9 +3989,11 @@ async function scanGlobalBoundsAndStagePositionsInMemory(
       positions[base + 1] = fy;
       positions[base + 2] = fz;
       count += 1;
+      updateProgress();
     },
     { chunkBytes: options.chunkBytes },
   );
+  updateProgress(true);
 
   ensure(count > 0, `PLY file ${filePath} does not contain any vertices.`);
   ensure(
@@ -4450,6 +4475,7 @@ function makeTilingProgressState(progress, vertexCount, maxDepth) {
     current: 0,
     message: 'building k-d tree',
     estimateExpanded: false,
+    estimateExpansionLogged: false,
     virtualSegmentActions: 0,
     virtualSegmentCount: 0,
   };
@@ -4510,6 +4536,13 @@ function maybeExpandTilingProgressTotal(state) {
   state.estimateExpanded = true;
   state.total = state.current + increment;
   state.progress.setTotal(state.total);
+  if (
+    !state.estimateExpansionLogged &&
+    typeof state.progress.logDetail === 'function'
+  ) {
+    state.progress.logDetail('work estimate expanded');
+    state.estimateExpansionLogged = true;
+  }
 }
 
 function startTilingProgressPhase(progressState, total, message) {
@@ -6210,16 +6243,25 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
           `[info] scan 1/4 | vertices=${header.vertexCount} | sh_degree=${layout.degree} | staging positions`,
         );
         const scanStartedAt = Date.now();
+        const scanProgress = new ConsoleProgressBar(
+          'scan 1/4',
+          header.vertexCount,
+        );
+        scanProgress.update(0, 'staging positions');
         if (memoryPlan.inMemoryPositions) {
           const staged = await scanGlobalBoundsAndStagePositionsInMemory(
             handle,
             inputPath,
             header,
             layout,
-            { chunkBytes: memoryPlan.scanChunkBytes },
+            {
+              chunkBytes: memoryPlan.scanChunkBytes,
+              progress: scanProgress,
+            },
           );
           rootBounds = staged.bounds;
           timingsMs.scan_positions_ms = elapsedMsSince(scanStartedAt);
+          scanProgress.done(`ms=${timingsMs.scan_positions_ms}`);
 
           console.log(
             '[info] scan 2/4 | building count-balanced k-d tiling tree from memory',
@@ -6252,9 +6294,11 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
             {
               chunkBytes: memoryPlan.scanChunkBytes,
               positionTmpBufferBytes: memoryPlan.positionTmpBufferBytes,
+              progress: scanProgress,
             },
           );
           timingsMs.scan_positions_ms = elapsedMsSince(scanStartedAt);
+          scanProgress.done(`ms=${timingsMs.scan_positions_ms}`);
 
           console.log(
             '[info] scan 2/4 | building count-balanced k-d tiling tree from positions',
