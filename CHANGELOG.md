@@ -14,8 +14,8 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ### Changed
 
-- Changed the default `maxDepth` from `4` to `5`.
-- Changed the default `leafLimit` from `10000` to `5000`.
+- Changed the default `maxDepth` from `4` to `8`.
+- Changed the default `leafLimit` from `10000` to `100`.
 - Updated voxel simplification so retained splat targets also drive voxel grouping and representative selection stays coarse-biased across sampling paths, replacing the earlier expanded/detail-first merge planning.
 - Reduced bottom-up build overhead in the temp-file-backed pipeline by throttling checkpoint rewrites across node levels, batch-cleaning consumed handoff buckets per level, and linking leaf handoff buckets to existing leaf bucket files when possible instead of rewriting the same canonical payload.
 - Streamed unsimplified bucket-backed content directly into SPZ/GLB output with content-worker support, avoiding full `GaussianCloud` materialization when no simplification is needed.
@@ -29,7 +29,7 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 - Added `memory_budget_plan`, `timings_ms`, and `peak_rss_bytes` diagnostics to generated `build_summary.json` files.
 - Added progress reporting for the large-PLY leaf bucket partitioning scan.
 - Changed tiling to an explicit count-balanced k-d tree that chooses one histogram-median split plane per node, so leaf buckets stay balanced by splat count without relying on fixed octree subdivision.
-- Limited k-d tile longest-to-width aspect ratio to `2:1` by splitting elongated leaves along their longest axis while depth budget remains.
+- Replaced non-root k-d tiles whose tight longest-to-width aspect ratio exceeds `2:1` with equal-length virtual segments, so long intermediate tiles are not emitted while logical LOD depth remains bounded by `maxDepth`.
 
 ### Removed
 

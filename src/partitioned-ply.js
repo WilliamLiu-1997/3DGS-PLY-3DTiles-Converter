@@ -57,7 +57,7 @@ const {
 const DEFAULT_WORKER_SCRIPT = path.join(__dirname, 'convert-core.js');
 const TEMP_WORKSPACE_NAME = '.tmp-ply-partitions';
 const PIPELINE_STATE_FILE = 'pipeline-state.json';
-const PIPELINE_STATE_VERSION = 7;
+const PIPELINE_STATE_VERSION = 8;
 const PIPELINE_STAGE_BUCKETED = 'bucketed';
 const LEAF_BUCKET_DIR = 'leaf';
 const HANDOFF_BUCKET_DIR = 'handoff';
@@ -77,6 +77,9 @@ const MERGE_SH_COEFF_BLOCK = 12;
 const PIPELINE_STATE_SAVE_INTERVAL_MS = 5000;
 const PIPELINE_STATE_SAVE_NODE_INTERVAL = 512;
 const TILING_STRATEGY_KD_TREE = 'kd_tree';
+const ROUTE_MODE_KD = 'kd';
+const ROUTE_MODE_AXIS_SEGMENTS = 'axis_segments';
+const LONG_TILE_SPLIT_MODE = 'virtual_equal_length_axis_segments';
 const ADAPTIVE_SPLIT_HISTOGRAM_BINS = 64;
 const ADAPTIVE_MAX_LONG_WIDTH_RATIO = 2.0;
 const ADAPTIVE_SPLIT_EPSILON = 1e-9;
@@ -378,6 +381,27 @@ function pointOctantForNode(node, x, y, z) {
   return pointOctant(node.bounds, x, y, z, node.splitPoint, node.splitAxes);
 }
 
+function pointSegmentForNode(node, x, y, z) {
+  const axis = Number.isInteger(node.segmentAxis) ? node.segmentAxis : 0;
+  const values = [x, y, z];
+  const segmentCount =
+    Number.isInteger(node.segmentCount) && node.segmentCount > 0
+      ? node.segmentCount
+      : 1;
+  const min = Number.isFinite(node.segmentMin)
+    ? node.segmentMin
+    : node.bounds.minimum[axis];
+  const max = Number.isFinite(node.segmentMax)
+    ? node.segmentMax
+    : node.bounds.maximum[axis];
+  const extent = max - min;
+  if (!Number.isFinite(extent) || extent <= 0.0 || segmentCount <= 1) {
+    return 0;
+  }
+  const slot = Math.floor(((values[axis] - min) / extent) * segmentCount);
+  return Math.max(0, Math.min(segmentCount - 1, slot));
+}
+
 function targetSplatCountForDepth(
   depth,
   lodMaxDepth,
@@ -466,6 +490,7 @@ function normalizeSplitAxes(splitAxes) {
 
 function makePartitionTreeNode({
   level,
+  depth = level,
   x,
   y,
   z,
@@ -474,22 +499,39 @@ function makePartitionTreeNode({
   leaf = true,
   splitPoint = null,
   splitAxes = null,
+  childSlot = null,
+  virtual = false,
+  routeMode = ROUTE_MODE_KD,
+  segmentAxis = null,
+  segmentCount = null,
+  segmentMin = null,
+  segmentMax = null,
+  contentTargetOverride = null,
 }) {
   return {
     key: makeNodeKey(level, x, y, z),
     level,
-    depth: level,
+    depth,
     x,
     y,
     z,
+    childSlot,
     count,
     bounds,
     leaf,
+    virtual: !!virtual,
+    routeMode,
     splitPoint: normalizeSplitPoint(splitPoint),
     splitAxes: normalizeSplitAxes(splitAxes),
+    segmentAxis,
+    segmentCount,
+    segmentMin,
+    segmentMax,
+    contentTargetOverride,
     tilingStrategy: TILING_STRATEGY_KD_TREE,
     children: [],
     childrenByOct: new Array(8).fill(null),
+    childrenBySegment: new Map(),
     occupiedChildCount: 0,
     bucketPath: null,
     contentUri: null,
@@ -510,11 +552,19 @@ function serializeNodeMeta(node) {
     x: node.x,
     y: node.y,
     z: node.z,
+    childSlot: node.childSlot,
     count: node.count,
     bounds: serializeBoundsState(node.bounds),
     leaf: node.leaf,
+    virtual: !!node.virtual,
+    routeMode: node.routeMode || ROUTE_MODE_KD,
     splitPoint: node.splitPoint ? node.splitPoint.slice() : null,
     splitAxes: node.splitAxes ? node.splitAxes.slice() : null,
+    segmentAxis: node.segmentAxis,
+    segmentCount: node.segmentCount,
+    segmentMin: node.segmentMin,
+    segmentMax: node.segmentMax,
+    contentTargetOverride: node.contentTargetOverride,
     tilingStrategy: node.tilingStrategy || TILING_STRATEGY_KD_TREE,
     occupiedChildCount: node.occupiedChildCount,
     bucketPath: node.bucketPath,
@@ -533,18 +583,34 @@ function deserializeNodeMeta(data) {
   const node = {
     key: data.key,
     level: data.level,
-    depth: data.depth,
+    depth: Number.isInteger(data.depth) ? data.depth : data.level,
     x: data.x,
     y: data.y,
     z: data.z,
+    childSlot: Number.isInteger(data.childSlot) ? data.childSlot : null,
     count: data.count,
     bounds: deserializeBoundsState(data.bounds),
     leaf: data.leaf,
+    virtual: !!data.virtual,
+    routeMode: data.routeMode || ROUTE_MODE_KD,
     splitPoint: normalizeSplitPoint(data.splitPoint),
     splitAxes: normalizeSplitAxes(data.splitAxes),
+    segmentAxis: Number.isInteger(data.segmentAxis) ? data.segmentAxis : null,
+    segmentCount:
+      Number.isInteger(data.segmentCount) && data.segmentCount > 0
+        ? data.segmentCount
+        : null,
+    segmentMin: Number.isFinite(data.segmentMin) ? data.segmentMin : null,
+    segmentMax: Number.isFinite(data.segmentMax) ? data.segmentMax : null,
+    contentTargetOverride:
+      Number.isFinite(data.contentTargetOverride) &&
+      data.contentTargetOverride > 0
+        ? data.contentTargetOverride
+        : null,
     tilingStrategy: data.tilingStrategy || TILING_STRATEGY_KD_TREE,
     children: [],
     childrenByOct: new Array(8).fill(null),
+    childrenBySegment: new Map(),
     occupiedChildCount: data.occupiedChildCount || 0,
     bucketPath: data.bucketPath || null,
     contentUri: data.contentUri || null,
@@ -568,9 +634,15 @@ function deserializeNodeMeta(data) {
     for (const childData of data.children) {
       const child = deserializeNodeMeta(childData);
       node.children.push(child);
-      const oct =
-        ((child.x & 1) << 0) | ((child.y & 1) << 1) | ((child.z & 1) << 2);
-      node.childrenByOct[oct] = child;
+      const slot =
+        Number.isInteger(child.childSlot) && child.childSlot >= 0
+          ? child.childSlot
+          : ((child.x & 1) << 0) | ((child.y & 1) << 1) | ((child.z & 1) << 2);
+      if (node.routeMode === ROUTE_MODE_AXIS_SEGMENTS || node.virtual) {
+        node.childrenBySegment.set(slot, child);
+      } else {
+        node.childrenByOct[slot] = child;
+      }
     }
   }
   return node;
@@ -579,10 +651,15 @@ function deserializeNodeMeta(data) {
 function collectTreeStats(node) {
   const nodes = [];
   const leaves = [];
+  const virtualNodes = [];
   let maxLevel = 0;
+  let maxDepth = 0;
   const levels = [];
   const visit = (current) => {
     nodes.push(current);
+    if (current.virtual) {
+      virtualNodes.push(current);
+    }
     if (!levels[current.level]) {
       levels[current.level] = [];
     }
@@ -593,22 +670,32 @@ function collectTreeStats(node) {
     if (current.level > maxLevel) {
       maxLevel = current.level;
     }
+    if (current.depth > maxDepth) {
+      maxDepth = current.depth;
+    }
     for (const child of current.children) {
       visit(child);
     }
   };
   visit(node);
-  return { nodes, leaves, maxLevel, levels };
+  return { nodes, leaves, virtualNodes, maxLevel, maxDepth, levels };
 }
 
 function resolveLeafNodeForPoint(root, x, y, z) {
   let node = root;
   while (!node.leaf) {
-    const oct = pointOctantForNode(node, x, y, z);
-    const child = node.childrenByOct[oct];
+    let slot;
+    let child;
+    if (node.routeMode === ROUTE_MODE_AXIS_SEGMENTS || node.virtual) {
+      slot = pointSegmentForNode(node, x, y, z);
+      child = node.childrenBySegment.get(slot);
+    } else {
+      slot = pointOctantForNode(node, x, y, z);
+      child = node.childrenByOct[slot];
+    }
     ensure(
       !!child,
-      `Failed to resolve leaf bucket for point at node ${node.key}.`,
+      `Failed to resolve leaf bucket for point at node ${node.key} slot=${slot}.`,
     );
     node = child;
   }
@@ -643,6 +730,7 @@ function makePipelineFingerprint(inputPath, inputStat, args) {
     tilingStrategy: TILING_STRATEGY_KD_TREE,
     kdTreeSplitHistogramBins: ADAPTIVE_SPLIT_HISTOGRAM_BINS,
     kdTreeMaxLongWidthRatio: ADAPTIVE_MAX_LONG_WIDTH_RATIO,
+    kdTreeLongTileSplitMode: LONG_TILE_SPLIT_MODE,
     samplingRatePerLevel: args.samplingRatePerLevel,
     sampleMode: args.sampleMode,
     minGeometricError: args.minGeometricError,
@@ -3078,6 +3166,9 @@ async function streamSimplifyBucketEntriesExact(
 }
 
 function resolveNodeContentTarget(node, ctx, inputSplatCount) {
+  if (Number.isFinite(node.contentTargetOverride) && node.contentTargetOverride > 0) {
+    return normalizeSplatTargetCount(node.contentTargetOverride, inputSplatCount);
+  }
   const targetRaw = targetSplatCountForDepth(
     node.depth,
     ctx.lodMaxDepth,
@@ -3089,6 +3180,114 @@ function resolveNodeContentTarget(node, ctx, inputSplatCount) {
     inputSplatCount,
     node.occupiedChildCount,
   );
+}
+
+function resolveVirtualNodeContentTarget(
+  node,
+  lodMaxDepth,
+  samplingRatePerLevel,
+) {
+  const targetRaw =
+    Number.isFinite(node.contentTargetOverride) && node.contentTargetOverride > 0
+      ? node.contentTargetOverride
+      : targetSplatCountForDepth(
+          node.depth,
+          lodMaxDepth,
+          samplingRatePerLevel,
+          node.count,
+        );
+  return constrainTargetSplatCount(targetRaw, node.count, node.children.length);
+}
+
+function minimumContentTargetForVirtualBudget(node) {
+  if (!node.virtual) {
+    return node.count > 0 ? 1 : 0;
+  }
+  return node.children.reduce(
+    (sum, child) => sum + minimumContentTargetForVirtualBudget(child),
+    0,
+  );
+}
+
+function allocateContentTargetsByChildCount(node, totalTarget) {
+  const children = node.children.filter((child) => child.count > 0);
+  if (children.length === 0) {
+    return;
+  }
+
+  const minTotal = children.reduce(
+    (sum, child) => sum + minimumContentTargetForVirtualBudget(child),
+    0,
+  );
+  const total = Math.max(
+    minTotal,
+    Math.min(node.count, Math.floor(totalTarget)),
+  );
+  const allocations = children.map((child) => {
+    const minimum = minimumContentTargetForVirtualBudget(child);
+    return {
+      child,
+      allocation: minimum,
+      capacity: Math.max(0, child.count - minimum),
+      remainder: 0.0,
+    };
+  });
+  let remaining =
+    total - allocations.reduce((sum, entry) => sum + entry.allocation, 0);
+  if (remaining > 0) {
+    const denominator = Math.max(1, node.count);
+    for (const entry of allocations) {
+      const exact = (remaining * entry.child.count) / denominator;
+      const extra = Math.min(entry.capacity, Math.floor(exact));
+      entry.allocation += extra;
+      entry.capacity -= extra;
+      entry.remainder = exact - extra;
+    }
+    remaining = total - allocations.reduce((sum, entry) => sum + entry.allocation, 0);
+  }
+
+  while (remaining > 0) {
+    const candidates = allocations
+      .filter((entry) => entry.capacity > 0)
+      .sort((a, b) => {
+        if (b.remainder !== a.remainder) return b.remainder - a.remainder;
+        if (b.child.count !== a.child.count) return b.child.count - a.child.count;
+        return (a.child.childSlot || 0) - (b.child.childSlot || 0);
+      });
+    if (candidates.length === 0) {
+      break;
+    }
+    for (const entry of candidates) {
+      if (remaining <= 0) {
+        break;
+      }
+      entry.allocation += 1;
+      entry.capacity -= 1;
+      remaining -= 1;
+    }
+  }
+
+  for (const entry of allocations) {
+    entry.child.contentTargetOverride = entry.allocation;
+  }
+}
+
+function assignVirtualSegmentContentTargets(
+  node,
+  lodMaxDepth,
+  samplingRatePerLevel,
+) {
+  if (node.virtual) {
+    const target = resolveVirtualNodeContentTarget(
+      node,
+      lodMaxDepth,
+      samplingRatePerLevel,
+    );
+    allocateContentTargetsByChildCount(node, target);
+  }
+  for (const child of node.children) {
+    assignVirtualSegmentContentTargets(child, lodMaxDepth, samplingRatePerLevel);
+  }
 }
 
 function spzBytesPerBucketRow(coeffCount) {
@@ -3519,13 +3718,15 @@ async function readExactFromHandle(handle, buffer, length, position, message) {
 
 function collectAdaptiveSplitCandidates(node, maxDepth, leafLimit, out) {
   if (node.leaf) {
-    if (
+    const canSplitByCount =
       !node.splitExhausted &&
-      node.level < maxDepth &&
-      node.count > 1 &&
-      (node.count > leafLimit ||
-        boundsLongWidthAspect(node.bounds) > ADAPTIVE_MAX_LONG_WIDTH_RATIO)
-    ) {
+      node.depth < maxDepth &&
+      node.count > leafLimit;
+    const canSplitByAspect =
+      node.level > 0 &&
+      !node.aspectSplitExhausted &&
+      boundsLongWidthAspect(node.bounds) > ADAPTIVE_MAX_LONG_WIDTH_RATIO;
+    if (node.count > 1 && (canSplitByAspect || canSplitByCount)) {
       out.push(node);
     }
     return;
@@ -3548,9 +3749,8 @@ function makeAdaptiveSplitStats(node) {
     maximum: [-Infinity, -Infinity, -Infinity],
     splitPoint: null,
     splitAxes: null,
-    childCounts: null,
-    childMinimums: null,
-    childMaximums: null,
+    action: null,
+    childStats: null,
   };
 }
 
@@ -3591,6 +3791,13 @@ function longWidthAspectFromExtents(extents) {
 
 function boundsLongWidthAspect(bounds) {
   return longWidthAspectFromExtents(bounds.extents()).aspect;
+}
+
+function aspectSegmentCount(aspect) {
+  if (!Number.isFinite(aspect) || aspect <= ADAPTIVE_MAX_LONG_WIDTH_RATIO) {
+    return 1;
+  }
+  return Math.max(2, Math.ceil(aspect / ADAPTIVE_MAX_LONG_WIDTH_RATIO));
 }
 
 function updateAdaptiveSplitStats(stats, x, y, z) {
@@ -3716,16 +3923,147 @@ function chooseAdaptiveSplit(stats) {
   return false;
 }
 
-function updateAdaptiveChildStats(stats, oct, x, y, z) {
-  stats.childCounts[oct] += 1;
-  const minimum = stats.childMinimums[oct];
-  const maximum = stats.childMaximums[oct];
+function makeKdSplitAction(stats) {
+  if (!chooseAdaptiveSplit(stats)) {
+    return null;
+  }
+  return {
+    kind: ROUTE_MODE_KD,
+    splitPoint: stats.splitPoint,
+    splitAxes: stats.splitAxes,
+  };
+}
+
+function makeVirtualSegmentSplitAction(node, tightBounds) {
+  if (node.level <= 0 || node.aspectSplitExhausted) {
+    return null;
+  }
+
+  const aspectInfo = longWidthAspectFromExtents(tightBounds.extents());
+  if (aspectInfo.aspect <= ADAPTIVE_MAX_LONG_WIDTH_RATIO) {
+    return null;
+  }
+
+  const axis = aspectInfo.longestAxis;
+  const segmentMin = tightBounds.minimum[axis];
+  const segmentMax = tightBounds.maximum[axis];
+  const segmentExtent = segmentMax - segmentMin;
+  const epsilon = Math.max(
+    ADAPTIVE_SPLIT_EPSILON,
+    Math.abs(segmentExtent) * ADAPTIVE_SPLIT_EPSILON,
+  );
+  if (
+    !Number.isFinite(segmentExtent) ||
+    segmentExtent <= epsilon ||
+    aspectInfo.widthExtent <= epsilon
+  ) {
+    return null;
+  }
+
+  const segmentCount = aspectSegmentCount(aspectInfo.aspect);
+  if (!Number.isInteger(segmentCount) || segmentCount <= 1) {
+    return null;
+  }
+
+  return {
+    kind: ROUTE_MODE_AXIS_SEGMENTS,
+    axis,
+    segmentCount,
+    segmentMin,
+    segmentMax,
+  };
+}
+
+function chooseAdaptiveSplitAction(stats, tightBounds, maxDepth, leafLimit) {
+  const node = stats.node;
+  const aspectCandidate =
+    node.level > 0 &&
+    !node.aspectSplitExhausted &&
+    boundsLongWidthAspect(tightBounds) > ADAPTIVE_MAX_LONG_WIDTH_RATIO;
+  if (aspectCandidate) {
+    const action = makeVirtualSegmentSplitAction(node, tightBounds);
+    if (action) {
+      return action;
+    }
+  }
+
+  if (!node.splitExhausted && node.depth < maxDepth && node.count > leafLimit) {
+    const action = makeKdSplitAction(stats);
+    if (action) {
+      return action;
+    }
+    return {
+      kind: null,
+      aspectExhausted: aspectCandidate,
+      splitExhausted: true,
+    };
+  }
+
+  return {
+    kind: null,
+    aspectExhausted: aspectCandidate,
+    splitExhausted: false,
+  };
+}
+
+function pointSegmentForSplitAction(action, x, y, z) {
+  const values = [x, y, z];
+  const extent = action.segmentMax - action.segmentMin;
+  if (!Number.isFinite(extent) || extent <= 0.0) {
+    return 0;
+  }
+  const slot = Math.floor(
+    ((values[action.axis] - action.segmentMin) / extent) *
+      action.segmentCount,
+  );
+  return Math.max(0, Math.min(action.segmentCount - 1, slot));
+}
+
+function childSlotForAdaptiveAction(stats, x, y, z) {
+  const action = stats.action;
+  if (action.kind === ROUTE_MODE_AXIS_SEGMENTS) {
+    return pointSegmentForSplitAction(action, x, y, z);
+  }
+  return pointOctant(
+    stats.node.bounds,
+    x,
+    y,
+    z,
+    action.splitPoint,
+    action.splitAxes,
+  );
+}
+
+function updateAdaptiveChildStats(stats, slot, x, y, z) {
+  if (!stats.childStats) {
+    stats.childStats = new Map();
+  }
+  let entry = stats.childStats.get(slot);
+  if (!entry) {
+    entry = {
+      slot,
+      count: 0,
+      minimum: [Infinity, Infinity, Infinity],
+      maximum: [-Infinity, -Infinity, -Infinity],
+    };
+    stats.childStats.set(slot, entry);
+  }
+  entry.count += 1;
+  const minimum = entry.minimum;
+  const maximum = entry.maximum;
   if (x < minimum[0]) minimum[0] = x;
   if (y < minimum[1]) minimum[1] = y;
   if (z < minimum[2]) minimum[2] = z;
   if (x > maximum[0]) maximum[0] = x;
   if (y > maximum[1]) maximum[1] = y;
   if (z > maximum[2]) maximum[2] = z;
+}
+
+function sortedAdaptiveChildStats(stats) {
+  if (!stats.childStats) {
+    return [];
+  }
+  return Array.from(stats.childStats.values()).sort((a, b) => a.slot - b.slot);
 }
 
 async function forEachStagedPosition(source, callback) {
@@ -3799,8 +4137,17 @@ async function buildAdaptiveNodeTreeFromPositions(
   maxDepth,
   leafLimit,
 ) {
+  let nextPhysicalCoordinate = 1;
+  const allocateChildCoordinates = (parent) => ({
+    level: parent.level + 1,
+    x: nextPhysicalCoordinate++,
+    y: 0,
+    z: 0,
+  });
+
   const root = makePartitionTreeNode({
     level: 0,
+    depth: 0,
     x: 0,
     y: 0,
     z: 0,
@@ -3813,7 +4160,7 @@ async function buildAdaptiveNodeTreeFromPositions(
     return root;
   }
 
-  for (let depth = 0; depth < maxDepth; depth++) {
+  while (true) {
     const candidates = [];
     collectAdaptiveSplitCandidates(root, maxDepth, leafLimit, candidates);
     if (candidates.length === 0) {
@@ -3841,25 +4188,38 @@ async function buildAdaptiveNodeTreeFromPositions(
         stats.maximum,
         stats.node.bounds,
       );
-      if (!chooseAdaptiveSplit(stats)) {
+      const action = chooseAdaptiveSplitAction(
+        stats,
+        tightBounds,
+        maxDepth,
+        leafLimit,
+      );
+      if (!action.kind) {
         stats.node.bounds = tightBounds;
-        stats.node.splitExhausted = true;
+        if (action.aspectExhausted) {
+          stats.node.aspectSplitExhausted = true;
+        }
+        if (action.splitExhausted) {
+          stats.node.splitExhausted = true;
+        }
         continue;
       }
       stats.node.bounds = tightBounds;
-      stats.node.splitPoint = stats.splitPoint;
-      stats.node.splitAxes = stats.splitAxes;
-      stats.childCounts = new Float64Array(8);
-      stats.childMinimums = Array.from({ length: 8 }, () => [
-        Infinity,
-        Infinity,
-        Infinity,
-      ]);
-      stats.childMaximums = Array.from({ length: 8 }, () => [
-        -Infinity,
-        -Infinity,
-        -Infinity,
-      ]);
+      stats.action = action;
+      if (action.kind === ROUTE_MODE_KD) {
+        stats.node.splitPoint = action.splitPoint;
+        stats.node.splitAxes = action.splitAxes;
+        stats.node.routeMode = ROUTE_MODE_KD;
+      } else {
+        stats.node.splitPoint = null;
+        stats.node.splitAxes = null;
+        stats.node.routeMode = ROUTE_MODE_AXIS_SEGMENTS;
+        stats.node.segmentAxis = action.axis;
+        stats.node.segmentCount = action.segmentCount;
+        stats.node.segmentMin = action.segmentMin;
+        stats.node.segmentMax = action.segmentMax;
+      }
+      stats.childStats = new Map();
       splittableStats.push(stats);
     }
 
@@ -3878,50 +4238,65 @@ async function buildAdaptiveNodeTreeFromPositions(
       if (!stats) {
         return;
       }
-      const oct = pointOctantForNode(leaf, x, y, z);
-      updateAdaptiveChildStats(stats, oct, x, y, z);
+      const slot = childSlotForAdaptiveAction(stats, x, y, z);
+      updateAdaptiveChildStats(stats, slot, x, y, z);
     });
 
     let splitNodeCount = 0;
     for (const stats of splittableStats) {
       const node = stats.node;
-      const occupied = [];
-      for (let oct = 0; oct < 8; oct++) {
-        const count = stats.childCounts[oct];
-        if (count > 0) {
-          occupied.push({ oct, count });
-        }
-      }
+      const occupied = sortedAdaptiveChildStats(stats);
 
       if (occupied.length <= 1) {
         node.splitPoint = null;
         node.splitAxes = null;
+        node.segmentAxis = null;
+        node.segmentCount = null;
+        node.segmentMin = null;
+        node.segmentMax = null;
+        node.routeMode = ROUTE_MODE_KD;
         node.leaf = true;
-        node.splitExhausted = true;
+        if (stats.action.kind === ROUTE_MODE_AXIS_SEGMENTS) {
+          node.aspectSplitExhausted = true;
+        } else {
+          node.splitExhausted = true;
+        }
         continue;
       }
 
       node.leaf = false;
+      node.virtual = stats.action.kind === ROUTE_MODE_AXIS_SEGMENTS;
       node.children = [];
       node.childrenByOct = new Array(8).fill(null);
+      node.childrenBySegment = new Map();
       node.occupiedChildCount = occupied.length;
       for (const entry of occupied) {
-        const oct = entry.oct;
+        const slot = entry.slot;
+        const coords = allocateChildCoordinates(node);
         const child = makePartitionTreeNode({
-          level: node.level + 1,
-          x: node.x * 2 + (oct & 1),
-          y: node.y * 2 + ((oct >> 1) & 1),
-          z: node.z * 2 + ((oct >> 2) & 1),
+          level: coords.level,
+          depth:
+            stats.action.kind === ROUTE_MODE_AXIS_SEGMENTS
+              ? node.depth
+              : node.depth + 1,
+          x: coords.x,
+          y: coords.y,
+          z: coords.z,
+          childSlot: slot,
           bounds: boundsFromMinMax(
-            stats.childMinimums[oct],
-            stats.childMaximums[oct],
+            entry.minimum,
+            entry.maximum,
             node.bounds,
           ),
           count: entry.count,
           leaf: true,
         });
         node.children.push(child);
-        node.childrenByOct[oct] = child;
+        if (node.virtual) {
+          node.childrenBySegment.set(slot, child);
+        } else {
+          node.childrenByOct[slot] = child;
+        }
       }
       splitNodeCount += 1;
     }
@@ -3935,6 +4310,18 @@ async function buildAdaptiveNodeTreeFromPositions(
 }
 
 async function isPartitionedNodeComplete(node, ctx) {
+  if (node.virtual) {
+    if (node.buildState !== 'completed') {
+      return false;
+    }
+    if (node.depth > 0 && !node.handoffConsumed) {
+      if (!node.handoffPath) {
+        return false;
+      }
+      return pathExists(node.handoffPath);
+    }
+    return true;
+  }
   if (node.buildState !== 'completed' || !node.contentUri) {
     return false;
   }
@@ -3993,7 +4380,54 @@ async function processPartitionedLeafNode(node, ctx) {
   enqueuePipelineStateSave(ctx, PIPELINE_STAGE_BUCKETED);
 }
 
+async function processPartitionedVirtualInternalNode(node, ctx) {
+  const inputSpecs = node.children.map((child) => {
+    ensure(
+      !!child.handoffPath,
+      `Missing active child handoff for virtual node ${node.key} <- ${child.key}.`,
+    );
+    return handoffBucketSpec(child);
+  });
+  const { entries, totalRows } = await collectBucketEntries(
+    inputSpecs,
+    ctx.layout.coeffCount,
+  );
+
+  if (node.depth > 0) {
+    node.handoffPath = canonicalNodePath(ctx.tempDir, HANDOFF_BUCKET_DIR, node);
+    await materializeCanonicalEntriesFile(
+      entries,
+      node.handoffPath,
+      ctx.layout.coeffCount,
+      { bucketChunkBytes: ctx.bucketChunkBytes },
+    );
+    node.handoffRowCount = totalRows;
+    node.handoffConsumed = false;
+  } else {
+    node.handoffPath = null;
+    node.handoffRowCount = null;
+    node.handoffConsumed = true;
+  }
+
+  node.ownError = 0.0;
+  node.contentUri = null;
+  node.buildState = 'completed';
+  for (const child of node.children) {
+    child.handoffConsumed = true;
+    if (child.handoffPath) {
+      ctx.pendingHandoffCleanup.add(child.handoffPath);
+    }
+    child.handoffRowCount = null;
+  }
+  enqueuePipelineStateSave(ctx, PIPELINE_STAGE_BUCKETED);
+}
+
 async function processPartitionedInternalNode(node, ctx) {
+  if (node.virtual) {
+    await processPartitionedVirtualInternalNode(node, ctx);
+    return;
+  }
+
   const inputSpecs = node.children.map((child) => {
     ensure(
       !!child.handoffPath,
@@ -4231,6 +4665,10 @@ function estimateBuildNodeMemoryBytes(node, ctx) {
     return base + inputRows * (spzRowBytes * 2 + rowByteSize * 0.25);
   }
 
+  if (node.virtual) {
+    return base + inputRows * rowByteSize;
+  }
+
   const targetRows = resolveNodeContentTarget(node, ctx, inputRows);
   if (inputRows <= targetRows) {
     return base + inputRows * (spzRowBytes * 2 + rowByteSize);
@@ -4268,7 +4706,7 @@ function tickBuildProgress(ctx, node, status) {
   if (!ctx || !ctx.buildProgress || !node) {
     return;
   }
-  const kind = node.leaf ? 'leaf' : 'internal';
+  const kind = node.virtual ? 'virtual' : node.leaf ? 'leaf' : 'internal';
   const suffix = status ? ` ${status}` : '';
   ctx.buildProgress.tick(`level=${node.level} ${kind}${suffix}`);
 }
@@ -4352,17 +4790,16 @@ function buildTileNodeTree(
   samplingRatePerLevel,
   nodesByKey,
 ) {
+  ensure(!node.virtual, `Virtual node ${node.key} cannot be emitted as a tile.`);
   const error =
     rootGeometricError *
     geometricErrorScaleForDepth(node.depth, lodMaxDepth, samplingRatePerLevel);
-  const children = node.children.map((child) =>
-    buildTileNodeTree(
-      child,
-      rootGeometricError,
-      lodMaxDepth,
-      samplingRatePerLevel,
-      nodesByKey,
-    ),
+  const children = buildEmittedTileChildren(
+    node,
+    rootGeometricError,
+    lodMaxDepth,
+    samplingRatePerLevel,
+    nodesByKey,
   );
   const tileNode = new TileNode(
     node.level,
@@ -4376,6 +4813,41 @@ function buildTileNodeTree(
   );
   nodesByKey.set(tileNode.key(), tileNode);
   return tileNode;
+}
+
+function buildEmittedTileChildren(
+  node,
+  rootGeometricError,
+  lodMaxDepth,
+  samplingRatePerLevel,
+  nodesByKey,
+) {
+  const children = [];
+  const directRealChildren = node.children.filter((child) => !child.virtual);
+  const virtualChildren = node.children.filter((child) => child.virtual);
+  for (const child of directRealChildren) {
+    children.push(
+      buildTileNodeTree(
+        child,
+        rootGeometricError,
+        lodMaxDepth,
+        samplingRatePerLevel,
+        nodesByKey,
+      ),
+    );
+  }
+  for (const child of virtualChildren) {
+    children.push(
+      ...buildEmittedTileChildren(
+        child,
+        rootGeometricError,
+        lodMaxDepth,
+        samplingRatePerLevel,
+        nodesByKey,
+      ),
+    );
+  }
+  return children;
 }
 
 function tileToJson(node) {
@@ -4401,8 +4873,12 @@ function makeBuildSummary(
   rootGeometricError,
   rootGeometricErrorSource,
   nodeCount,
-  maxLevel,
+  maxDepth,
   availableLevels,
+  physicalMaxLevel,
+  physicalLevels,
+  partitionNodeCount,
+  virtualNodeCount,
   checkpointInfo,
   memoryPlan,
   timingsMs = {},
@@ -4412,7 +4888,7 @@ function makeBuildSummary(
   const samplingRatesByDepth = {};
   const geometricErrorScaleByDepth = {};
   const geometricErrorByDepth = {};
-  const effectiveMaxDepth = maxLevel;
+  const effectiveMaxDepth = maxDepth;
   const resolvedMemoryPlan = memoryPlan || makeMemoryBudgetPlan(args);
 
   for (let depth = 0; depth <= effectiveMaxDepth; depth++) {
@@ -4455,6 +4931,8 @@ function makeBuildSummary(
     tiling_strategy: TILING_STRATEGY_KD_TREE,
     kd_tree_split_histogram_bins: ADAPTIVE_SPLIT_HISTOGRAM_BINS,
     kd_tree_max_long_width_ratio: ADAPTIVE_MAX_LONG_WIDTH_RATIO,
+    kd_tree_long_tile_split_mode: LONG_TILE_SPLIT_MODE,
+    kd_tree_long_tile_split_virtual: true,
     content_codec: 'spz_stream',
     spz_version: SPZ_STREAM_VERSION,
     spz_sh1_bits: args.spzSh1Bits,
@@ -4472,8 +4950,12 @@ function makeBuildSummary(
         ? args.minGeometricError
         : null,
     node_count: nodeCount,
+    partition_node_count: partitionNodeCount,
+    virtual_node_count: virtualNodeCount,
     available_levels: availableLevels,
     effective_max_depth: effectiveMaxDepth,
+    physical_levels: physicalLevels,
+    physical_max_level: physicalMaxLevel,
     root_geometric_error_source: rootGeometricErrorSource,
     root_geometric_error: rootNode.error,
     min_geometric_error:
@@ -4688,7 +5170,12 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
     params.bucketChunkBytes = memoryPlan.bucketChunkBytes;
     const lodMaxDepth = Math.max(
       0,
-      Math.min(args.maxDepth, treeStats.maxLevel),
+      Math.min(args.maxDepth, treeStats.maxDepth),
+    );
+    assignVirtualSegmentContentTargets(
+      rootNodeMeta,
+      lodMaxDepth,
+      args.samplingRatePerLevel,
     );
 
     const canReuseLeafBuckets =
@@ -4783,7 +5270,7 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
     await buildPartitionedBottomUp(rootNodeMeta, ctx);
     timingsMs.build_tiles_ms = elapsedMsSince(buildStartedAt);
     ctx.buildProgress.done(
-      `nodes=${treeStats.nodes.length} levels=${treeStats.maxLevel + 1}`,
+      `nodes=${treeStats.nodes.length} levels=${treeStats.maxDepth + 1} logical/${treeStats.maxLevel + 1} physical`,
     );
     await ctx.savePromise;
 
@@ -4798,7 +5285,8 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
       nodesByKey,
     );
 
-    const availableLevels = treeStats.maxLevel + 1;
+    const availableLevels = treeStats.maxDepth + 1;
+    const physicalLevels = treeStats.maxLevel + 1;
     const tileset = applyTilesetGltfContentExtensions({
       asset: makeTilesetAsset(),
       geometricError: rootTileNode.error,
@@ -4823,8 +5311,12 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
           rootGeometricError,
           rootGeometricErrorSource,
           nodesByKey.size,
-          treeStats.maxLevel,
+          treeStats.maxDepth,
           availableLevels,
+          treeStats.maxLevel,
+          physicalLevels,
+          treeStats.nodes.length,
+          treeStats.virtualNodes.length,
           checkpointInfo,
           memoryPlan,
           {
@@ -4838,7 +5330,7 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
     );
 
     console.log(
-      `[info] nodes=${nodesByKey.size} | levels=${availableLevels} | splats=${header.vertexCount}`,
+      `[info] nodes=${nodesByKey.size} | levels=${availableLevels} logical/${physicalLevels} physical | splats=${header.vertexCount}`,
     );
     success = true;
     return {
@@ -4846,6 +5338,7 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
       shDegree: layout.degree,
       nodeCount: nodesByKey.size,
       levels: availableLevels,
+      physicalLevels,
     };
   } finally {
     try {

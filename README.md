@@ -51,7 +51,7 @@ Output is written under:
 
 Generated `tileset.json` files declare the top-level `3DTILES_content_gltf` tileset extension metadata that CesiumJS uses to detect `KHR_gaussian_splatting` and `KHR_gaussian_splatting_compression_spz_2` glTF tile content.
 
-Tiling is explicit and uses a count-balanced k-d tree. Each split chooses one axis and a histogram median split plane for the current bucket, so leaf buckets stay globally balanced by splat count while dense regions naturally become smaller. Leaf tiles also keep their longest-to-width aspect ratio at `2:1` where `maxDepth` allows.
+Tiling is explicit and uses a count-balanced k-d tree. Each logical split chooses one axis and a histogram median split plane for the current bucket, so leaf buckets stay globally balanced by splat count while dense regions naturally become smaller. Non-root tiles whose tight bounding box exceeds a `2:1` longest-to-width ratio are removed from the emitted tileset and replaced by equal-length virtual segments along their longest axis. These virtual segment splits can add deeper physical `tiles/{level}/{x}/{y}/{z}.glb` paths without increasing logical LOD depth or consuming `maxDepth`.
 
 Large PLY conversion through `convert(...)` now uses a temp-file-backed pipeline. That path writes canonical leaf/handoff buckets, builds parent LODs from handoff data, uses exact streaming simplify so internal nodes do not need a full in-memory SH payload up front, and processes each level with memory-budgeted concurrency. Successful conversions remove the temp workspace; failed conversions preserve it so the same output directory can resume when rerun without `--clean`.
 
@@ -62,8 +62,8 @@ const { convert } = require('3dgs-ply-3dtiles-converter');
 
 (async () => {
   const result = await convert('data/scene.ply', './out/tileset', {
-    maxDepth: 5,
-    leafLimit: 5000,
+    maxDepth: 8,
+    leafLimit: 100,
     spzSh1Bits: 8,
     spzShRestBits: 8,
     memoryBudget: 2,
@@ -87,7 +87,7 @@ The library API accepts the same option names as CLI flags, with camelCase names
 
 Examples:
 
-- CLI `--max-depth 5` equals API `{ maxDepth: 5 }`
+- CLI `--max-depth 8` equals API `{ maxDepth: 8 }`
 - CLI `--spz-sh1-bits 6` equals API `{ spzSh1Bits: 6 }`
 - CLI `--sample-mode merge` equals API `{ sampleMode: 'merge' }`
 - CLI `--memory-budget 4` equals API `{ memoryBudget: 4 }`
@@ -108,8 +108,8 @@ Examples:
 | Input convention        | string  | `--input-convention`        | `inputConvention`      | `graphdeco`           | `graphdeco`, `khr_native`                   | Controls PLY quaternion interpretation and opacity mapping.                                                                                                                                                                                                       |
 | Linear scale input      | boolean | `--linear-scale-input`      | `linearScaleInput`     | `false`               | `true`/`false`                              | If enabled, converts scale values as `ln(max(v, 1e-8))`.                                                                                                                                                                                                          |
 | Color space             | string  | `--color-space`             | `colorSpace`           | `srgb_rec709_display` | `lin_rec709_display`, `srgb_rec709_display` | Emitted in tileset extension metadata.                                                                                                                                                                                                                            |
-| Max depth               | integer | `--max-depth`               | `maxDepth`             | `5`                   | `>= 0`                                      | Maximum k-d tree tile depth.                                                                                                                                                                                                                                      |
-| Leaf limit              | integer | `--leaf-limit`              | `leafLimit`            | `5000`                | `>= 1`                                      | Max splat count per leaf tile before split stops.                                                                                                                                                                                                                 |
+| Max depth               | integer | `--max-depth`               | `maxDepth`             | `8`                   | `>= 0`                                      | Maximum logical k-d tree LOD depth. Virtual long-tile segment paths may be physically deeper.                                                                                                                                                                      |
+| Leaf limit              | integer | `--leaf-limit`              | `leafLimit`            | `100`                 | `>= 1`                                      | Max splat count per leaf tile before split stops.                                                                                                                                                                                                                 |
 | Min geometric error     | number  | `--min-geometric-error`     | `minGeometricError`    | `null`                | any finite number                           | Minimum geometric error for the deepest emitted level.                                                                                                                                                                                                            |
 | SH1 bits                | integer | `--spz-sh1-bits`            | `spzSh1Bits`           | `8`                   | `1..8`                                      | SPZ quantization bits for DC SH coefficients.                                                                                                                                                                                                                     |
 | SH rest bits            | integer | `--spz-sh-rest-bits`        | `spzShRestBits`        | `8`                   | `1..8`                                      | SPZ quantization bits for higher SH coefficients.                                                                                                                                                                                                                 |
