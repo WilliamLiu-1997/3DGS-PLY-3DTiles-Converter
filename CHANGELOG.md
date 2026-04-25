@@ -6,6 +6,12 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-04-25
+
+### Changed
+
+- Updated the `3dtiles-inspector` dependency range to `^0.1.4`.
+
 ## [0.3.1] - 2026-04-25
 
 ### Changed
