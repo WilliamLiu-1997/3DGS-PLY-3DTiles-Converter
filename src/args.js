@@ -52,7 +52,7 @@ const DEFAULT_CONVERSION_ARGS = {
   samplingRatePerLevel: 0.5,
   sampleMode: 'merge',
   memoryBudget: 2,
-  orientedBoundingBoxes: true,
+  orientedBoundingBoxes: false,
   openInspector: true,
   clean: true,
   selfTest: false,

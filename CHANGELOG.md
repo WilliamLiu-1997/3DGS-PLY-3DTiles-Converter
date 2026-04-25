@@ -6,6 +6,12 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-04-25
+
+### Changed
+
+- Changed the default bounds mode to AABB. Use `--obb` or `orientedBoundingBoxes: true` to enable root-PCA oriented bounds.
+
 ## [0.3.0] - 2026-04-25
 
 ### Added

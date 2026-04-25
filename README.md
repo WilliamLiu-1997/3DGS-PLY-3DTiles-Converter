@@ -118,7 +118,7 @@ The library API accepts the same option names as the CLI, using camelCase fields
 | LOD sampling          | `--sampling-rate-per-level <0..1]`                      | `samplingRatePerLevel`        | `0.5`                 | Sampling ratio between LOD levels.                                                          |
 | Sampling mode         | `--sample-mode <value>`                                 | `sampleMode`                  | `merge`               | Use `sample` or `merge`; `sample` keeps representatives and `merge` merges assigned splats. |
 | Memory budget         | `--memory-budget <gb>`                                  | `memoryBudget`                | `2`                   | Sizes scan buffers, bucket buffers, simplify scratch space, write concurrency, and workers. |
-| Bounds mode           | `--obb` or `--aabb`                                     | `orientedBoundingBoxes`       | `true`                | Emits root-PCA OBB bounds by default; `--aabb` uses axis-aligned bounds and split planes.   |
+| Bounds mode           | `--obb` or `--aabb`                                     | `orientedBoundingBoxes`       | `false`               | Emits AABB bounds and split planes by default; `--obb` enables root-PCA oriented bounds.    |
 | Inspector             | `--open-inspector` or `--no-open-inspector`             | `openInspector`               | `true`                | Opens the generated tileset in `3dtiles-inspector` after success.                           |
 | Self-test count       | `--self-test-count <int>`                               | `selfTestCount`               | `1000000`             | Number of synthetic splats when using `--self-test`.                                        |
 | Output cleanup        | `--clean` or `--continue`                               | `clean`                       | `true`                | `--continue` preserves the output directory and resumes a failed checkpoint.                |
@@ -127,7 +127,7 @@ Use `--help` to print the CLI usage text.
 
 ## Tiling and Performance
 
-The converter always writes explicit 3D Tiles. It builds a visual-cost-balanced k-d tree, uses root-PCA oriented bounding boxes by default, and falls back to AABB behavior when `--aabb` is set.
+The converter always writes explicit 3D Tiles. It builds a visual-cost-balanced k-d tree with AABB bounds and split planes by default. Use `--obb` to enable root-PCA oriented bounding boxes and root-basis split planes.
 
 Use `--tile-refinement 2` when the first tile level should be finer: the root performs two initial k-d split rounds and emits up to four direct child tiles while keeping those children at logical depth 1. Higher integer values continue the same pattern.
 

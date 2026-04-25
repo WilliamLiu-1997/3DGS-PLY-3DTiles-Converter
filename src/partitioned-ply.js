@@ -353,7 +353,7 @@ function elapsedMsSince(startMs) {
 }
 
 function useOrientedBoundingBoxes(args) {
-  return !args || args.orientedBoundingBoxes !== false;
+  return !!(args && args.orientedBoundingBoxes === true);
 }
 
 function tileBoundingVolumeModeForArgs(args) {
@@ -5955,7 +5955,7 @@ async function buildAdaptiveNodeTreeFromPositions(
   leafLimit,
   options = {},
 ) {
-  const orientedBoundingBoxes = options.orientedBoundingBoxes !== false;
+  const orientedBoundingBoxes = options.orientedBoundingBoxes === true;
   const rootBasisAxes = orientedBoundingBoxes
     ? await computeRootBasisAxesFromPositions(source)
     : null;
