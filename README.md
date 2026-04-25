@@ -79,7 +79,7 @@ const { convert } = require('3dgs-ply-3dtiles-converter');
   const result = await convert('data/scene.ply', './out/tileset', {
     memoryBudget: 4,
     maxDepth: 8,
-    tileRefinement: 1,
+    tileRefinement: 2,
     leafLimit: 100,
     openInspector: false,
   });
@@ -108,7 +108,7 @@ The library API accepts the same option names as the CLI, using camelCase fields
 | Linear scale input    | `--linear-scale-input`                                  | `linearScaleInput`            | `false`               | Converts linear scale values to log scale.                                                  |
 | Color space           | `--color-space <value>`                                 | `colorSpace`                  | `srgb_rec709_display` | Use `lin_rec709_display` or `srgb_rec709_display`; written to tileset extension metadata.   |
 | Tiling depth          | `--max-depth <int>`                                     | `maxDepth`                    | `8`                   | Maximum tree LOD depth.                                                                     |
-| Root tile refinement  | `--tile-refinement <int>`                               | `tileRefinement`              | `1`                   | Higher values produce more, smaller tiles.                                                  |
+| Root tile refinement  | `--tile-refinement <int>`                               | `tileRefinement`              | `2`                   | Higher values produce more, smaller tiles.                                                  |
 | Leaf size             | `--leaf-limit <int>`                                    | `leafLimit`                   | `100`                 | Target splat-count limit for leaf tiles.                                                    |
 | Geometric error floor | `--min-geometric-error <number>`                        | `minGeometricError`           | `null`                | Minimum geometric error for the deepest emitted level.                                      |
 | SPZ quantization      | `--spz-sh1-bits <1..8>` and `--spz-sh-rest-bits <1..8>` | `spzSh1Bits`, `spzShRestBits` | `8`, `8`              | SH coefficient quantization bits.                                                           |

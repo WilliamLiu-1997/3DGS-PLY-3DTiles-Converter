@@ -6,6 +6,12 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-04-25
+
+### Changed
+
+- Changed the default `tileRefinement` / `--tile-refinement` value from `1` to `2`, producing more, smaller first-level tiles by default.
+
 ## [0.3.2] - 2026-04-25
 
 ### Changed
