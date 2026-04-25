@@ -1,6 +1,6 @@
 {
   "name": "3dgs-ply-3dtiles-converter",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Convert Gaussian Splatting PLY files into 3D Tiles with SPZ compressed GLB output.",
   "author": "William Liu <lyz15972107087@gmail.com>",
   "license": "Apache-2.0",

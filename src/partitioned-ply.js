@@ -61,7 +61,7 @@ const {
 const DEFAULT_WORKER_SCRIPT = path.join(__dirname, 'convert-core.js');
 const TEMP_WORKSPACE_NAME = '.tmp-ply-partitions';
 const PIPELINE_STATE_FILE = 'pipeline-state.json';
-const PIPELINE_STATE_VERSION = 14;
+const PIPELINE_STATE_VERSION = 15;
 const PIPELINE_STAGE_BUCKETED = 'bucketed';
 const LEAF_BUCKET_DIR = 'leaf';
 const HANDOFF_BUCKET_DIR = 'handoff';
@@ -625,9 +625,7 @@ function normalizeSplitOffset(splitOffset) {
 }
 
 function usesSegmentRouting(node) {
-  return (
-    !!node && (node.routeMode === ROUTE_MODE_AXIS_SEGMENTS || !!node.virtual)
-  );
+  return !!node && node.routeMode === ROUTE_MODE_AXIS_SEGMENTS;
 }
 
 function ensureChildrenBySegment(node) {
@@ -971,6 +969,7 @@ function makePipelineFingerprint(
     sourceCoordinateSystem:
       sourceCoordinateSystem || DEFAULT_SOURCE_COORDINATE_SYSTEM,
     maxDepth: args.maxDepth,
+    tileRefinement: args.tileRefinement,
     leafLimit: args.leafLimit,
     tilingStrategy: TILING_STRATEGY_KD_TREE,
     kdTreeSplitDirection: kdTreeSplitDirectionForArgs(args),
@@ -4237,21 +4236,106 @@ async function readExactFromHandle(handle, buffer, length, position, message) {
   }
 }
 
-function collectAdaptiveSplitCandidates(node, maxDepth, leafLimit, out) {
+function normalizedTileRefinement(value) {
+  return Math.max(1, Math.floor(value || 1));
+}
+
+function markRootTileRefinementStart(root, tileRefinement) {
+  if (normalizedTileRefinement(tileRefinement) > 1) {
+    root._rootTileRefinementDepth = 0;
+  }
+}
+
+function rootTileRefinementDepth(node) {
+  return Number.isInteger(node && node._rootTileRefinementDepth)
+    ? node._rootTileRefinementDepth
+    : null;
+}
+
+function canSplitRootTileRefinement(node, maxDepth, tileRefinement) {
+  const refinement = normalizedTileRefinement(tileRefinement);
+  const depth = rootTileRefinementDepth(node);
+  return (
+    maxDepth > 0 &&
+    refinement > 1 &&
+    depth != null &&
+    depth > 0 &&
+    depth < refinement &&
+    !node._rootTileRefinementExhausted &&
+    node.count > 1
+  );
+}
+
+function markRootTileRefinementExhausted(node) {
+  if (node && rootTileRefinementDepth(node) != null) {
+    node._rootTileRefinementExhausted = true;
+  }
+}
+
+function splitActionKeepsLogicalDepth(action) {
+  return (
+    action &&
+    (action.kind === ROUTE_MODE_AXIS_SEGMENTS || action.rootTileRefinement)
+  );
+}
+
+function splitActionMakesVirtualNode(action) {
+  return splitActionKeepsLogicalDepth(action);
+}
+
+function assignRootTileRefinementChildState(parent, child, action, refinement) {
+  if (!action || action.kind !== ROUTE_MODE_KD) {
+    return;
+  }
+  const parentDepth = rootTileRefinementDepth(parent);
+  const tileRefinement = normalizedTileRefinement(refinement);
+  if (parentDepth != null && parentDepth < tileRefinement) {
+    child._rootTileRefinementDepth = parentDepth + 1;
+  }
+}
+
+function makeAdaptiveSplitCandidateOptions(options = {}) {
+  return {
+    tileRefinement: normalizedTileRefinement(options.tileRefinement),
+  };
+}
+
+function collectAdaptiveSplitCandidates(
+  node,
+  maxDepth,
+  leafLimit,
+  out,
+  options = {},
+) {
+  const candidateOptions = makeAdaptiveSplitCandidateOptions(options);
   if (node.leaf) {
+    const canSplitByRootRefinement = canSplitRootTileRefinement(
+      node,
+      maxDepth,
+      candidateOptions.tileRefinement,
+    );
     const canSplitByCount =
       !node.splitExhausted && node.depth < maxDepth && node.count > leafLimit;
     const canSplitByAspect =
       node.level > 0 &&
       !node.aspectSplitExhausted &&
       boundsLongWidthAspect(node.bounds) > ADAPTIVE_MAX_LONG_WIDTH_RATIO;
-    if (node.count > 1 && (canSplitByAspect || canSplitByCount)) {
+    if (
+      node.count > 1 &&
+      (canSplitByRootRefinement || canSplitByAspect || canSplitByCount)
+    ) {
       out.push(node);
     }
     return;
   }
   for (const child of node.children) {
-    collectAdaptiveSplitCandidates(child, maxDepth, leafLimit, out);
+    collectAdaptiveSplitCandidates(
+      child,
+      maxDepth,
+      leafLimit,
+      out,
+      candidateOptions,
+    );
   }
 }
 
@@ -4961,8 +5045,24 @@ function chooseAdaptiveSplitAction(
   maxDepth,
   leafLimit,
   basisAxes = null,
+  options = {},
 ) {
   const node = stats.node;
+  const tileRefinement = normalizedTileRefinement(options.tileRefinement);
+  if (canSplitRootTileRefinement(node, maxDepth, tileRefinement)) {
+    const action = makeKdSplitAction(stats, tightBounds, basisAxes);
+    if (action) {
+      action.rootTileRefinement = true;
+      return action;
+    }
+    return {
+      kind: null,
+      aspectExhausted: false,
+      splitExhausted: false,
+      rootTileRefinementExhausted: true,
+    };
+  }
+
   const projectedAspectInfo = basisAxes
     ? projectedAspectInfoFromStats(stats, tightBounds, basisAxes)
     : null;
@@ -5900,6 +6000,8 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
   });
 
   const root = makeAdaptiveRootNode(rootBounds, source.vertexCount);
+  const tileRefinement = normalizedTileRefinement(options.tileRefinement);
+  markRootTileRefinementStart(root, tileRefinement);
 
   if (maxDepth <= 0 || source.vertexCount <= 1) {
     return root;
@@ -5923,7 +6025,9 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
   try {
     while (true) {
       const candidates = [];
-      collectAdaptiveSplitCandidates(root, maxDepth, leafLimit, candidates);
+      collectAdaptiveSplitCandidates(root, maxDepth, leafLimit, candidates, {
+        tileRefinement,
+      });
       if (candidates.length === 0) {
         break;
       }
@@ -5977,6 +6081,7 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
           maxDepth,
           leafLimit,
           splitBasisAxes,
+          { tileRefinement },
         );
         if (!action.kind) {
           stats.node.bounds = tightBounds;
@@ -5985,6 +6090,9 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
           }
           if (action.splitExhausted) {
             stats.node.splitExhausted = true;
+          }
+          if (action.rootTileRefinementExhausted) {
+            markRootTileRefinementExhausted(stats.node);
           }
           continue;
         }
@@ -6029,6 +6137,7 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
           !finalizeKdSplitAction(stats)
         ) {
           stats.node.splitExhausted = true;
+          markRootTileRefinementExhausted(stats.node);
           continue;
         }
         applyAdaptiveSplitActionToNode(stats.node, stats.action);
@@ -6099,25 +6208,25 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
             node.aspectSplitExhausted = true;
           } else {
             node.splitExhausted = true;
+            markRootTileRefinementExhausted(node);
           }
           continue;
         }
 
         node.leaf = false;
-        node.virtual = stats.action.kind === ROUTE_MODE_AXIS_SEGMENTS;
+        node.virtual = splitActionMakesVirtualNode(stats.action);
         node.children = [];
         node.childrenByOct = new Array(8).fill(null);
-        node.childrenBySegment = node.virtual ? new Map() : null;
+        node.childrenBySegment = usesSegmentRouting(node) ? new Map() : null;
         node.occupiedChildCount = occupied.length;
         for (const entry of occupied) {
           const slot = entry.slot;
           const coords = allocateChildCoordinates(node);
           const child = makePartitionTreeNode({
             level: coords.level,
-            depth:
-              stats.action.kind === ROUTE_MODE_AXIS_SEGMENTS
-                ? node.depth
-                : node.depth + 1,
+            depth: splitActionKeepsLogicalDepth(stats.action)
+              ? node.depth
+              : node.depth + 1,
             x: coords.x,
             y: coords.y,
             z: coords.z,
@@ -6126,9 +6235,15 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
             count: entry.count,
             leaf: true,
           });
+          assignRootTileRefinementChildState(
+            node,
+            child,
+            stats.action,
+            tileRefinement,
+          );
           setNodePositionIndexRange(child, entry.start, entry.end);
           node.children.push(child);
-          if (node.virtual) {
+          if (usesSegmentRouting(node)) {
             ensureChildrenBySegment(node).set(slot, child);
           } else {
             node.childrenByOct[slot] = child;
@@ -6166,6 +6281,8 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
 
   const root = makeAdaptiveRootNode(rootBounds, source.vertexCount);
   const splitBasisAxes = options.splitBasisAxes || null;
+  const tileRefinement = normalizedTileRefinement(options.tileRefinement);
+  markRootTileRefinementStart(root, tileRefinement);
 
   if (maxDepth <= 0 || source.vertexCount <= 1) {
     return root;
@@ -6173,7 +6290,9 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
 
   while (true) {
     const candidates = [];
-    collectAdaptiveSplitCandidates(root, maxDepth, leafLimit, candidates);
+    collectAdaptiveSplitCandidates(root, maxDepth, leafLimit, candidates, {
+      tileRefinement,
+    });
     if (candidates.length === 0) {
       break;
     }
@@ -6206,6 +6325,7 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
         maxDepth,
         leafLimit,
         splitBasisAxes,
+        { tileRefinement },
       );
       if (!action.kind) {
         stats.node.bounds = tightBounds;
@@ -6214,6 +6334,9 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
         }
         if (action.splitExhausted) {
           stats.node.splitExhausted = true;
+        }
+        if (action.rootTileRefinementExhausted) {
+          markRootTileRefinementExhausted(stats.node);
         }
         continue;
       }
@@ -6247,6 +6370,7 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
         !finalizeKdSplitAction(stats)
       ) {
         stats.node.splitExhausted = true;
+        markRootTileRefinementExhausted(stats.node);
         continue;
       }
       applyAdaptiveSplitActionToNode(stats.node, stats.action);
@@ -6285,25 +6409,25 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
           node.aspectSplitExhausted = true;
         } else {
           node.splitExhausted = true;
+          markRootTileRefinementExhausted(node);
         }
         continue;
       }
 
       node.leaf = false;
-      node.virtual = stats.action.kind === ROUTE_MODE_AXIS_SEGMENTS;
+      node.virtual = splitActionMakesVirtualNode(stats.action);
       node.children = [];
       node.childrenByOct = new Array(8).fill(null);
-      node.childrenBySegment = node.virtual ? new Map() : null;
+      node.childrenBySegment = usesSegmentRouting(node) ? new Map() : null;
       node.occupiedChildCount = occupied.length;
       for (const entry of occupied) {
         const slot = entry.slot;
         const coords = allocateChildCoordinates(node);
         const child = makePartitionTreeNode({
           level: coords.level,
-          depth:
-            stats.action.kind === ROUTE_MODE_AXIS_SEGMENTS
-              ? node.depth
-              : node.depth + 1,
+          depth: splitActionKeepsLogicalDepth(stats.action)
+            ? node.depth
+            : node.depth + 1,
           x: coords.x,
           y: coords.y,
           z: coords.z,
@@ -6312,8 +6436,14 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
           count: entry.count,
           leaf: true,
         });
+        assignRootTileRefinementChildState(
+          node,
+          child,
+          stats.action,
+          tileRefinement,
+        );
         node.children.push(child);
-        if (node.virtual) {
+        if (usesSegmentRouting(node)) {
           ensureChildrenBySegment(node).set(slot, child);
         } else {
           node.childrenByOct[slot] = child;
@@ -6971,6 +7101,7 @@ function makeBuildSummary(
     checkpoint_reused: !!checkpointInfo.reused,
     checkpoint_reused_stage: checkpointInfo.stage,
     max_depth: args.maxDepth,
+    tile_refinement: args.tileRefinement,
     leaf_limit: args.leafLimit,
     color_space: args.colorSpace,
     memory_budget_gb: args.memoryBudget,
@@ -7229,6 +7360,7 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
             {
               progress: tilingProgress,
               orientedBoundingBoxes: useOrientedBoundingBoxes(args),
+              tileRefinement: args.tileRefinement,
             },
           );
           timingsMs.build_tiling_tree_ms = elapsedMsSince(tilingStartedAt);
@@ -7264,7 +7396,10 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
             rootBounds,
             args.maxDepth,
             args.leafLimit,
-            { orientedBoundingBoxes: useOrientedBoundingBoxes(args) },
+            {
+              orientedBoundingBoxes: useOrientedBoundingBoxes(args),
+              tileRefinement: args.tileRefinement,
+            },
           );
           timingsMs.build_tiling_tree_ms = elapsedMsSince(tilingStartedAt);
         }

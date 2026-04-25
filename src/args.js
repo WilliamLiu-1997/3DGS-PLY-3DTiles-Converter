@@ -14,6 +14,7 @@ function usage() {
     '  --linear-scale-input',
     '  --color-space <lin_rec709_display|srgb_rec709_display>',
     '  --max-depth <int>',
+    '  --tile-refinement <int>',
     '  --leaf-limit <int>',
     '  --min-geometric-error <number>',
     '  --spz-sh1-bits <1..8>',
@@ -40,6 +41,7 @@ const DEFAULT_CONVERSION_ARGS = {
   linearScaleInput: false,
   colorSpace: 'srgb_rec709_display',
   maxDepth: 8,
+  tileRefinement: 1,
   leafLimit: 100,
   minGeometricError: null,
   spzSh1Bits: 8,
@@ -76,6 +78,20 @@ function normalizeToInt(value, name) {
   }
   const parsed = Number.parseInt(String(value), 10);
   if (!Number.isFinite(parsed)) {
+    throw new ConversionError(`Invalid integer for ${name}: ${value}`);
+  }
+  return parsed;
+}
+
+function normalizeToStrictInt(value, name) {
+  if (value === undefined || value === null) {
+    return value;
+  }
+  const parsed =
+    typeof value === 'number' && Number.isFinite(value)
+      ? value
+      : Number(String(value));
+  if (!Number.isInteger(parsed)) {
     throw new ConversionError(`Invalid integer for ${name}: ${value}`);
   }
   return parsed;
@@ -286,6 +302,9 @@ function validateConversionArgs(args, { requireInput = false } = {}) {
   if (args.maxDepth < 0) {
     throw new ConversionError('--max-depth must be >= 0');
   }
+  if (!Number.isInteger(args.tileRefinement) || args.tileRefinement < 1) {
+    throw new ConversionError('--tile-refinement must be an integer >= 1');
+  }
   if (args.leafLimit < 1) {
     throw new ConversionError('--leaf-limit must be >= 1');
   }
@@ -384,6 +403,13 @@ function parseArgs(argv) {
         throw new ConversionError(`Invalid integer for --max-depth: ${raw}`);
       }
       args.maxDepth = value;
+      continue;
+    }
+    if (token === '--tile-refinement') {
+      args.tileRefinement = normalizeToStrictInt(
+        requireValue(token),
+        token,
+      );
       continue;
     }
     if (token === '--leaf-limit') {
@@ -628,6 +654,15 @@ function makeConversionArgs(
       ),
       '--max-depth',
     ),
+    tileRefinement: normalizeToStrictInt(
+      firstDefined(
+        options.tileRefinement,
+        options['tile-refinement'],
+        options.tile_refinement,
+        DEFAULT_CONVERSION_ARGS.tileRefinement,
+      ),
+      '--tile-refinement',
+    ),
     leafLimit: normalizeToInt(
       firstDefined(
         options.leafLimit,
@@ -772,6 +807,7 @@ module.exports = {
   normalizeCoordinate,
   makeCoordinateTransform,
   normalizeToInt,
+  normalizeToStrictInt,
   normalizeToFloat,
   validateConversionArgs,
 };

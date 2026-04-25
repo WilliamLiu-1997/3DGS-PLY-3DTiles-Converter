@@ -6,6 +6,12 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-25
+
+### Added
+
+- Added `tileRefinement` / `--tile-refinement` to perform extra root-child k-d split rounds without increasing logical LOD depth. Higher values produce more, smaller tiles.
+
 ## [0.2.0] - 2026-04-25
 
 ### Added

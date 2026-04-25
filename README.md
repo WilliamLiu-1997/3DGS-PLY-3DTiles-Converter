@@ -79,6 +79,7 @@ const { convert } = require('3dgs-ply-3dtiles-converter');
   const result = await convert('data/scene.ply', './out/tileset', {
     memoryBudget: 4,
     maxDepth: 8,
+    tileRefinement: 1,
     leafLimit: 100,
     openInspector: false,
   });
@@ -101,31 +102,34 @@ The library API accepts the same option names as the CLI, using camelCase fields
 
 ## Options
 
-| Area | CLI | API | Default | Notes |
-| ---- | --- | --- | ------- | ----- |
-| Input convention | `--input-convention <value>` | `inputConvention` | `graphdeco` | Use `graphdeco` or `khr_native`; controls quaternion interpretation and opacity mapping. |
-| Linear scale input | `--linear-scale-input` | `linearScaleInput` | `false` | Converts linear scale values to log scale. |
-| Color space | `--color-space <value>` | `colorSpace` | `srgb_rec709_display` | Use `lin_rec709_display` or `srgb_rec709_display`; written to tileset extension metadata. |
-| Tiling depth | `--max-depth <int>` | `maxDepth` | `8` | Maximum logical k-d tree LOD depth. |
-| Leaf size | `--leaf-limit <int>` | `leafLimit` | `100` | Max splats per leaf before splitting stops. |
-| Geometric error floor | `--min-geometric-error <number>` | `minGeometricError` | `null` | Minimum geometric error for the deepest emitted level. |
-| SPZ quantization | `--spz-sh1-bits <1..8>` and `--spz-sh-rest-bits <1..8>` | `spzSh1Bits`, `spzShRestBits` | `8`, `8` | SH coefficient quantization bits. |
-| SPZ compression | `--spz-compression-level <0..9>` | `spzCompressionLevel` | `8` | gzip compression level for SPZ payloads. |
-| Placement matrix | `--transform <json_matrix4>` | `transform` | `null` | Writes `tileset.root.transform` directly. |
-| Placement coordinate | `--coordinate <json_[lat,long,height]>` | `coordinate` | `null` | Generates an ENU root transform from WGS84 degrees/meters. |
-| LOD sampling | `--sampling-rate-per-level <0..1]` | `samplingRatePerLevel` | `0.5` | Sampling ratio between LOD levels. |
-| Sampling mode | `--sample-mode <value>` | `sampleMode` | `merge` | Use `sample` or `merge`; `sample` keeps representatives and `merge` merges assigned splats. |
-| Memory budget | `--memory-budget <gb>` | `memoryBudget` | `2` | Sizes scan buffers, bucket buffers, simplify scratch space, write concurrency, and workers. |
-| Bounds mode | `--obb` or `--aabb` | `orientedBoundingBoxes` | `true` | Emits root-PCA OBB bounds by default; `--aabb` uses axis-aligned bounds and split planes. |
-| Inspector | `--open-inspector` or `--no-open-inspector` | `openInspector` | `true` | Opens the generated tileset in `3dtiles-inspector` after success. |
-| Self-test count | `--self-test-count <int>` | `selfTestCount` | `1000000` | Number of synthetic splats when using `--self-test`. |
-| Output cleanup | `--clean` or `--continue` | `clean` | `true` | `--continue` preserves the output directory and resumes a failed checkpoint. |
+| Area                  | CLI                                                     | API                           | Default               | Notes                                                                                       |
+| --------------------- | ------------------------------------------------------- | ----------------------------- | --------------------- | ------------------------------------------------------------------------------------------- |
+| Input convention      | `--input-convention <value>`                            | `inputConvention`             | `graphdeco`           | Use `graphdeco` or `khr_native`; controls quaternion interpretation and opacity mapping.    |
+| Linear scale input    | `--linear-scale-input`                                  | `linearScaleInput`            | `false`               | Converts linear scale values to log scale.                                                  |
+| Color space           | `--color-space <value>`                                 | `colorSpace`                  | `srgb_rec709_display` | Use `lin_rec709_display` or `srgb_rec709_display`; written to tileset extension metadata.   |
+| Tiling depth          | `--max-depth <int>`                                     | `maxDepth`                    | `8`                   | Maximum tree LOD depth.                                                                     |
+| Root tile refinement  | `--tile-refinement <int>`                               | `tileRefinement`              | `1`                   | Higher values produce more, smaller tiles.                                                  |
+| Leaf size             | `--leaf-limit <int>`                                    | `leafLimit`                   | `100`                 | Target splat-count limit for leaf tiles.                                                    |
+| Geometric error floor | `--min-geometric-error <number>`                        | `minGeometricError`           | `null`                | Minimum geometric error for the deepest emitted level.                                      |
+| SPZ quantization      | `--spz-sh1-bits <1..8>` and `--spz-sh-rest-bits <1..8>` | `spzSh1Bits`, `spzShRestBits` | `8`, `8`              | SH coefficient quantization bits.                                                           |
+| SPZ compression       | `--spz-compression-level <0..9>`                        | `spzCompressionLevel`         | `8`                   | gzip compression level for SPZ payloads.                                                    |
+| Placement matrix      | `--transform <json_matrix4>`                            | `transform`                   | `null`                | Writes `tileset.root.transform` directly.                                                   |
+| Placement coordinate  | `--coordinate <json_[lat,long,height]>`                 | `coordinate`                  | `null`                | Generates an ENU root transform from WGS84 degrees/meters.                                  |
+| LOD sampling          | `--sampling-rate-per-level <0..1]`                      | `samplingRatePerLevel`        | `0.5`                 | Sampling ratio between LOD levels.                                                          |
+| Sampling mode         | `--sample-mode <value>`                                 | `sampleMode`                  | `merge`               | Use `sample` or `merge`; `sample` keeps representatives and `merge` merges assigned splats. |
+| Memory budget         | `--memory-budget <gb>`                                  | `memoryBudget`                | `2`                   | Sizes scan buffers, bucket buffers, simplify scratch space, write concurrency, and workers. |
+| Bounds mode           | `--obb` or `--aabb`                                     | `orientedBoundingBoxes`       | `true`                | Emits root-PCA OBB bounds by default; `--aabb` uses axis-aligned bounds and split planes.   |
+| Inspector             | `--open-inspector` or `--no-open-inspector`             | `openInspector`               | `true`                | Opens the generated tileset in `3dtiles-inspector` after success.                           |
+| Self-test count       | `--self-test-count <int>`                               | `selfTestCount`               | `1000000`             | Number of synthetic splats when using `--self-test`.                                        |
+| Output cleanup        | `--clean` or `--continue`                               | `clean`                       | `true`                | `--continue` preserves the output directory and resumes a failed checkpoint.                |
 
 Use `--help` to print the CLI usage text.
 
 ## Tiling and Performance
 
 The converter always writes explicit 3D Tiles. It builds a visual-cost-balanced k-d tree, uses root-PCA oriented bounding boxes by default, and falls back to AABB behavior when `--aabb` is set.
+
+Use `--tile-refinement 2` when the first tile level should be finer: the root performs two initial k-d split rounds and emits up to four direct child tiles while keeping those children at logical depth 1. Higher integer values continue the same pattern.
 
 Large PLY files are processed through a temp-file-backed pipeline. The pipeline streams PLY records into leaf and handoff buckets, builds parent LODs bottom-up, and derives internal concurrency from `memoryBudget`. Successful conversions remove the temp workspace. Failed conversions preserve it so a later run with `--continue` can reuse checkpoints.
 
