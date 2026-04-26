@@ -16,6 +16,8 @@ function usage() {
     '  --max-depth <int>',
     '  --tile-refinement <int>',
     '  --leaf-limit <int>',
+    '  --split-midpoint-penalty <number>',
+    '  --split-count-balance-penalty <number>',
     '  --min-geometric-error <number>',
     '  --spz-sh1-bits <1..8>',
     '  --spz-sh-rest-bits <1..8>',
@@ -43,6 +45,8 @@ const DEFAULT_CONVERSION_ARGS = {
   maxDepth: 8,
   tileRefinement: 2,
   leafLimit: 1000,
+  splitMidpointPenalty: 0.5,
+  splitCountBalancePenalty: 0.1,
   minGeometricError: null,
   spzSh1Bits: 8,
   spzShRestBits: 8,
@@ -308,6 +312,18 @@ function validateConversionArgs(args, { requireInput = false } = {}) {
   if (args.leafLimit < 1) {
     throw new ConversionError('--leaf-limit must be >= 1');
   }
+  if (
+    !Number.isFinite(args.splitMidpointPenalty) ||
+    args.splitMidpointPenalty < 0.0
+  ) {
+    throw new ConversionError('--split-midpoint-penalty must be >= 0');
+  }
+  if (
+    !Number.isFinite(args.splitCountBalancePenalty) ||
+    args.splitCountBalancePenalty < 0.0
+  ) {
+    throw new ConversionError('--split-count-balance-penalty must be >= 0');
+  }
   if (args.spzSh1Bits < 1 || args.spzSh1Bits > 8) {
     throw new ConversionError('--spz-sh1-bits must be in [1, 8]');
   }
@@ -419,6 +435,20 @@ function parseArgs(argv) {
         throw new ConversionError(`Invalid integer for --leaf-limit: ${raw}`);
       }
       args.leafLimit = value;
+      continue;
+    }
+    if (token === '--split-midpoint-penalty') {
+      args.splitMidpointPenalty = normalizeToFloat(
+        requireValue(token),
+        token,
+      );
+      continue;
+    }
+    if (token === '--split-count-balance-penalty') {
+      args.splitCountBalancePenalty = normalizeToFloat(
+        requireValue(token),
+        token,
+      );
       continue;
     }
     if (token === '--min-geometric-error') {
@@ -671,6 +701,24 @@ function makeConversionArgs(
         DEFAULT_CONVERSION_ARGS.leafLimit,
       ),
       '--leaf-limit',
+    ),
+    splitMidpointPenalty: normalizeToFloat(
+      firstDefined(
+        options.splitMidpointPenalty,
+        options['split-midpoint-penalty'],
+        options.split_midpoint_penalty,
+        DEFAULT_CONVERSION_ARGS.splitMidpointPenalty,
+      ),
+      '--split-midpoint-penalty',
+    ),
+    splitCountBalancePenalty: normalizeToFloat(
+      firstDefined(
+        options.splitCountBalancePenalty,
+        options['split-count-balance-penalty'],
+        options.split_count_balance_penalty,
+        DEFAULT_CONVERSION_ARGS.splitCountBalancePenalty,
+      ),
+      '--split-count-balance-penalty',
     ),
     minGeometricError: firstDefined(
       options.minGeometricError,

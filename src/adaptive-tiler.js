@@ -7,8 +7,9 @@ const ROUTE_MODE_KD = 'kd';
 const KD_CHILD_SLOT_COUNT = 2;
 const ADAPTIVE_SPLIT_EQUAL_SEGMENTS = 256;
 const ADAPTIVE_SPLIT_VOLUME_SCORE_WEIGHT = 1.0;
-const ADAPTIVE_SPLIT_MIDPOINT_SCORE_WEIGHT = 0.5;
-const KD_TREE_AXIS_COMPETITION_ASPECT_RATIO = 1.5;
+const DEFAULT_ADAPTIVE_SPLIT_MIDPOINT_PENALTY_WEIGHT = 0.5;
+const DEFAULT_ADAPTIVE_SPLIT_COUNT_BALANCE_PENALTY_WEIGHT = 0.0;
+const KD_TREE_AXIS_COMPETITION_ASPECT_RATIO = 2.0;
 const LONG_TILE_VIRTUAL_KD_SEGMENT_COUNT = 2;
 const ADAPTIVE_MAX_LONG_WIDTH_RATIO = 4.0;
 const ADAPTIVE_MAX_CHILD_VOLUME_RATIO = 3.0;
@@ -497,6 +498,24 @@ function makeAdaptiveSplitCandidateOptions(options = {}) {
   };
 }
 
+function normalizeSplitPenaltyWeight(value, fallback) {
+  return Number.isFinite(value) && value >= 0.0 ? value : fallback;
+}
+
+function makeAdaptiveSplitPenaltyOptions(options = {}) {
+  return {
+    splitMidpointPenaltyWeight: normalizeSplitPenaltyWeight(
+      options.splitMidpointPenalty ?? options.splitMidpointPenaltyWeight,
+      DEFAULT_ADAPTIVE_SPLIT_MIDPOINT_PENALTY_WEIGHT,
+    ),
+    splitCountBalancePenaltyWeight: normalizeSplitPenaltyWeight(
+      options.splitCountBalancePenalty ??
+        options.splitCountBalancePenaltyWeight,
+      DEFAULT_ADAPTIVE_SPLIT_COUNT_BALANCE_PENALTY_WEIGHT,
+    ),
+  };
+}
+
 function collectAdaptiveSplitCandidates(
   node,
   maxDepth,
@@ -543,8 +562,9 @@ function collectAdaptiveSplitCandidates(
   }
 }
 
-function makeAdaptiveSplitStats(node, basisAxes = null) {
+function makeAdaptiveSplitStats(node, basisAxes = null, options = {}) {
   const normalizedBasisAxes = basisAxes ? normalizeBasisAxes(basisAxes) : null;
+  const penaltyOptions = makeAdaptiveSplitPenaltyOptions(options);
   return {
     node,
     count: 0,
@@ -564,6 +584,9 @@ function makeAdaptiveSplitStats(node, basisAxes = null) {
     childStats: null,
     positionIndexStart: null,
     positionIndexEnd: null,
+    splitMidpointPenaltyWeight: penaltyOptions.splitMidpointPenaltyWeight,
+    splitCountBalancePenaltyWeight:
+      penaltyOptions.splitCountBalancePenaltyWeight,
   };
 }
 
@@ -1298,6 +1321,7 @@ function kdProjectionCandidateFromAxisInfo(axisInfo) {
     projectionMin,
     projectionMax,
     projectionExtent,
+    axisScoreMultiplier: 1.0,
   };
 }
 
@@ -1319,6 +1343,8 @@ function kdProjectionCandidatesFromAxisInfos(axisInfos) {
       Number.isFinite(ratio) &&
       ratio < KD_TREE_AXIS_COMPETITION_ASPECT_RATIO
     ) {
+      primary.axisScoreMultiplier = 1.0;
+      secondary.axisScoreMultiplier = Math.max(1.0, Math.sqrt(ratio));
       candidates.push(secondary);
     }
   }
@@ -1366,6 +1392,7 @@ function resetAdaptiveProjectionStats(stats) {
             coordinateAxis: action.coordinateAxis,
             projectionMin: action.projectionMin,
             projectionMax: action.projectionMax,
+            axisScoreMultiplier: 1.0,
           },
         ];
   stats.projectionCandidateStats = candidates.map((candidate) => ({
@@ -1376,7 +1403,14 @@ function resetAdaptiveProjectionStats(stats) {
       : null,
     projectionMin: candidate.projectionMin,
     projectionMax: candidate.projectionMax,
+    axisScoreMultiplier:
+      Number.isFinite(candidate.axisScoreMultiplier) &&
+      candidate.axisScoreMultiplier > 0.0
+        ? candidate.axisScoreMultiplier
+        : 1.0,
     parentVolume,
+    splitMidpointPenaltyWeight: stats.splitMidpointPenaltyWeight,
+    splitCountBalancePenaltyWeight: stats.splitCountBalancePenaltyWeight,
     projectionBins: makeProjectionVolumeBins(segmentCount),
     projectionTotalCount: 0,
   }));
@@ -1588,13 +1622,32 @@ function normalizedProjectionVolumeScore(volumeSum, parentVolume) {
   return Math.max(0.0, volumeSum / parentVolume);
 }
 
-function projectionSplitObjectiveScore(volumeScore, midpointPenalty) {
-  if (!Number.isFinite(volumeScore) || !Number.isFinite(midpointPenalty)) {
+function projectionSplitObjectiveScore(
+  volumeScore,
+  midpointPenalty,
+  countBalance,
+  midpointPenaltyWeight,
+  countBalancePenaltyWeight,
+) {
+  if (
+    !Number.isFinite(volumeScore) ||
+    !Number.isFinite(midpointPenalty) ||
+    !Number.isFinite(countBalance)
+  ) {
     return Infinity;
   }
+  const midpointWeight = normalizeSplitPenaltyWeight(
+    midpointPenaltyWeight,
+    DEFAULT_ADAPTIVE_SPLIT_MIDPOINT_PENALTY_WEIGHT,
+  );
+  const countWeight = normalizeSplitPenaltyWeight(
+    countBalancePenaltyWeight,
+    DEFAULT_ADAPTIVE_SPLIT_COUNT_BALANCE_PENALTY_WEIGHT,
+  );
   return (
     volumeScore * ADAPTIVE_SPLIT_VOLUME_SCORE_WEIGHT +
-    midpointPenalty * ADAPTIVE_SPLIT_MIDPOINT_SCORE_WEIGHT
+    midpointPenalty * midpointWeight +
+    countBalance * countWeight
   );
 }
 
@@ -1661,13 +1714,19 @@ function chooseProjectionSplitForCandidate(candidate) {
       volumeSum,
       candidate.parentVolume,
     );
-    const score = projectionSplitObjectiveScore(volumeScore, midpointPenalty);
-    if (!Number.isFinite(score)) {
-      continue;
-    }
     const maxChildVolume = Math.max(lowerVolume, upperVolume);
     const countBalance =
       Math.abs(lower.count - upperCount) / candidate.projectionTotalCount;
+    const score = projectionSplitObjectiveScore(
+      volumeScore,
+      midpointPenalty,
+      countBalance,
+      candidate.splitMidpointPenaltyWeight,
+      candidate.splitCountBalancePenaltyWeight,
+    );
+    if (!Number.isFinite(score)) {
+      continue;
+    }
     if (
       projectionSplitMetricsAreBetter(
         score,
@@ -1714,6 +1773,12 @@ function chooseProjectionSplitForCandidate(candidate) {
     splitOffset: bestSplitOffset,
     boundary: bestBoundary,
     score: bestScore,
+    adjustedScore:
+      bestScore *
+      (Number.isFinite(candidate.axisScoreMultiplier) &&
+      candidate.axisScoreMultiplier > 0.0
+        ? candidate.axisScoreMultiplier
+        : 1.0),
     volumeSum: bestVolumeSum,
     maxChildVolume: bestMaxChildVolume,
     countBalance: bestCountBalance,
@@ -1803,12 +1868,14 @@ function projectionSplitChoiceIsBetter(choice, bestChoice) {
     return true;
   }
   const metricComparison = compareProjectionSplitMetricValues(
-    choice.score,
+    Number.isFinite(choice.adjustedScore) ? choice.adjustedScore : choice.score,
     choice.volumeSum,
     choice.maxChildVolume,
     choice.countBalance,
     choice.midpointPenalty,
-    bestChoice.score,
+    Number.isFinite(bestChoice.adjustedScore)
+      ? bestChoice.adjustedScore
+      : bestChoice.score,
     bestChoice.volumeSum,
     bestChoice.maxChildVolume,
     bestChoice.countBalance,
@@ -2675,6 +2742,7 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
     maxDepth,
   );
   const splitBasisAxes = options.splitBasisAxes || null;
+  const splitPenaltyOptions = makeAdaptiveSplitPenaltyOptions(options);
   setNodePositionIndexRange(root, 0, source.vertexCount);
 
   try {
@@ -2708,7 +2776,11 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
       const statsList = [];
       for (const range of candidateRanges) {
         const node = range.node;
-        const stats = makeAdaptiveSplitStats(node, splitBasisAxes);
+        const stats = makeAdaptiveSplitStats(
+          node,
+          splitBasisAxes,
+          splitPenaltyOptions,
+        );
         stats.positionIndexStart = range.start;
         stats.positionIndexEnd = range.end;
         updateAdaptiveSplitStatsForPositionIndexRange(
@@ -2919,6 +2991,7 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
 
   const root = makeAdaptiveRootNode(rootBounds, source.vertexCount);
   const splitBasisAxes = options.splitBasisAxes || null;
+  const splitPenaltyOptions = makeAdaptiveSplitPenaltyOptions(options);
   const tileRefinement = normalizedTileRefinement(options.tileRefinement);
   markRootTileRefinementStart(root, tileRefinement);
 
@@ -2937,7 +3010,11 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
 
     const statsList = [];
     for (const node of candidates) {
-      const stats = makeAdaptiveSplitStats(node, splitBasisAxes);
+      const stats = makeAdaptiveSplitStats(
+        node,
+        splitBasisAxes,
+        splitPenaltyOptions,
+      );
       statsList.push(stats);
       nodeBuildState(node).activeSplitStats = stats;
     }

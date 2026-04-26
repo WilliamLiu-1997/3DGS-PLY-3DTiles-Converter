@@ -282,6 +282,8 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
               orientedBoundingBoxes: useOrientedBoundingBoxes(args),
               rootBasisAxes: staged.rootBasisAxes,
               tileRefinement: args.tileRefinement,
+              splitMidpointPenalty: args.splitMidpointPenalty,
+              splitCountBalancePenalty: args.splitCountBalancePenalty,
             },
           );
           timingsMs.build_tiling_tree_ms = elapsedMsSince(tilingStartedAt);
@@ -323,6 +325,8 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
               orientedBoundingBoxes: useOrientedBoundingBoxes(args),
               rootBasisAxes: staged.rootBasisAxes,
               tileRefinement: args.tileRefinement,
+              splitMidpointPenalty: args.splitMidpointPenalty,
+              splitCountBalancePenalty: args.splitCountBalancePenalty,
             },
           );
           timingsMs.build_tiling_tree_ms = elapsedMsSince(tilingStartedAt);

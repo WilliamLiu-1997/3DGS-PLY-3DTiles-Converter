@@ -263,6 +263,8 @@ function makeBuildSummary(
     max_depth: args.maxDepth,
     tile_refinement: args.tileRefinement,
     leaf_limit: args.leafLimit,
+    split_midpoint_penalty: args.splitMidpointPenalty,
+    split_count_balance_penalty: args.splitCountBalancePenalty,
     color_space: args.colorSpace,
     memory_budget_gb: args.memoryBudget,
     sampling_rate_per_level: args.samplingRatePerLevel,

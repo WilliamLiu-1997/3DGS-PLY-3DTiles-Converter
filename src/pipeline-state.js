@@ -46,6 +46,8 @@ function makePipelineFingerprint(
     maxDepth: args.maxDepth,
     tileRefinement: args.tileRefinement,
     leafLimit: args.leafLimit,
+    splitMidpointPenalty: args.splitMidpointPenalty,
+    splitCountBalancePenalty: args.splitCountBalancePenalty,
     orientedBoundingBoxes: args.orientedBoundingBoxes === true,
     samplingRatePerLevel: args.samplingRatePerLevel,
     sampleMode: args.sampleMode,
