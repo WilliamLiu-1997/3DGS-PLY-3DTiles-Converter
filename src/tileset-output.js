@@ -6,6 +6,7 @@ const { makeMemoryBudgetPlan, serializeMemoryBudgetPlan } = require('./memory-pl
 const { HANDOFF_BUCKET_ENCODING } = require('./bucket-io');
 
 const TILING_STRATEGY_KD_TREE = 'kd_tree';
+const ESTIMATED_GEOMETRIC_ERROR_MULTIPLIER = 2.5;
 const GLTF_TILESET_CONTENT_EXTENSION = '3DTILES_content_gltf';
 const GAUSSIAN_SPLATTING_GLTF_EXTENSIONS = [
   'KHR_gaussian_splatting',
@@ -103,14 +104,18 @@ function resolveRootGeometricError(rootNode, rootBounds, params, lodMaxDepth) {
     const ex = rootBounds.extents();
     const diag = Math.sqrt(ex[0] * ex[0] + ex[1] * ex[1] + ex[2] * ex[2]);
     return {
-      value: Math.max(rootNode.ownError, diag * 1e-6, 1e-6),
-      source: 'estimated_root_simplify',
+      value:
+        Math.max(rootNode.ownError, diag * 1e-6, 1e-6) *
+        ESTIMATED_GEOMETRIC_ERROR_MULTIPLIER,
+      source: 'estimated_root_simplify_scaled',
     };
   }
 
   return {
-    value: fallbackRootGeometricError(rootBounds, rootNode.count),
-    source: 'estimated_root_fallback',
+    value:
+      fallbackRootGeometricError(rootBounds, rootNode.count) *
+      ESTIMATED_GEOMETRIC_ERROR_MULTIPLIER,
+    source: 'estimated_root_fallback_scaled',
   };
 }
 
