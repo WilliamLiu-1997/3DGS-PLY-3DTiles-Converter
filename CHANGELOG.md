@@ -6,6 +6,12 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+### Changed
+
+- Changed k-d split-plane selection to score both weak projected visual connectivity and longest-axis range-midpoint proximity, normalizing connection strength within each projection histogram so the weakest candidate is `0` and the strongest is `1`.
+- Changed long-tile virtual splitting to use the same weak-connection/range-midpoint projection score, with a single virtual split per long-tile branch instead of equal-length segment buckets.
+- Added a virtual volume-rebalance split after k-d splits for current-LOD leaf tiles whose volume is more than 3x the median volume at the same logical depth.
+
 ## [0.3.3] - 2026-04-25
 
 ### Changed
