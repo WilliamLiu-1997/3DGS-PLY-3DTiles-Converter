@@ -61,7 +61,7 @@ const {
 const DEFAULT_WORKER_SCRIPT = path.join(__dirname, 'convert-core.js');
 const TEMP_WORKSPACE_NAME = '.tmp-ply-partitions';
 const PIPELINE_STATE_FILE = 'pipeline-state.json';
-const PIPELINE_STATE_VERSION = 18;
+const PIPELINE_STATE_VERSION = 21;
 const PIPELINE_STAGE_BUCKETED = 'bucketed';
 const LEAF_BUCKET_DIR = 'leaf';
 const HANDOFF_BUCKET_DIR = 'handoff';
@@ -87,31 +87,14 @@ const PIPELINE_STATE_SAVE_INTERVAL_MS = 5000;
 const PIPELINE_STATE_SAVE_NODE_INTERVAL = 512;
 const TILING_STRATEGY_KD_TREE = 'kd_tree';
 const ROUTE_MODE_KD = 'kd';
-const LONG_TILE_SPLIT_MODE =
-  'virtual_single_weak_connection_range_midpoint_projection_split';
-const KD_TREE_SPLIT_DIRECTION = 'root_pca_basis_axis';
-const KD_TREE_SPLIT_DIRECTION_AABB = 'aabb_axis';
-const KD_TREE_COVARIANCE_WEIGHTING = 'split_visual_weighted_splat_centers';
-const KD_TREE_SPLIT_PLANE =
-  'weak_connection_range_midpoint_projection_histogram';
-const KD_TREE_SPLIT_BALANCE = 'root_pca_axis_weak_connection_range_midpoint';
-const KD_TREE_SPLIT_BALANCE_AABB = 'aabb_axis_weak_connection_range_midpoint';
-const TILE_BOUNDING_VOLUME_MODE_ROOT_PCA_OBB = 'root_pca_obb';
-const TILE_BOUNDING_VOLUME_MODE_AABB = 'aabb';
-const SPLIT_WEIGHT_FORMULA = 'max(opacity,1e-4)*radius3sigma^2';
-const ADAPTIVE_SPLIT_HISTOGRAM_BINS = 64;
-const ADAPTIVE_SPLIT_RANGE_MIDPOINT_SCORE_WEIGHT = 2;
-const ADAPTIVE_SPLIT_CONNECTION_SCORE_WEIGHT = 1;
+const KD_CHILD_SLOT_COUNT = 2;
+const ADAPTIVE_SPLIT_EQUAL_SEGMENTS = 256;
+const ADAPTIVE_SPLIT_VOLUME_SCORE_WEIGHT = 1.0;
+const ADAPTIVE_SPLIT_MIDPOINT_SCORE_WEIGHT = 0.5;
 const KD_TREE_AXIS_COMPETITION_ASPECT_RATIO = 1.5;
-const KD_TREE_AXIS_COMPETITION_SCORE_BIAS =
-  'score*longest_projection_extent/candidate_projection_extent';
-const KD_TREE_SPLIT_OBJECTIVE =
-  `${ADAPTIVE_SPLIT_RANGE_MIDPOINT_SCORE_WEIGHT}*range_midpoint_penalty` +
-  `+${ADAPTIVE_SPLIT_CONNECTION_SCORE_WEIGHT}*histogram_minmax_connection_strength_penalty`;
 const LONG_TILE_VIRTUAL_KD_SEGMENT_COUNT = 2;
 const ADAPTIVE_MAX_LONG_WIDTH_RATIO = 4.0;
 const ADAPTIVE_MAX_CHILD_VOLUME_RATIO = 3.0;
-const ADAPTIVE_VOLUME_REBALANCE_RULE = 'current_lod_median_volume';
 const ADAPTIVE_SPLIT_EPSILON = 1e-9;
 const IS_LITTLE_ENDIAN = (() => {
   const probe = new Uint8Array(new Uint16Array([0x0102]).buffer);
@@ -214,6 +197,9 @@ function derivePartitionWriteConcurrency(memoryBudgetBytes) {
 
 function makeMemoryBudgetPlan(args, { header = null, layout = null } = {}) {
   const budgetBytes = memoryBudgetBytesFromArgs(args);
+  const includePositionWeights = !!(
+    args && args.orientedBoundingBoxes === true
+  );
   const runtimeReserveBytes = Math.min(
     Math.floor(budgetBytes * RUNTIME_RESERVE_FRACTION),
     RUNTIME_RESERVE_MAX_BYTES,
@@ -246,9 +232,13 @@ function makeMemoryBudgetPlan(args, { header = null, layout = null } = {}) {
             Math.floor(usableBudgetBytes / (PARTITION_ARENA_COUNT * 2)),
           ),
         );
-  const positionBytes = header
-    ? header.vertexCount * POSITION_ROW_BYTE_SIZE
+  const positionFloatCount = header
+    ? header.vertexCount * (includePositionWeights ? 4 : 3)
     : null;
+  const positionBytes =
+    positionFloatCount == null
+      ? null
+      : positionFloatCount * Float32Array.BYTES_PER_ELEMENT;
   const positionIndexBytes = header
     ? header.vertexCount * POSITION_INDEX_ROW_BYTE_SIZE
     : null;
@@ -262,9 +252,6 @@ function makeMemoryBudgetPlan(args, { header = null, layout = null } = {}) {
     positionTilingBytes == null || positionScanBytes == null
       ? null
       : Math.max(positionTilingBytes, positionScanBytes);
-  const positionFloatCount = header
-    ? header.vertexCount * POSITION_ROW_FLOAT_COUNT
-    : null;
   const positionTmpBufferMax = Math.max(
     POSITION_ROW_BYTE_SIZE,
     Math.min(8 * BYTES_PER_MB, Math.floor(usableBudgetBytes / 16)),
@@ -371,24 +358,6 @@ function useOrientedBoundingBoxes(args) {
   return !!(args && args.orientedBoundingBoxes === true);
 }
 
-function tileBoundingVolumeModeForArgs(args) {
-  return useOrientedBoundingBoxes(args)
-    ? TILE_BOUNDING_VOLUME_MODE_ROOT_PCA_OBB
-    : TILE_BOUNDING_VOLUME_MODE_AABB;
-}
-
-function kdTreeSplitDirectionForArgs(args) {
-  return useOrientedBoundingBoxes(args)
-    ? KD_TREE_SPLIT_DIRECTION
-    : KD_TREE_SPLIT_DIRECTION_AABB;
-}
-
-function kdTreeSplitBalanceForArgs(args) {
-  return useOrientedBoundingBoxes(args)
-    ? KD_TREE_SPLIT_BALANCE
-    : KD_TREE_SPLIT_BALANCE_AABB;
-}
-
 function splitBasisLabelForArgs(args) {
   return useOrientedBoundingBoxes(args) ? 'root-basis' : 'AABB-axis';
 }
@@ -434,30 +403,6 @@ function makeNodeKey(level, x, y, z) {
   return `${level}/${x}/${y}/${z}`;
 }
 
-function defaultSplitPointForBounds(bounds) {
-  const min = bounds.minimum;
-  const max = bounds.maximum;
-  return [
-    (min[0] + max[0]) * 0.5,
-    (min[1] + max[1]) * 0.5,
-    (min[2] + max[2]) * 0.5,
-  ];
-}
-
-function pointOctant(bounds, x, y, z, splitPoint = null, splitAxes = null) {
-  const split = splitPoint || defaultSplitPointForBounds(bounds);
-  const axes = splitAxes || [true, true, true];
-  return (
-    (axes[0] && x >= split[0] ? 1 : 0) |
-    (axes[1] && y >= split[1] ? 2 : 0) |
-    (axes[2] && z >= split[2] ? 4 : 0)
-  );
-}
-
-function pointOctantForNode(node, x, y, z) {
-  return pointOctant(node.bounds, x, y, z, node.splitPoint, node.splitAxes);
-}
-
 function dotDirection(direction, x, y, z) {
   return direction[0] * x + direction[1] * y + direction[2] * z;
 }
@@ -467,10 +412,11 @@ function pointPlaneSlot(splitDirection, splitOffset, x, y, z) {
 }
 
 function pointKdSlotForNode(node, x, y, z) {
-  if (node.splitDirection && Number.isFinite(node.splitOffset)) {
-    return pointPlaneSlot(node.splitDirection, node.splitOffset, x, y, z);
-  }
-  return pointOctantForNode(node, x, y, z);
+  ensure(
+    node.splitDirection && Number.isFinite(node.splitOffset),
+    `Missing k-d split plane for node ${node.key}.`,
+  );
+  return pointPlaneSlot(node.splitDirection, node.splitOffset, x, y, z);
 }
 
 function coordinateForAxis(axis, x, y, z) {
@@ -564,18 +510,6 @@ function normalizeOrientedBox(box) {
   return normalized && normalized.length === 12 ? normalized : null;
 }
 
-function normalizeSplitPoint(splitPoint) {
-  return Array.isArray(splitPoint) && splitPoint.length === 3
-    ? splitPoint.map((value) => Number(value))
-    : null;
-}
-
-function normalizeSplitAxes(splitAxes) {
-  return Array.isArray(splitAxes) && splitAxes.length === 3
-    ? splitAxes.map((value) => !!value)
-    : null;
-}
-
 function normalizeVector3(values) {
   if (!Array.isArray(values) && !ArrayBuffer.isView(values)) {
     return null;
@@ -602,6 +536,28 @@ function normalizeSplitOffset(splitOffset) {
   return Number.isFinite(splitOffset) ? Number(splitOffset) : null;
 }
 
+function makeChildSlotArray() {
+  return new Array(KD_CHILD_SLOT_COUNT).fill(null);
+}
+
+function nodeBuildState(node) {
+  if (!node._build) {
+    node._build = {};
+  }
+  return node._build;
+}
+
+function existingNodeBuildState(node) {
+  return node ? node._build || null : null;
+}
+
+function pruneNodeBuildState(node) {
+  const build = existingNodeBuildState(node);
+  if (build && Object.keys(build).length === 0) {
+    delete node._build;
+  }
+}
+
 function makePartitionTreeNode({
   level,
   depth = level,
@@ -612,8 +568,6 @@ function makePartitionTreeNode({
   orientedBox = null,
   count,
   leaf = true,
-  splitPoint = null,
-  splitAxes = null,
   splitDirection = null,
   splitOffset = null,
   childSlot = null,
@@ -633,14 +587,11 @@ function makePartitionTreeNode({
     orientedBox: normalizeOrientedBox(orientedBox),
     leaf,
     virtual: !!virtual,
-    splitPoint: normalizeSplitPoint(splitPoint),
-    splitAxes: normalizeSplitAxes(splitAxes),
     splitDirection: normalizeSplitDirection(splitDirection),
     splitOffset: normalizeSplitOffset(splitOffset),
     contentTargetOverride,
-    tilingStrategy: TILING_STRATEGY_KD_TREE,
     children: [],
-    childrenByOct: new Array(8).fill(null),
+    childrenBySlot: makeChildSlotArray(),
     occupiedChildCount: 0,
     bucketPath: null,
     contentUri: null,
@@ -678,12 +629,6 @@ function serializeNodeMeta(node) {
   if (node.virtual) {
     meta.virtual = true;
   }
-  if (node.splitPoint) {
-    meta.splitPoint = node.splitPoint.slice();
-  }
-  if (node.splitAxes) {
-    meta.splitAxes = node.splitAxes.slice();
-  }
   if (node.splitDirection) {
     meta.splitDirection = node.splitDirection.slice();
   }
@@ -695,10 +640,6 @@ function serializeNodeMeta(node) {
     node.contentTargetOverride > 0
   ) {
     meta.contentTargetOverride = node.contentTargetOverride;
-  }
-  const tilingStrategy = node.tilingStrategy || TILING_STRATEGY_KD_TREE;
-  if (tilingStrategy !== TILING_STRATEGY_KD_TREE) {
-    meta.tilingStrategy = tilingStrategy;
   }
   if (
     Number.isInteger(node.occupiedChildCount) &&
@@ -750,8 +691,6 @@ function deserializeNodeMeta(data) {
     orientedBox: normalizeOrientedBox(data.orientedBox),
     leaf: data.leaf !== false,
     virtual: !!data.virtual,
-    splitPoint: normalizeSplitPoint(data.splitPoint),
-    splitAxes: normalizeSplitAxes(data.splitAxes),
     splitDirection: normalizeSplitDirection(data.splitDirection),
     splitOffset: normalizeSplitOffset(data.splitOffset),
     contentTargetOverride:
@@ -759,9 +698,8 @@ function deserializeNodeMeta(data) {
       data.contentTargetOverride > 0
         ? data.contentTargetOverride
         : null,
-    tilingStrategy: data.tilingStrategy ?? TILING_STRATEGY_KD_TREE,
     children: [],
-    childrenByOct: new Array(8).fill(null),
+    childrenBySlot: makeChildSlotArray(),
     occupiedChildCount: Number.isInteger(data.occupiedChildCount)
       ? data.occupiedChildCount
       : 0,
@@ -790,8 +728,8 @@ function deserializeNodeMeta(data) {
       const slot =
         Number.isInteger(child.childSlot) && child.childSlot >= 0
           ? child.childSlot
-          : ((child.x & 1) << 0) | ((child.y & 1) << 1) | ((child.z & 1) << 2);
-      node.childrenByOct[slot] = child;
+          : node.children.length - 1;
+      node.childrenBySlot[slot] = child;
     }
   }
   if (!Number.isInteger(data.occupiedChildCount) && node.children.length > 0) {
@@ -837,7 +775,7 @@ function resolveLeafNodeForPoint(root, x, y, z) {
   let node = root;
   while (!node.leaf) {
     const slot = pointKdSlotForNode(node, x, y, z);
-    const child = node.childrenByOct[slot];
+    const child = node.childrenBySlot[slot];
     ensure(
       !!child,
       `Failed to resolve leaf bucket for point at node ${node.key} slot=${slot}.`,
@@ -880,27 +818,7 @@ function makePipelineFingerprint(
     maxDepth: args.maxDepth,
     tileRefinement: args.tileRefinement,
     leafLimit: args.leafLimit,
-    tilingStrategy: TILING_STRATEGY_KD_TREE,
-    kdTreeSplitDirection: kdTreeSplitDirectionForArgs(args),
-    kdTreeCovarianceWeighting: KD_TREE_COVARIANCE_WEIGHTING,
-    kdTreeSplitPlane: KD_TREE_SPLIT_PLANE,
-    kdTreeSplitBalance: kdTreeSplitBalanceForArgs(args),
-    kdTreeSplitObjective: KD_TREE_SPLIT_OBJECTIVE,
-    kdTreeSplitRangeMidpointWeight: ADAPTIVE_SPLIT_RANGE_MIDPOINT_SCORE_WEIGHT,
-    kdTreeSplitConnectionStrengthWeight: ADAPTIVE_SPLIT_CONNECTION_SCORE_WEIGHT,
     orientedBoundingBoxes: useOrientedBoundingBoxes(args),
-    tileBoundingVolumeMode: tileBoundingVolumeModeForArgs(args),
-    splitWeightFormula: SPLIT_WEIGHT_FORMULA,
-    kdTreeSplitHistogramBins: ADAPTIVE_SPLIT_HISTOGRAM_BINS,
-    kdTreeSplitAxisCompetitionAspectRatio:
-      KD_TREE_AXIS_COMPETITION_ASPECT_RATIO,
-    kdTreeSplitAxisCompetitionScoreBias:
-      KD_TREE_AXIS_COMPETITION_SCORE_BIAS,
-    kdTreeMaxLongWidthRatio: ADAPTIVE_MAX_LONG_WIDTH_RATIO,
-    kdTreeLongTileSplitMode: LONG_TILE_SPLIT_MODE,
-    kdTreeVolumeRebalanceRule: ADAPTIVE_VOLUME_REBALANCE_RULE,
-    kdTreeLodMedianVolumeRatio: ADAPTIVE_MAX_CHILD_VOLUME_RATIO,
-    kdTreeChildVolumeRebalanceVirtual: true,
     samplingRatePerLevel: args.samplingRatePerLevel,
     sampleMode: args.sampleMode,
     minGeometricError: args.minGeometricError,
@@ -1470,11 +1388,12 @@ async function partitionLeafBuckets(
   };
 
   const touchLeaf = (leaf) => {
-    if (leaf._partitionTouched) {
+    const build = nodeBuildState(leaf);
+    if (build.partitionTouched) {
       return;
     }
-    leaf._partitionTouched = true;
-    leaf._partitionWriteChain = Promise.resolve();
+    build.partitionTouched = true;
+    build.partitionWriteChain = Promise.resolve();
     touchedLeaves.push(leaf);
   };
 
@@ -1509,7 +1428,8 @@ async function partitionLeafBuckets(
       const startPromise = new Promise((resolve) => {
         startWrite = resolve;
       });
-      const writePromise = leaf._partitionWriteChain
+      const build = nodeBuildState(leaf);
+      const writePromise = build.partitionWriteChain
         .then(() => startPromise)
         .then(async () => {
           const entry = await acquireLeafHandle(leaf);
@@ -1524,7 +1444,7 @@ async function partitionLeafBuckets(
             releaseLeafHandle(entry);
           }
         });
-      leaf._partitionWriteChain = writePromise;
+      build.partitionWriteChain = writePromise;
       writePromise.catch(() => {});
       writeTasks.push({ startWrite, writePromise });
     }
@@ -1630,7 +1550,7 @@ async function partitionLeafBuckets(
     await Promise.all(arenas.map((arena) => scheduleArenaFlush(arena)));
     await Promise.all(
       touchedLeaves.map((leaf) =>
-        leaf._partitionWriteChain.catch((err) => {
+        nodeBuildState(leaf).partitionWriteChain.catch((err) => {
           if (!flushError) {
             flushError = err;
           }
@@ -1649,8 +1569,12 @@ async function partitionLeafBuckets(
     leafHandles.clear();
 
     for (const leaf of touchedLeaves) {
-      delete leaf._partitionTouched;
-      delete leaf._partitionWriteChain;
+      const build = existingNodeBuildState(leaf);
+      if (build) {
+        delete build.partitionTouched;
+        delete build.partitionWriteChain;
+        pruneNodeBuildState(leaf);
+      }
     }
   }
   arenas.length = 0;
@@ -3470,11 +3394,13 @@ function resolveVirtualNodeContentTarget(
 }
 
 function minimumContentTargetForVirtualBudget(node) {
+  const build = existingNodeBuildState(node);
   if (
-    Number.isInteger(node._virtualBudgetMinimum) &&
-    node._virtualBudgetMinimum >= 0
+    build &&
+    Number.isInteger(build.virtualBudgetMinimum) &&
+    build.virtualBudgetMinimum >= 0
   ) {
-    return node._virtualBudgetMinimum;
+    return build.virtualBudgetMinimum;
   }
   return computeVirtualBudgetMinimums(node);
 }
@@ -3489,7 +3415,7 @@ function computeVirtualBudgetMinimums(node) {
       0,
     );
   }
-  node._virtualBudgetMinimum = minimum;
+  nodeBuildState(node).virtualBudgetMinimum = minimum;
   return minimum;
 }
 
@@ -3951,6 +3877,7 @@ async function scanGlobalBoundsAndWritePositions(
 ) {
   const minimum = [Infinity, Infinity, Infinity];
   const maximum = [-Infinity, -Infinity, -Infinity];
+  const includeWeights = options.includeWeights === true;
   const bufferBytes =
     Number.isFinite(options.positionTmpBufferBytes) &&
     options.positionTmpBufferBytes > 0
@@ -3972,7 +3899,7 @@ async function scanGlobalBoundsAndWritePositions(
   let bufferedRows = 0;
   let count = 0;
   const scratch = makeRowScratch(0);
-  const extentScratch = new Float32Array(3);
+  const extentScratch = includeWeights ? new Float32Array(3) : null;
   const progress = options.progress || null;
   const updateProgress = (force = false) => {
     if (!progress) {
@@ -4027,11 +3954,12 @@ async function scanGlobalBoundsAndWritePositions(
         const x = scratch.position[0];
         const y = scratch.position[1];
         const z = scratch.position[2];
-        const weight = splitWeightFromScratch(scratch, extentScratch);
         const fx = Math.fround(x);
         const fy = Math.fround(y);
         const fz = Math.fround(z);
-        const fw = Math.fround(weight);
+        const fw = includeWeights
+          ? Math.fround(splitWeightFromScratch(scratch, extentScratch))
+          : 1.0;
         updatePositionBounds(minimum, maximum, fx, fy, fz);
 
         if (floatView) {
@@ -4081,10 +4009,11 @@ async function scanGlobalBoundsAndStagePositionsInMemory(
   const minimum = [Infinity, Infinity, Infinity];
   const maximum = [-Infinity, -Infinity, -Infinity];
   const positions = new Float32Array(header.vertexCount * 3);
-  const weights = new Float32Array(header.vertexCount);
+  const includeWeights = options.includeWeights === true;
+  const weights = includeWeights ? new Float32Array(header.vertexCount) : null;
   let count = 0;
   const scratch = makeRowScratch(0);
-  const extentScratch = new Float32Array(3);
+  const extentScratch = includeWeights ? new Float32Array(3) : null;
   const progress = options.progress || null;
   const updateProgress = (force = false) => {
     if (!progress) {
@@ -4113,7 +4042,6 @@ async function scanGlobalBoundsAndStagePositionsInMemory(
       const x = scratch.position[0];
       const y = scratch.position[1];
       const z = scratch.position[2];
-      const weight = splitWeightFromScratch(scratch, extentScratch);
       const fx = Math.fround(x);
       const fy = Math.fround(y);
       const fz = Math.fround(z);
@@ -4123,7 +4051,11 @@ async function scanGlobalBoundsAndStagePositionsInMemory(
       positions[base + 0] = fx;
       positions[base + 1] = fy;
       positions[base + 2] = fz;
-      weights[rowIndex] = Math.fround(weight);
+      if (weights) {
+        weights[rowIndex] = Math.fround(
+          splitWeightFromScratch(scratch, extentScratch),
+        );
+      }
       count += 1;
       updateProgress();
     },
@@ -4165,13 +4097,14 @@ function normalizedTileRefinement(value) {
 
 function markRootTileRefinementStart(root, tileRefinement) {
   if (normalizedTileRefinement(tileRefinement) > 1) {
-    root._rootTileRefinementDepth = 0;
+    nodeBuildState(root).rootTileRefinementDepth = 0;
   }
 }
 
 function rootTileRefinementDepth(node) {
-  return Number.isInteger(node && node._rootTileRefinementDepth)
-    ? node._rootTileRefinementDepth
+  const build = existingNodeBuildState(node);
+  return build && Number.isInteger(build.rootTileRefinementDepth)
+    ? build.rootTileRefinementDepth
     : null;
 }
 
@@ -4184,14 +4117,14 @@ function canSplitRootTileRefinement(node, maxDepth, tileRefinement) {
     depth != null &&
     depth > 0 &&
     depth < refinement &&
-    !node._rootTileRefinementExhausted &&
+    existingNodeBuildState(node)?.rootTileRefinementExhausted !== true &&
     node.count > 1
   );
 }
 
 function markRootTileRefinementExhausted(node) {
   if (node && rootTileRefinementDepth(node) != null) {
-    node._rootTileRefinementExhausted = true;
+    nodeBuildState(node).rootTileRefinementExhausted = true;
   }
 }
 
@@ -4247,12 +4180,13 @@ function assignRootTileRefinementChildState(parent, child, action, refinement) {
   if (parentDepth == null || parentDepth >= tileRefinement) {
     return;
   }
+  const childBuild = nodeBuildState(child);
   if (action.rootTileRefinement) {
-    child._rootTileRefinementDepth = parentDepth + 1;
+    childBuild.rootTileRefinementDepth = parentDepth + 1;
   } else if (splitActionKeepsLogicalDepth(action)) {
-    child._rootTileRefinementDepth = parentDepth;
+    childBuild.rootTileRefinementDepth = parentDepth;
   } else {
-    child._rootTileRefinementDepth = parentDepth + 1;
+    childBuild.rootTileRefinementDepth = parentDepth + 1;
   }
 }
 
@@ -4282,9 +4216,10 @@ function collectAdaptiveSplitCandidates(
       node.level > 0 &&
       !node.aspectSplitExhausted &&
       boundsLongWidthAspect(node.bounds) > ADAPTIVE_MAX_LONG_WIDTH_RATIO;
+    const build = existingNodeBuildState(node);
     const canSplitByVolumeRebalance =
-      node._forceVolumeRebalanceSplit === true &&
-      !node._volumeRebalanceSplitExhausted;
+      build?.forceVolumeRebalanceSplit === true &&
+      build.volumeRebalanceSplitExhausted !== true;
     if (
       node.count > 1 &&
       (canSplitByVolumeRebalance ||
@@ -4314,17 +4249,9 @@ function makeAdaptiveSplitStats(node, basisAxes = null) {
     count: 0,
     minimum: [Infinity, Infinity, Infinity],
     maximum: [-Infinity, -Infinity, -Infinity],
-    splitPoint: null,
-    splitAxes: null,
     splitDirection: null,
     splitOffset: null,
-    projectionMin: null,
-    projectionMax: null,
-    projectionHistogram: null,
     projectionCandidateStats: null,
-    projectionHistogramBinCount: 0,
-    projectionTotalWeight: 0.0,
-    projectionTotalCount: 0,
     basisAxes: normalizedBasisAxes,
     basisProjectionMinimum: normalizedBasisAxes
       ? [Infinity, Infinity, Infinity]
@@ -4334,6 +4261,8 @@ function makeAdaptiveSplitStats(node, basisAxes = null) {
       : null,
     action: null,
     childStats: null,
+    positionIndexStart: null,
+    positionIndexEnd: null,
   };
 }
 
@@ -4376,25 +4305,50 @@ function boundsLongWidthAspect(bounds) {
   return longWidthAspectFromExtents(bounds.extents()).aspect;
 }
 
-function boundsVolume(bounds) {
-  if (!bounds) {
-    return 0.0;
+function volumeFromExtents(extents) {
+  let maxExtent = 0.0;
+  for (let axis = 0; axis < extents.length; axis++) {
+    const extent = extents[axis];
+    if (Number.isFinite(extent) && extent > maxExtent) {
+      maxExtent = extent;
+    }
   }
-  const extents = bounds.extents();
-  const finiteExtents = extents.map((extent) =>
-    Number.isFinite(extent) ? Math.max(0.0, extent) : 0.0,
-  );
-  const maxExtent = Math.max(...finiteExtents);
   const epsilon = Math.max(
     ADAPTIVE_SPLIT_EPSILON,
     maxExtent * ADAPTIVE_SPLIT_EPSILON,
   );
   // Keep planar or linear leaves in same-depth scale comparisons instead of
   // letting one degenerate axis collapse their regularized volume to zero.
-  return finiteExtents.reduce(
-    (volume, extent) => volume * Math.max(extent, epsilon),
-    1.0,
-  );
+  let volume = 1.0;
+  for (let axis = 0; axis < extents.length; axis++) {
+    const extent = extents[axis];
+    const finite = Number.isFinite(extent) && extent > 0.0 ? extent : 0.0;
+    volume *= Math.max(finite, epsilon);
+  }
+  return volume;
+}
+
+function boundsVolume(bounds) {
+  if (!bounds) {
+    return 0.0;
+  }
+  return volumeFromExtents(bounds.extents());
+}
+
+function volumeFromMinMax(minimum, maximum) {
+  if (
+    !minimum ||
+    !maximum ||
+    !minimum.every((value) => Number.isFinite(value)) ||
+    !maximum.every((value) => Number.isFinite(value))
+  ) {
+    return Infinity;
+  }
+  return volumeFromExtents([
+    maximum[0] - minimum[0],
+    maximum[1] - minimum[1],
+    maximum[2] - minimum[2],
+  ]);
 }
 
 function medianSorted(values) {
@@ -4413,10 +4367,12 @@ function clearVolumeRebalanceSplitRequest(node, exhausted = true) {
   if (!node) {
     return;
   }
-  delete node._forceVolumeRebalanceSplit;
+  const build = nodeBuildState(node);
+  delete build.forceVolumeRebalanceSplit;
   if (exhausted) {
-    node._volumeRebalanceSplitExhausted = true;
+    build.volumeRebalanceSplitExhausted = true;
   }
+  pruneNodeBuildState(node);
 }
 
 function collectCurrentLodTileVolumeEntries(
@@ -4472,7 +4428,11 @@ function markCurrentLodTilesForVolumeRebalance(root, targetDepths = null) {
   for (const entries of entriesByDepth.values()) {
     if (entries.length < 2) {
       for (const entry of entries) {
-        delete entry.node._forceVolumeRebalanceSplit;
+        const build = existingNodeBuildState(entry.node);
+        if (build) {
+          delete build.forceVolumeRebalanceSplit;
+          pruneNodeBuildState(entry.node);
+        }
       }
       continue;
     }
@@ -4481,7 +4441,11 @@ function markCurrentLodTilesForVolumeRebalance(root, targetDepths = null) {
     const median = medianSorted(volumes);
     if (!Number.isFinite(median) || median <= 0.0) {
       for (const entry of entries) {
-        delete entry.node._forceVolumeRebalanceSplit;
+        const build = existingNodeBuildState(entry.node);
+        if (build) {
+          delete build.forceVolumeRebalanceSplit;
+          pruneNodeBuildState(entry.node);
+        }
       }
       continue;
     }
@@ -4489,14 +4453,16 @@ function markCurrentLodTilesForVolumeRebalance(root, targetDepths = null) {
     for (const entry of entries) {
       const node = entry.node;
       const volumeRatio = entry.volume / median;
+      const build = existingNodeBuildState(node);
       if (
         volumeRatio > ADAPTIVE_MAX_CHILD_VOLUME_RATIO &&
         node.count > 1 &&
-        node._volumeRebalanceSplitExhausted !== true
+        build?.volumeRebalanceSplitExhausted !== true
       ) {
-        node._forceVolumeRebalanceSplit = true;
-      } else if (node._forceVolumeRebalanceSplit === true) {
-        delete node._forceVolumeRebalanceSplit;
+        nodeBuildState(node).forceVolumeRebalanceSplit = true;
+      } else if (build?.forceVolumeRebalanceSplit === true) {
+        delete build.forceVolumeRebalanceSplit;
+        pruneNodeBuildState(node);
       }
     }
   }
@@ -5011,10 +4977,12 @@ function kdProjectionCandidateFromAxisInfo(axisInfo) {
   return {
     basisAxis: axisInfo.axis,
     splitDirection: axisInfo.direction.slice(),
+    coordinateAxis: Number.isInteger(axisInfo.coordinateAxis)
+      ? axisInfo.coordinateAxis
+      : null,
     projectionMin,
     projectionMax,
     projectionExtent,
-    axisScoreMultiplier: 1.0,
   };
 }
 
@@ -5023,7 +4991,6 @@ function kdProjectionCandidatesFromAxisInfos(axisInfos) {
   if (!primary) {
     return [];
   }
-  primary.axisScoreMultiplier = 1.0;
 
   const candidates = [primary];
   const secondaryInfo = axisInfos[1];
@@ -5037,7 +5004,6 @@ function kdProjectionCandidatesFromAxisInfos(axisInfos) {
       Number.isFinite(ratio) &&
       ratio < KD_TREE_AXIS_COMPETITION_ASPECT_RATIO
     ) {
-      secondary.axisScoreMultiplier = Math.max(1.0, ratio);
       candidates.push(secondary);
     }
   }
@@ -5045,9 +5011,13 @@ function kdProjectionCandidatesFromAxisInfos(axisInfos) {
 }
 
 function makeKdSplitAction(stats, tightBounds, basisAxes = null) {
-  const candidates = kdProjectionCandidatesFromAxisInfos(
-    projectedAxisInfosFromStats(stats, tightBounds, basisAxes),
-  );
+  const axisInfos = projectedAxisInfosFromStats(stats, tightBounds, basisAxes);
+  if (!basisAxes && !stats.basisAxes) {
+    for (const axisInfo of axisInfos) {
+      axisInfo.coordinateAxis = axisInfo.axis;
+    }
+  }
+  const candidates = kdProjectionCandidatesFromAxisInfos(axisInfos);
   const primary = candidates[0];
   if (!primary) {
     return null;
@@ -5069,7 +5039,8 @@ function resetAdaptiveProjectionStats(stats) {
     action && action.kind === ROUTE_MODE_KD,
     `Missing k-d projection action for node ${stats.node.key}.`,
   );
-  const binCount = ADAPTIVE_SPLIT_HISTOGRAM_BINS;
+  const segmentCount = ADAPTIVE_SPLIT_EQUAL_SEGMENTS;
+  const parentVolume = boundsVolume(stats.node.bounds);
   const candidates =
     action.projectionCandidates && action.projectionCandidates.length > 0
       ? action.projectionCandidates
@@ -5077,33 +5048,26 @@ function resetAdaptiveProjectionStats(stats) {
           {
             basisAxis: action.basisAxis,
             splitDirection: action.splitDirection,
+            coordinateAxis: action.coordinateAxis,
             projectionMin: action.projectionMin,
             projectionMax: action.projectionMax,
-            axisScoreMultiplier: 1.0,
           },
         ];
   stats.projectionCandidateStats = candidates.map((candidate) => ({
     basisAxis: candidate.basisAxis,
     splitDirection: candidate.splitDirection.slice(),
+    coordinateAxis: Number.isInteger(candidate.coordinateAxis)
+      ? candidate.coordinateAxis
+      : null,
     projectionMin: candidate.projectionMin,
     projectionMax: candidate.projectionMax,
-    axisScoreMultiplier:
-      Number.isFinite(candidate.axisScoreMultiplier) &&
-      candidate.axisScoreMultiplier >= 1.0
-        ? candidate.axisScoreMultiplier
-        : 1.0,
-    projectionHistogram: new Float64Array(binCount),
-    projectionTotalWeight: 0.0,
+    parentVolume,
+    projectionBins: Array.from(
+      { length: segmentCount },
+      makeProjectionVolumeBin,
+    ),
     projectionTotalCount: 0,
   }));
-  const primary = stats.projectionCandidateStats[0];
-  stats.projectionMin = primary.projectionMin;
-  stats.projectionMax = primary.projectionMax;
-  stats.projectionHistogram = primary.projectionHistogram;
-  stats.projectionTotalWeight = 0.0;
-  stats.projectionTotalCount = 0;
-  stats.projectionHistogramBinCount = binCount;
-  action.projectionHistogramBinCount = binCount;
 }
 
 function projectionBinIndex(projection, min, extent, binCount) {
@@ -5121,41 +5085,140 @@ function projectionBinIndex(projection, min, extent, binCount) {
   return Math.max(0, Math.min(binCount - 1, bin));
 }
 
-function addWeightedProjectionPoint(candidate, projection, weight) {
-  const histogram = candidate.projectionHistogram;
+function makeProjectionVolumeBin() {
+  return {
+    count: 0,
+    minimum: [Infinity, Infinity, Infinity],
+    maximum: [-Infinity, -Infinity, -Infinity],
+  };
+}
+
+function updateProjectionVolumeBin(bin, x, y, z) {
+  bin.count += 1;
+  const minimum = bin.minimum;
+  const maximum = bin.maximum;
+  if (x < minimum[0]) minimum[0] = x;
+  if (y < minimum[1]) minimum[1] = y;
+  if (z < minimum[2]) minimum[2] = z;
+  if (x > maximum[0]) maximum[0] = x;
+  if (y > maximum[1]) maximum[1] = y;
+  if (z > maximum[2]) maximum[2] = z;
+}
+
+function addVolumeBinToAccumulator(accumulator, bin) {
+  if (bin.count <= 0) {
+    return;
+  }
+  accumulator.count += bin.count;
+  const accMin = accumulator.minimum;
+  const accMax = accumulator.maximum;
+  const binMin = bin.minimum;
+  const binMax = bin.maximum;
+  if (binMin[0] < accMin[0]) accMin[0] = binMin[0];
+  if (binMin[1] < accMin[1]) accMin[1] = binMin[1];
+  if (binMin[2] < accMin[2]) accMin[2] = binMin[2];
+  if (binMax[0] > accMax[0]) accMax[0] = binMax[0];
+  if (binMax[1] > accMax[1]) accMax[1] = binMax[1];
+  if (binMax[2] > accMax[2]) accMax[2] = binMax[2];
+}
+
+function buildProjectionVolumeSuffixAccumulators(bins) {
+  const count = new Float64Array(bins.length + 1);
+  const minimum = new Float64Array((bins.length + 1) * 3);
+  const maximum = new Float64Array((bins.length + 1) * 3);
+  let suffixCount = 0;
+  let minX = Infinity;
+  let minY = Infinity;
+  let minZ = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  let maxZ = -Infinity;
+  const store = (index) => {
+    const base = index * 3;
+    count[index] = suffixCount;
+    minimum[base + 0] = minX;
+    minimum[base + 1] = minY;
+    minimum[base + 2] = minZ;
+    maximum[base + 0] = maxX;
+    maximum[base + 1] = maxY;
+    maximum[base + 2] = maxZ;
+  };
+  store(bins.length);
+  for (let index = bins.length - 1; index >= 0; index--) {
+    const bin = bins[index];
+    if (bin.count > 0) {
+      suffixCount += bin.count;
+      const binMin = bin.minimum;
+      const binMax = bin.maximum;
+      if (binMin[0] < minX) minX = binMin[0];
+      if (binMin[1] < minY) minY = binMin[1];
+      if (binMin[2] < minZ) minZ = binMin[2];
+      if (binMax[0] > maxX) maxX = binMax[0];
+      if (binMax[1] > maxY) maxY = binMax[1];
+      if (binMax[2] > maxZ) maxZ = binMax[2];
+    }
+    store(index);
+  }
+  return { count, minimum, maximum };
+}
+
+function suffixAccumulatorVolume(suffixes, index) {
+  const base = index * 3;
+  return volumeFromExtents([
+    suffixes.maximum[base + 0] - suffixes.minimum[base + 0],
+    suffixes.maximum[base + 1] - suffixes.minimum[base + 1],
+    suffixes.maximum[base + 2] - suffixes.minimum[base + 2],
+  ]);
+}
+
+function childEntryFromValues(slot, count, minimum, maximum) {
+  return {
+    slot,
+    count,
+    minimum: minimum.slice(),
+    maximum: maximum.slice(),
+  };
+}
+
+function splitProjectionForCandidate(candidate, x, y, z) {
+  const axis = candidate.coordinateAxis;
+  if (axis === 0) return x;
+  if (axis === 1) return y;
+  if (axis === 2) return z;
+  return dotDirection(candidate.splitDirection, x, y, z);
+}
+
+function addProjectionVolumePoint(candidate, projection, x, y, z) {
+  const bins = candidate.projectionBins;
   const min = candidate.projectionMin;
   const max = candidate.projectionMax;
   const extent = max - min;
-  const binCount = histogram ? histogram.length : 0;
-  if (!histogram || binCount <= 0) {
-    return;
+  const binCount = bins ? bins.length : 0;
+  if (!bins || binCount <= 0) {
+    return false;
   }
   if (!Number.isFinite(projection)) {
-    return;
+    return false;
   }
   if (!Number.isFinite(extent) || extent <= 0.0) {
-    return;
+    return false;
   }
   const bin = projectionBinIndex(projection, min, extent, binCount);
-  histogram[bin] += weight;
+  updateProjectionVolumeBin(bins[bin], x, y, z);
+  return true;
 }
 
-function updateAdaptiveProjectionStats(stats, x, y, z, weight = 1.0) {
+function updateAdaptiveProjectionStats(stats, x, y, z) {
   const candidates = stats.projectionCandidateStats;
   if (!candidates || candidates.length === 0) {
     return;
   }
-  const splitWeight = normalizeSplitWeight(weight);
   for (const candidate of candidates) {
-    const direction = candidate.splitDirection;
-    const projection = dotDirection(direction, x, y, z);
-    addWeightedProjectionPoint(candidate, projection, splitWeight);
-    candidate.projectionTotalWeight += splitWeight;
-    candidate.projectionTotalCount += 1;
+    const projection = splitProjectionForCandidate(candidate, x, y, z);
+    if (addProjectionVolumePoint(candidate, projection, x, y, z)) {
+      candidate.projectionTotalCount += 1;
+    }
   }
-  const primary = candidates[0];
-  stats.projectionTotalWeight = primary.projectionTotalWeight;
-  stats.projectionTotalCount = primary.projectionTotalCount;
 }
 
 function normalizedProjectionMidpointPenalty(split, min, max) {
@@ -5175,103 +5238,38 @@ function normalizedProjectionMidpointPenalty(split, min, max) {
   return Math.min(1.0, Math.max(0.0, Math.abs(split - midpoint) / halfExtent));
 }
 
-function projectionBoundaryConnectionStrength(histogram, boundary) {
-  if (
-    !histogram ||
-    !Number.isInteger(boundary) ||
-    boundary <= 0 ||
-    boundary >= histogram.length
-  ) {
+function normalizedProjectionVolumeScore(volumeSum, parentVolume) {
+  if (!Number.isFinite(volumeSum)) {
     return Infinity;
   }
-  return histogram[boundary - 1] + histogram[boundary];
+  if (
+    !Number.isFinite(parentVolume) ||
+    parentVolume <= ADAPTIVE_SPLIT_EPSILON
+  ) {
+    return volumeSum;
+  }
+  return Math.max(0.0, volumeSum / parentVolume);
 }
 
-function normalizedProjectionConnectionStrengthPenalty(
-  connectionStrength,
-  minimumConnectionStrength,
-  maximumConnectionStrength,
-) {
-  if (
-    !Number.isFinite(connectionStrength) ||
-    !Number.isFinite(minimumConnectionStrength) ||
-    !Number.isFinite(maximumConnectionStrength)
-  ) {
-    return Infinity;
-  }
-  const range = maximumConnectionStrength - minimumConnectionStrength;
-  if (!Number.isFinite(range) || range <= ADAPTIVE_SPLIT_EPSILON) {
-    return 0.0;
-  }
-  return Math.min(
-    1.0,
-    Math.max(0.0, (connectionStrength - minimumConnectionStrength) / range),
-  );
-}
-
-function projectionSplitObjectiveScore(
-  midpointPenalty,
-  connectionStrengthPenalty,
-) {
-  if (
-    !Number.isFinite(midpointPenalty) ||
-    !Number.isFinite(connectionStrengthPenalty)
-  ) {
+function projectionSplitObjectiveScore(volumeScore, midpointPenalty) {
+  if (!Number.isFinite(volumeScore) || !Number.isFinite(midpointPenalty)) {
     return Infinity;
   }
   return (
-    midpointPenalty * ADAPTIVE_SPLIT_RANGE_MIDPOINT_SCORE_WEIGHT +
-    connectionStrengthPenalty * ADAPTIVE_SPLIT_CONNECTION_SCORE_WEIGHT
+    volumeScore * ADAPTIVE_SPLIT_VOLUME_SCORE_WEIGHT +
+    midpointPenalty * ADAPTIVE_SPLIT_MIDPOINT_SCORE_WEIGHT
   );
 }
 
-function collectProjectionSplitCandidates(histogram, totalWeight) {
-  const binCount = histogram ? histogram.length : 0;
-  const candidates = [];
-  let lowerWeight = 0.0;
-  let minimumConnectionStrength = Infinity;
-  let maximumConnectionStrength = -Infinity;
-  for (let boundary = 1; boundary < binCount; boundary++) {
-    lowerWeight += histogram[boundary - 1];
-    if (lowerWeight <= 0.0 || lowerWeight >= totalWeight) {
-      continue;
-    }
-    const connectionStrength = projectionBoundaryConnectionStrength(
-      histogram,
-      boundary,
-    );
-    if (!Number.isFinite(connectionStrength)) {
-      continue;
-    }
-    minimumConnectionStrength = Math.min(
-      minimumConnectionStrength,
-      connectionStrength,
-    );
-    maximumConnectionStrength = Math.max(
-      maximumConnectionStrength,
-      connectionStrength,
-    );
-    candidates.push({
-      boundary,
-      connectionStrength,
-    });
-  }
-  return {
-    candidates,
-    minimumConnectionStrength,
-    maximumConnectionStrength,
-  };
-}
-
 function chooseProjectionSplitForCandidate(candidate) {
-  const histogram = candidate.projectionHistogram;
-  if (!histogram) {
+  const bins = candidate.projectionBins;
+  if (!bins) {
     return null;
   }
   const min = candidate.projectionMin;
   const max = candidate.projectionMax;
   const extent = max - min;
-  const binCount = histogram.length;
+  const binCount = bins.length;
   const epsilon = Math.max(
     ADAPTIVE_SPLIT_EPSILON,
     Math.abs(extent) * ADAPTIVE_SPLIT_EPSILON,
@@ -5280,99 +5278,184 @@ function chooseProjectionSplitForCandidate(candidate) {
     !Number.isFinite(extent) ||
     extent <= epsilon ||
     binCount <= 1 ||
-    !Number.isFinite(candidate.projectionTotalWeight) ||
-    candidate.projectionTotalWeight <= 0.0
+    !Number.isInteger(candidate.projectionTotalCount) ||
+    candidate.projectionTotalCount <= 1
   ) {
     return null;
   }
 
-  const { candidates, minimumConnectionStrength, maximumConnectionStrength } =
-    collectProjectionSplitCandidates(
-      histogram,
-      candidate.projectionTotalWeight,
-    );
+  const suffixes = buildProjectionVolumeSuffixAccumulators(bins);
+  const lower = makeProjectionVolumeBin();
   let bestBoundary = -1;
+  let bestSplitOffset = null;
   let bestScore = Infinity;
-  let bestConnectionPenalty = Infinity;
+  let bestVolumeSum = Infinity;
+  let bestMaxChildVolume = Infinity;
+  let bestCountBalance = Infinity;
   let bestMidpointPenalty = Infinity;
-  let bestConnectionStrength = Infinity;
-  for (const splitCandidate of candidates) {
-    const split = min + (extent * splitCandidate.boundary) / binCount;
+  let bestLowerCount = 0;
+  let bestUpperCount = 0;
+  let bestLowerMinimum = null;
+  let bestLowerMaximum = null;
+  let bestUpperMinimum = null;
+  let bestUpperMaximum = null;
+  for (let boundary = 1; boundary < binCount; boundary++) {
+    addVolumeBinToAccumulator(lower, bins[boundary - 1]);
+    const upperCount = suffixes.count[boundary];
+    if (lower.count <= 0 || upperCount <= 0) {
+      continue;
+    }
+    const split = min + (extent * boundary) / binCount;
+    if (split <= min + epsilon || split >= max - epsilon) {
+      continue;
+    }
+    const lowerVolume = volumeFromMinMax(lower.minimum, lower.maximum);
+    const upperVolume = suffixAccumulatorVolume(suffixes, boundary);
+    const volumeSum = lowerVolume + upperVolume;
+    if (!Number.isFinite(volumeSum)) {
+      continue;
+    }
     const midpointPenalty = normalizedProjectionMidpointPenalty(
       split,
       min,
       max,
     );
-    const connectionPenalty = normalizedProjectionConnectionStrengthPenalty(
-      splitCandidate.connectionStrength,
-      minimumConnectionStrength,
-      maximumConnectionStrength,
+    const volumeScore = normalizedProjectionVolumeScore(
+      volumeSum,
+      candidate.parentVolume,
     );
-    const score = projectionSplitObjectiveScore(
-      midpointPenalty,
-      connectionPenalty,
-    );
+    const score = projectionSplitObjectiveScore(volumeScore, midpointPenalty);
+    if (!Number.isFinite(score)) {
+      continue;
+    }
+    const maxChildVolume = Math.max(lowerVolume, upperVolume);
+    const countBalance =
+      Math.abs(lower.count - upperCount) / candidate.projectionTotalCount;
     if (
-      score < bestScore ||
-      (Math.abs(score - bestScore) <= ADAPTIVE_SPLIT_EPSILON &&
-        (connectionPenalty < bestConnectionPenalty ||
-          (Math.abs(connectionPenalty - bestConnectionPenalty) <=
-            ADAPTIVE_SPLIT_EPSILON &&
-            midpointPenalty < bestMidpointPenalty)))
+      projectionSplitMetricsAreBetter(
+        score,
+        volumeSum,
+        maxChildVolume,
+        countBalance,
+        midpointPenalty,
+        bestScore,
+        bestVolumeSum,
+        bestMaxChildVolume,
+        bestCountBalance,
+        bestMidpointPenalty,
+      )
     ) {
+      const upperBase = boundary * 3;
+      bestBoundary = boundary;
+      bestSplitOffset = split;
       bestScore = score;
-      bestConnectionPenalty = connectionPenalty;
+      bestVolumeSum = volumeSum;
+      bestMaxChildVolume = maxChildVolume;
+      bestCountBalance = countBalance;
       bestMidpointPenalty = midpointPenalty;
-      bestConnectionStrength = splitCandidate.connectionStrength;
-      bestBoundary = splitCandidate.boundary;
+      bestLowerCount = lower.count;
+      bestUpperCount = upperCount;
+      bestLowerMinimum = lower.minimum.slice();
+      bestLowerMaximum = lower.maximum.slice();
+      bestUpperMinimum = [
+        suffixes.minimum[upperBase + 0],
+        suffixes.minimum[upperBase + 1],
+        suffixes.minimum[upperBase + 2],
+      ];
+      bestUpperMaximum = [
+        suffixes.maximum[upperBase + 0],
+        suffixes.maximum[upperBase + 1],
+        suffixes.maximum[upperBase + 2],
+      ];
     }
   }
-
-  if (bestBoundary > 0) {
-    const split = min + (extent * bestBoundary) / binCount;
-    if (split > min + epsilon && split < max - epsilon) {
-      const scoreMultiplier =
-        Number.isFinite(candidate.axisScoreMultiplier) &&
-        candidate.axisScoreMultiplier >= 1.0
-          ? candidate.axisScoreMultiplier
-          : 1.0;
-      return {
-        candidate,
-        splitOffset: split,
-        score: bestScore,
-        axisAdjustedScore: bestScore * scoreMultiplier,
-        axisScoreMultiplier: scoreMultiplier,
-        connectionPenalty: bestConnectionPenalty,
-        midpointPenalty: bestMidpointPenalty,
-        connectionStrength: bestConnectionStrength,
-        fallback: false,
-      };
-    }
+  if (bestBoundary <= 0) {
+    return null;
   }
+  return {
+    candidate,
+    splitOffset: bestSplitOffset,
+    boundary: bestBoundary,
+    score: bestScore,
+    volumeSum: bestVolumeSum,
+    maxChildVolume: bestMaxChildVolume,
+    countBalance: bestCountBalance,
+    midpointPenalty: bestMidpointPenalty,
+    childEntries: [
+      childEntryFromValues(
+        0,
+        bestLowerCount,
+        bestLowerMinimum,
+        bestLowerMaximum,
+      ),
+      childEntryFromValues(
+        1,
+        bestUpperCount,
+        bestUpperMinimum,
+        bestUpperMaximum,
+      ),
+    ],
+  };
+}
 
-  const midpointProjection = min + extent * 0.5;
-  if (
-    midpointProjection > min + epsilon &&
-    midpointProjection < max - epsilon
-  ) {
-    const scoreMultiplier =
-      Number.isFinite(candidate.axisScoreMultiplier) &&
-      candidate.axisScoreMultiplier >= 1.0
-        ? candidate.axisScoreMultiplier
-        : 1.0;
-    return {
-      candidate,
-      splitOffset: midpointProjection,
-      score: Infinity,
-      axisAdjustedScore: Infinity,
-      axisScoreMultiplier: scoreMultiplier,
-      connectionPenalty: Infinity,
-      midpointPenalty: 0.0,
-      connectionStrength: Infinity,
-      fallback: true,
-    };
+function pairwiseComparisonEpsilon(lhs, rhs) {
+  const lhsScale = Number.isFinite(lhs) ? Math.abs(lhs) : 0.0;
+  const rhsScale = Number.isFinite(rhs) ? Math.abs(rhs) : 0.0;
+  const scale = Math.max(1.0, lhsScale, rhsScale);
+  return ADAPTIVE_SPLIT_EPSILON * scale;
+}
+
+function valueIsLess(lhs, rhs) {
+  return lhs < rhs - pairwiseComparisonEpsilon(lhs, rhs);
+}
+
+function valueIsGreater(lhs, rhs) {
+  return lhs > rhs + pairwiseComparisonEpsilon(lhs, rhs);
+}
+
+function compareProjectionSplitMetricValues(
+  score,
+  volumeSum,
+  maxChildVolume,
+  countBalance,
+  midpointPenalty,
+  bestScore,
+  bestVolumeSum,
+  bestMaxChildVolume,
+  bestCountBalance,
+  bestMidpointPenalty,
+) {
+  if (valueIsLess(score, bestScore)) {
+    return -1;
   }
-  return null;
+  if (valueIsGreater(score, bestScore)) {
+    return 1;
+  }
+  if (valueIsLess(volumeSum, bestVolumeSum)) {
+    return -1;
+  }
+  if (valueIsGreater(volumeSum, bestVolumeSum)) {
+    return 1;
+  }
+  if (valueIsLess(maxChildVolume, bestMaxChildVolume)) {
+    return -1;
+  }
+  if (valueIsGreater(maxChildVolume, bestMaxChildVolume)) {
+    return 1;
+  }
+  if (valueIsLess(countBalance, bestCountBalance)) {
+    return -1;
+  }
+  if (valueIsGreater(countBalance, bestCountBalance)) {
+    return 1;
+  }
+  if (valueIsLess(midpointPenalty, bestMidpointPenalty)) {
+    return -1;
+  }
+  if (valueIsGreater(midpointPenalty, bestMidpointPenalty)) {
+    return 1;
+  }
+  return 0;
 }
 
 function projectionSplitChoiceIsBetter(choice, bestChoice) {
@@ -5382,78 +5465,65 @@ function projectionSplitChoiceIsBetter(choice, bestChoice) {
   if (!bestChoice) {
     return true;
   }
-  if (choice.fallback !== bestChoice.fallback) {
-    return !choice.fallback;
-  }
-  const choiceScore = Number.isFinite(choice.axisAdjustedScore)
-    ? choice.axisAdjustedScore
-    : choice.score;
-  const bestScore = Number.isFinite(bestChoice.axisAdjustedScore)
-    ? bestChoice.axisAdjustedScore
-    : bestChoice.score;
-  if (choiceScore < bestScore - ADAPTIVE_SPLIT_EPSILON) {
-    return true;
-  }
-  if (choiceScore > bestScore + ADAPTIVE_SPLIT_EPSILON) {
-    return false;
-  }
-  const choiceAxisMultiplier =
-    Number.isFinite(choice.axisScoreMultiplier) &&
-    choice.axisScoreMultiplier >= 1.0
-      ? choice.axisScoreMultiplier
-      : 1.0;
-  const bestAxisMultiplier =
-    Number.isFinite(bestChoice.axisScoreMultiplier) &&
-    bestChoice.axisScoreMultiplier >= 1.0
-      ? bestChoice.axisScoreMultiplier
-      : 1.0;
-  if (
-    choiceAxisMultiplier <
-    bestAxisMultiplier - ADAPTIVE_SPLIT_EPSILON
-  ) {
-    return true;
-  }
-  if (
-    choiceAxisMultiplier >
-    bestAxisMultiplier + ADAPTIVE_SPLIT_EPSILON
-  ) {
-    return false;
-  }
-  if (choice.score < bestChoice.score - ADAPTIVE_SPLIT_EPSILON) {
-    return true;
-  }
-  if (choice.score > bestChoice.score + ADAPTIVE_SPLIT_EPSILON) {
-    return false;
-  }
-  if (
-    choice.connectionPenalty <
-    bestChoice.connectionPenalty - ADAPTIVE_SPLIT_EPSILON
-  ) {
-    return true;
-  }
-  if (
-    choice.connectionPenalty >
-    bestChoice.connectionPenalty + ADAPTIVE_SPLIT_EPSILON
-  ) {
-    return false;
-  }
-  if (
-    choice.midpointPenalty <
-    bestChoice.midpointPenalty - ADAPTIVE_SPLIT_EPSILON
-  ) {
-    return true;
-  }
-  if (
-    choice.midpointPenalty >
-    bestChoice.midpointPenalty + ADAPTIVE_SPLIT_EPSILON
-  ) {
-    return false;
+  const metricComparison = compareProjectionSplitMetricValues(
+    choice.score,
+    choice.volumeSum,
+    choice.maxChildVolume,
+    choice.countBalance,
+    choice.midpointPenalty,
+    bestChoice.score,
+    bestChoice.volumeSum,
+    bestChoice.maxChildVolume,
+    bestChoice.countBalance,
+    bestChoice.midpointPenalty,
+  );
+  if (metricComparison !== 0) {
+    return metricComparison < 0;
   }
   const choiceExtent =
     choice.candidate.projectionMax - choice.candidate.projectionMin;
   const bestExtent =
     bestChoice.candidate.projectionMax - bestChoice.candidate.projectionMin;
-  return choiceExtent > bestExtent + ADAPTIVE_SPLIT_EPSILON;
+  if (valueIsGreater(choiceExtent, bestExtent)) {
+    return true;
+  }
+  if (valueIsLess(choiceExtent, bestExtent)) {
+    return false;
+  }
+  return (
+    (choice.candidate.basisAxis || 0) < (bestChoice.candidate.basisAxis || 0)
+  );
+}
+
+function projectionSplitMetricsAreBetter(
+  score,
+  volumeSum,
+  maxChildVolume,
+  countBalance,
+  midpointPenalty,
+  bestScore,
+  bestVolumeSum,
+  bestMaxChildVolume,
+  bestCountBalance,
+  bestMidpointPenalty,
+) {
+  if (!Number.isFinite(bestScore)) {
+    return true;
+  }
+  return (
+    compareProjectionSplitMetricValues(
+      score,
+      volumeSum,
+      maxChildVolume,
+      countBalance,
+      midpointPenalty,
+      bestScore,
+      bestVolumeSum,
+      bestMaxChildVolume,
+      bestCountBalance,
+      bestMidpointPenalty,
+    ) < 0
+  );
 }
 
 function chooseProjectionSplit(stats) {
@@ -5486,9 +5556,13 @@ function finalizeKdSplitAction(stats) {
   const candidate = choice.candidate;
   action.basisAxis = candidate.basisAxis;
   action.splitDirection = candidate.splitDirection.slice();
+  action.coordinateAxis = Number.isInteger(candidate.coordinateAxis)
+    ? candidate.coordinateAxis
+    : null;
   action.projectionMin = candidate.projectionMin;
   action.projectionMax = candidate.projectionMax;
   action.splitOffset = splitOffset;
+  action.childEntries = choice.childEntries;
   stats.splitDirection = action.splitDirection.slice();
   stats.splitOffset = splitOffset;
   return true;
@@ -5564,9 +5638,10 @@ function chooseAdaptiveSplitAction(
 ) {
   const node = stats.node;
   const tileRefinement = normalizedTileRefinement(options.tileRefinement);
+  const build = existingNodeBuildState(node);
   if (
-    node._forceVolumeRebalanceSplit === true &&
-    !node._volumeRebalanceSplitExhausted
+    build?.forceVolumeRebalanceSplit === true &&
+    build.volumeRebalanceSplitExhausted !== true
   ) {
     const action = makeKdSplitAction(stats, tightBounds, basisAxes);
     if (action) {
@@ -5636,8 +5711,6 @@ function chooseAdaptiveSplitAction(
 }
 
 function clearNodeSplitRouting(node) {
-  node.splitPoint = null;
-  node.splitAxes = null;
   node.splitDirection = null;
   node.splitOffset = null;
 }
@@ -5647,34 +5720,20 @@ function applyAdaptiveSplitActionToNode(node, action) {
     action && action.kind === ROUTE_MODE_KD,
     `Unsupported adaptive split action for node ${node.key}.`,
   );
-  node.splitPoint = null;
-  node.splitAxes = null;
   node.splitDirection = action.splitDirection.slice();
   node.splitOffset = action.splitOffset;
 }
 
-function pointKdSlotForAction(action, bounds, x, y, z) {
-  if (action.splitDirection && Number.isFinite(action.splitOffset)) {
-    return pointPlaneSlot(action.splitDirection, action.splitOffset, x, y, z);
-  }
-  return pointOctant(bounds, x, y, z, action.splitPoint, action.splitAxes);
+function pointKdSlotForAction(action, x, y, z) {
+  ensure(
+    action && action.splitDirection && Number.isFinite(action.splitOffset),
+    'Missing k-d split plane for action.',
+  );
+  return pointPlaneSlot(action.splitDirection, action.splitOffset, x, y, z);
 }
 
 function childSlotForAdaptiveAction(stats, x, y, z) {
-  return pointKdSlotForAction(stats.action, stats.node.bounds, x, y, z);
-}
-
-function kdSplitAxisForAction(action) {
-  if (!action || action.kind !== ROUTE_MODE_KD) {
-    return null;
-  }
-  const axes = action.splitAxes || [];
-  for (let axis = 0; axis < 3; axis++) {
-    if (axes[axis]) {
-      return axis;
-    }
-  }
-  return null;
+  return pointKdSlotForAction(stats.action, x, y, z);
 }
 
 function updateAdaptiveChildStats(stats, slot, x, y, z) {
@@ -5707,6 +5766,26 @@ function sortedAdaptiveChildStats(stats) {
     return [];
   }
   return Array.from(stats.childStats.values()).sort((a, b) => a.slot - b.slot);
+}
+
+function childStatsMapFromSplitAction(action) {
+  const entries = action && action.childEntries;
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return null;
+  }
+  const out = new Map();
+  for (const entry of entries) {
+    if (!entry || entry.count <= 0 || !Number.isInteger(entry.slot)) {
+      continue;
+    }
+    out.set(entry.slot, {
+      slot: entry.slot,
+      count: entry.count,
+      minimum: entry.minimum.slice(),
+      maximum: entry.maximum.slice(),
+    });
+  }
+  return out.size > 0 ? out : null;
 }
 
 function makeAdaptiveChildEntry(slot, start = null, end = null) {
@@ -5752,13 +5831,27 @@ function makePositionIndexArray(vertexCount) {
 }
 
 function setNodePositionIndexRange(node, start, end) {
-  node._positionIndexStart = start;
-  node._positionIndexEnd = end;
+  const build = nodeBuildState(node);
+  build.positionIndexStart = start;
+  build.positionIndexEnd = end;
+}
+
+function nodePositionIndexRange(node) {
+  const build = existingNodeBuildState(node);
+  return build &&
+    Number.isInteger(build.positionIndexStart) &&
+    Number.isInteger(build.positionIndexEnd)
+    ? build
+    : null;
 }
 
 function clearNodePositionIndexRanges(node) {
-  delete node._positionIndexStart;
-  delete node._positionIndexEnd;
+  const build = existingNodeBuildState(node);
+  if (build) {
+    delete build.positionIndexStart;
+    delete build.positionIndexEnd;
+    pruneNodeBuildState(node);
+  }
   for (const child of node.children) {
     clearNodePositionIndexRanges(child);
   }
@@ -5919,7 +6012,6 @@ function updateAdaptiveSplitStatsForPositionIndexRange(
 function updateAdaptiveProjectionStatsForPositionIndexRange(
   stats,
   positions,
-  weights,
   indices,
   start,
   end,
@@ -5934,7 +6026,6 @@ function updateAdaptiveProjectionStatsForPositionIndexRange(
       positions[base + 0],
       positions[base + 1],
       positions[base + 2],
-      weights ? weights[rowIndex] : 1.0,
     );
     pendingProgressRows += 1;
     if (pendingProgressRows >= TILING_TREE_PROGRESS_ROW_INTERVAL) {
@@ -5956,22 +6047,20 @@ function partitionKdPositionIndexRange(
   progressState = null,
 ) {
   const action = stats.action;
-  const usesPlane =
-    action && action.splitDirection && Number.isFinite(action.splitOffset);
-  const axis = usesPlane ? null : kdSplitAxisForAction(action);
   ensure(
-    usesPlane || (Number.isInteger(axis) && axis >= 0 && axis < 3),
+    action && action.splitDirection && Number.isFinite(action.splitOffset),
     `Missing k-d split plane for node ${stats.node.key}.`,
   );
-  const split = usesPlane ? action.splitOffset : action.splitPoint[axis];
+  const split = action.splitOffset;
   ensure(
     Number.isFinite(split),
     `Missing k-d split offset for node ${stats.node.key}.`,
   );
+  const coordinateAxis =
+    Number.isInteger(action.coordinateAxis) ? action.coordinateAxis : null;
 
   const lower = makeAdaptiveChildEntry(0, start, null);
-  const upperSlot = usesPlane ? 1 : 1 << axis;
-  const upper = makeAdaptiveChildEntry(upperSlot, null, end);
+  const upper = makeAdaptiveChildEntry(1, null, end);
   let left = start;
   let right = end - 1;
   let pendingProgressRows = 0;
@@ -5988,9 +6077,10 @@ function partitionKdPositionIndexRange(
     const x = positions[base + 0];
     const y = positions[base + 1];
     const z = positions[base + 2];
-    const coordinate = usesPlane
-      ? dotDirection(action.splitDirection, x, y, z)
-      : coordinateForAxis(axis, x, y, z);
+    const coordinate =
+      coordinateAxis != null
+        ? coordinateForAxis(coordinateAxis, x, y, z)
+        : dotDirection(action.splitDirection, x, y, z);
 
     if (coordinate >= split) {
       updateAdaptiveChildEntry(upper, x, y, z);
@@ -6117,7 +6207,7 @@ function forEachNodeOnPointPath(root, x, y, z, callback) {
     }
 
     const slot = pointKdSlotForNode(node, x, y, z);
-    const child = node.childrenByOct[slot];
+    const child = node.childrenBySlot[slot];
     ensure(
       !!child,
       `Failed to resolve OBB stats path for point at node ${node.key} slot=${slot}.`,
@@ -6240,7 +6330,6 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
   }
 
   const positions = source.positions;
-  const weights = source.weights || null;
   ensure(
     positions && positions.length >= source.vertexCount * 3,
     'In-memory staged positions are missing or truncated.',
@@ -6267,8 +6356,9 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
       const candidateRanges = [];
       let candidateRowTotal = 0;
       for (const node of candidates) {
-        const start = node._positionIndexStart;
-        const end = node._positionIndexEnd;
+        const range = nodePositionIndexRange(node);
+        const start = range ? range.positionIndexStart : null;
+        const end = range ? range.positionIndexEnd : null;
         ensure(
           Number.isInteger(start) && Number.isInteger(end) && end >= start,
           `Missing in-memory position index range for node ${node.key}.`,
@@ -6285,6 +6375,8 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
       for (const range of candidateRanges) {
         const node = range.node;
         const stats = makeAdaptiveSplitStats(node, splitBasisAxes);
+        stats.positionIndexStart = range.start;
+        stats.positionIndexEnd = range.end;
         updateAdaptiveSplitStatsForPositionIndexRange(
           stats,
           positions,
@@ -6343,21 +6435,20 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
         let projectionRowTotal = 0;
         for (const stats of kdActionStats) {
           projectionRowTotal +=
-            stats.node._positionIndexEnd - stats.node._positionIndexStart;
+            stats.positionIndexEnd - stats.positionIndexStart;
         }
         const projectionProgress = startTilingProgressPhase(
           progress,
           projectionRowTotal,
-          `building k-d tree | root-basis splits=${kdActionStats.length}`,
+          `building k-d tree | volume split candidates=${kdActionStats.length}`,
         );
         for (const stats of kdActionStats) {
           updateAdaptiveProjectionStatsForPositionIndexRange(
             stats,
             positions,
-            weights,
             indices,
-            stats.node._positionIndexStart,
-            stats.node._positionIndexEnd,
+            stats.positionIndexStart,
+            stats.positionIndexEnd,
             projectionProgress,
           );
         }
@@ -6386,8 +6477,7 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
 
       let bucketProgressRowTotal = 0;
       for (const stats of splittableStats) {
-        const rowCount =
-          stats.node._positionIndexEnd - stats.node._positionIndexStart;
+        const rowCount = stats.positionIndexEnd - stats.positionIndexStart;
         noteTilingVirtualSegmentAction(progress, stats.action);
         bucketProgressRowTotal += rowCount;
       }
@@ -6400,8 +6490,8 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
       const affectedVolumeDepths = new Set();
       for (const stats of splittableStats) {
         const node = stats.node;
-        const start = node._positionIndexStart;
-        const end = node._positionIndexEnd;
+        const start = stats.positionIndexStart;
+        const end = stats.positionIndexEnd;
         const occupied = partitionKdPositionIndexRange(
           stats,
           positions,
@@ -6421,7 +6511,7 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
         node.leaf = false;
         node.virtual = splitActionMakesVirtualNode(stats.action);
         node.children = [];
-        node.childrenByOct = new Array(8).fill(null);
+        node.childrenBySlot = makeChildSlotArray();
         node.occupiedChildCount = occupied.length;
         for (const entry of occupied) {
           const slot = entry.slot;
@@ -6453,7 +6543,7 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
           }
           setNodePositionIndexRange(child, entry.start, entry.end);
           node.children.push(child);
-          node.childrenByOct[slot] = child;
+          node.childrenBySlot[slot] = child;
         }
         splitNodeCount += 1;
         noteAffectedVolumeRebalanceDepths(
@@ -6571,16 +6661,17 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
       for (const stats of kdActionStats) {
         kdStatsByNode.set(stats.node, stats);
       }
-      await forEachStagedPosition(source, (x, y, z, weight) => {
+      await forEachStagedPosition(source, (x, y, z) => {
         const leaf = resolveLeafNodeForPoint(root, x, y, z);
         const stats = kdStatsByNode.get(leaf);
         if (stats) {
-          updateAdaptiveProjectionStats(stats, x, y, z, weight);
+          updateAdaptiveProjectionStats(stats, x, y, z);
         }
       });
     }
 
     const splittableStats = [];
+    let needsChildStatsScan = false;
     for (const stats of actionStats) {
       if (
         stats.action.kind === ROUTE_MODE_KD &&
@@ -6593,7 +6684,11 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
         clearVolumeRebalanceSplitRequest(stats.node);
       }
       applyAdaptiveSplitActionToNode(stats.node, stats.action);
-      stats.childStats = new Map();
+      stats.childStats = childStatsMapFromSplitAction(stats.action);
+      if (!stats.childStats) {
+        stats.childStats = new Map();
+        needsChildStatsScan = true;
+      }
       splittableStats.push(stats);
     }
 
@@ -6601,20 +6696,24 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
       break;
     }
 
-    const splittableByNode = new Map();
-    for (const stats of splittableStats) {
-      splittableByNode.set(stats.node, stats);
-    }
-
-    await forEachStagedPosition(source, (x, y, z) => {
-      const leaf = resolveLeafNodeForPoint(root, x, y, z);
-      const stats = splittableByNode.get(leaf);
-      if (!stats) {
-        return;
+    if (needsChildStatsScan) {
+      const splittableByNode = new Map();
+      for (const stats of splittableStats) {
+        if (stats.childStats.size === 0) {
+          splittableByNode.set(stats.node, stats);
+        }
       }
-      const slot = childSlotForAdaptiveAction(stats, x, y, z);
-      updateAdaptiveChildStats(stats, slot, x, y, z);
-    });
+
+      await forEachStagedPosition(source, (x, y, z) => {
+        const leaf = resolveLeafNodeForPoint(root, x, y, z);
+        const stats = splittableByNode.get(leaf);
+        if (!stats) {
+          return;
+        }
+        const slot = childSlotForAdaptiveAction(stats, x, y, z);
+        updateAdaptiveChildStats(stats, slot, x, y, z);
+      });
+    }
 
     let splitNodeCount = 0;
     const affectedVolumeDepths = new Set();
@@ -6632,7 +6731,7 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
       node.leaf = false;
       node.virtual = splitActionMakesVirtualNode(stats.action);
       node.children = [];
-      node.childrenByOct = new Array(8).fill(null);
+      node.childrenBySlot = makeChildSlotArray();
       node.occupiedChildCount = occupied.length;
       for (const entry of occupied) {
         const slot = entry.slot;
@@ -6660,7 +6759,7 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
           child.aspectSplitExhausted = true;
         }
         node.children.push(child);
-        node.childrenByOct[slot] = child;
+        node.childrenBySlot[slot] = child;
       }
       splitNodeCount += 1;
       noteAffectedVolumeRebalanceDepths(
@@ -7315,51 +7414,23 @@ function makeBuildSummary(
     geometricErrorByDepth[String(depth)] = rootGeometricError * geometricScale;
   }
 
+  const peakRss =
+    Number.isFinite(peakRssBytes) && peakRssBytes > 0
+      ? Math.floor(peakRssBytes)
+      : null;
+
   return {
     input_splats: header.vertexCount,
     sh_degree: layout.degree,
     handoff_encoding: HANDOFF_BUCKET_ENCODING,
-    checkpoint_reused: !!checkpointInfo.reused,
-    checkpoint_reused_stage: checkpointInfo.stage,
     max_depth: args.maxDepth,
     tile_refinement: args.tileRefinement,
     leaf_limit: args.leafLimit,
     color_space: args.colorSpace,
     memory_budget_gb: args.memoryBudget,
-    memory_budget_plan: serializeMemoryBudgetPlan(resolvedMemoryPlan),
-    build_concurrency: resolvedMemoryPlan.buildConcurrency,
-    content_workers: resolvedMemoryPlan.contentWorkers,
-    partition_write_concurrency: resolvedMemoryPlan.partitionWriteConcurrency,
-    timings_ms: timingsMs,
-    peak_rss_bytes:
-      Number.isFinite(peakRssBytes) && peakRssBytes > 0
-        ? Math.floor(peakRssBytes)
-        : null,
     sampling_rate_per_level: args.samplingRatePerLevel,
     tiling_strategy: TILING_STRATEGY_KD_TREE,
-    kd_tree_split_direction: kdTreeSplitDirectionForArgs(args),
-    kd_tree_covariance_weighting: KD_TREE_COVARIANCE_WEIGHTING,
-    kd_tree_split_plane: KD_TREE_SPLIT_PLANE,
-    kd_tree_split_balance: kdTreeSplitBalanceForArgs(args),
-    kd_tree_split_objective: KD_TREE_SPLIT_OBJECTIVE,
-    kd_tree_split_range_midpoint_weight:
-      ADAPTIVE_SPLIT_RANGE_MIDPOINT_SCORE_WEIGHT,
-    kd_tree_split_connection_strength_weight:
-      ADAPTIVE_SPLIT_CONNECTION_SCORE_WEIGHT,
     oriented_bounding_boxes: useOrientedBoundingBoxes(args),
-    tile_bounding_volume_mode: tileBoundingVolumeModeForArgs(args),
-    split_weight_formula: SPLIT_WEIGHT_FORMULA,
-    kd_tree_split_histogram_bins: ADAPTIVE_SPLIT_HISTOGRAM_BINS,
-    kd_tree_split_axis_competition_aspect_ratio:
-      KD_TREE_AXIS_COMPETITION_ASPECT_RATIO,
-    kd_tree_split_axis_competition_score_bias:
-      KD_TREE_AXIS_COMPETITION_SCORE_BIAS,
-    kd_tree_max_long_width_ratio: ADAPTIVE_MAX_LONG_WIDTH_RATIO,
-    kd_tree_long_tile_split_mode: LONG_TILE_SPLIT_MODE,
-    kd_tree_long_tile_split_virtual: true,
-    kd_tree_volume_rebalance_rule: ADAPTIVE_VOLUME_REBALANCE_RULE,
-    kd_tree_lod_median_volume_ratio: ADAPTIVE_MAX_CHILD_VOLUME_RATIO,
-    kd_tree_child_volume_rebalance_virtual: true,
     content_codec: 'spz_stream',
     spz_version: SPZ_STREAM_VERSION,
     spz_sh1_bits: args.spzSh1Bits,
@@ -7383,26 +7454,46 @@ function makeBuildSummary(
       args.minGeometricError != null && args.minGeometricError > 0.0
         ? args.minGeometricError
         : null,
-    node_count: nodeCount,
-    partition_node_count: partitionNodeCount,
-    virtual_node_count: virtualNodeCount,
-    available_levels: availableLevels,
-    effective_max_depth: effectiveMaxDepth,
-    physical_levels: physicalLevels,
-    physical_max_level: physicalMaxLevel,
-    root_geometric_error_source: rootGeometricErrorSource,
-    root_geometric_error: rootNode.error,
-    min_geometric_error:
-      rootGeometricError *
-      geometricErrorScaleForDepth(
-        effectiveMaxDepth,
-        effectiveMaxDepth,
-        args.samplingRatePerLevel,
-      ),
-    geometric_error_scale_by_depth: geometricErrorScaleByDepth,
-    geometric_error_by_depth: geometricErrorByDepth,
-    sampling_rates_by_depth: samplingRatesByDepth,
-    sampling_divisors_by_depth: samplingDivisorsByDepth,
+    diagnostics: {
+      checkpoint: {
+        reused: !!checkpointInfo.reused,
+        stage: checkpointInfo.stage,
+      },
+      memory_budget_plan: serializeMemoryBudgetPlan(resolvedMemoryPlan),
+      concurrency: {
+        build: resolvedMemoryPlan.buildConcurrency,
+        content_workers: resolvedMemoryPlan.contentWorkers,
+        partition_write: resolvedMemoryPlan.partitionWriteConcurrency,
+      },
+      timings_ms: timingsMs,
+      peak_rss_bytes: peakRss,
+      tree: {
+        node_count: nodeCount,
+        partition_node_count: partitionNodeCount,
+        virtual_node_count: virtualNodeCount,
+        available_levels: availableLevels,
+        effective_max_depth: effectiveMaxDepth,
+        physical_levels: physicalLevels,
+        physical_max_level: physicalMaxLevel,
+      },
+      geometric_error: {
+        source: rootGeometricErrorSource,
+        root: rootNode.error,
+        min:
+          rootGeometricError *
+          geometricErrorScaleForDepth(
+            effectiveMaxDepth,
+            effectiveMaxDepth,
+            args.samplingRatePerLevel,
+          ),
+        scale_by_depth: geometricErrorScaleByDepth,
+        by_depth: geometricErrorByDepth,
+      },
+      sampling: {
+        rates_by_depth: samplingRatesByDepth,
+        divisors_by_depth: samplingDivisorsByDepth,
+      },
+    },
     source: SOURCE_REPOSITORY,
   };
 }
@@ -7566,6 +7657,7 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
             layout,
             {
               chunkBytes: memoryPlan.scanChunkBytes,
+              includeWeights: useOrientedBoundingBoxes(args),
               progress: scanProgress,
             },
           );
@@ -7574,7 +7666,7 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
           scanProgress.done(`ms=${timingsMs.scan_positions_ms}`);
 
           console.log(
-            `[info] scan 2/4 | building ${splitBasisLabelForArgs(args)} weak-connection/range-midpoint k-d tiling tree from memory`,
+            `[info] scan 2/4 | building ${splitBasisLabelForArgs(args)} volume-minimizing k-d tiling tree from memory`,
           );
           const tilingStartedAt = Date.now();
           const tilingProgress = new ConsoleProgressBar(
@@ -7609,6 +7701,7 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
             positionsPath,
             {
               chunkBytes: memoryPlan.scanChunkBytes,
+              includeWeights: useOrientedBoundingBoxes(args),
               positionTmpBufferBytes: memoryPlan.positionTmpBufferBytes,
               progress: scanProgress,
             },
@@ -7617,7 +7710,7 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
           scanProgress.done(`ms=${timingsMs.scan_positions_ms}`);
 
           console.log(
-            `[info] scan 2/4 | building ${splitBasisLabelForArgs(args)} weak-connection/range-midpoint k-d tiling tree from positions`,
+            `[info] scan 2/4 | building ${splitBasisLabelForArgs(args)} volume-minimizing k-d tiling tree from positions`,
           );
           const tilingStartedAt = Date.now();
           rootNodeMeta = await buildAdaptiveNodeTreeFromPositions(

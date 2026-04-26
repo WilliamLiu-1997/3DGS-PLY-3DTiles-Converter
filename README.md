@@ -127,7 +127,7 @@ Use `--help` to print the CLI usage text.
 
 ## Tiling and Performance
 
-The converter always writes explicit 3D Tiles. It builds a weak-connection/range-midpoint k-d tree with AABB bounds and split planes by default: split candidates prefer low visual-density projection gaps while staying close to the longest-axis range midpoint. Long, thin non-root tiles use the same scored projection split once as a virtual split instead of equal-length segment buckets. After each k-d split, current-LOD leaf tiles whose volume is more than 3x the median volume at the same logical depth get one extra virtual split at that same logical LOD. Use `--obb` to enable root-PCA oriented bounding boxes and root-basis split planes.
+The converter always writes explicit 3D Tiles. It builds a volume-aware k-d tree with AABB bounds and split planes by default: each split divides the longest axis into 64 equal segments, tests each internal boundary, and chooses the lowest score from normalized child tile volume sum plus a midpoint-distance penalty. When the longest axis is less than 1.5x the second-longest axis, the second axis is tested in the same pass. Long, thin non-root tiles use the same 64-segment scoring once as a virtual split. After each k-d split, current-LOD leaf tiles whose volume is more than 3x the median volume at the same logical depth get one extra virtual split at that same logical LOD. Use `--obb` to enable root-PCA oriented bounding boxes and root-basis split planes.
 
 Use `--tile-refinement 2` when the first tile level should be finer: the root performs two initial k-d split rounds and emits up to four direct child tiles while keeping those children at logical depth 1. Higher integer values continue the same pattern.
 
