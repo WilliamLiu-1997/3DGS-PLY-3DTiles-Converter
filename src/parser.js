@@ -556,6 +556,7 @@ function buildGaussianPlyLayout(
     if (!plan) {
       plan = { kind: PLY_KIND_SKIP, typeInfo };
     }
+    plan.name = name;
     plan.floatOffset = floatOffset;
     if (plan.kind === PLY_KIND_POSITION) {
       binaryPositionProps[plan.index] = {
@@ -569,7 +570,7 @@ function buildGaussianPlyLayout(
   }
   ensure(sourceRecordSize > 0, `PLY vertex record is empty in ${filePath}.`);
 
-  return {
+  const layout = {
     inputConvention,
     linearScaleInput,
     degree,
@@ -583,6 +584,128 @@ function buildGaussianPlyLayout(
       binaryFloat32Direct && (sourceRecordSize & 3) === 0,
     canonicalFloatCount: canonicalGaussianRowFloatCount(coeffCount),
     canonicalByteSize: canonicalGaussianRowByteSize(coeffCount),
+  };
+  layout.float32DecodePlan = makeFloat32DecodePlan(layout);
+  layout.float32CommonPlan = makeCommonFloat32DecodePlan(layout);
+  return layout;
+}
+
+function makeFloat32DecodePlan(layout) {
+  const directSrc = [];
+  const directDst = [];
+  const positionOffsets = new Int32Array(3);
+  const scaleOffsets = new Int32Array(3);
+  const rotOffsets = new Int32Array(4);
+  positionOffsets.fill(-1);
+  scaleOffsets.fill(-1);
+  rotOffsets.fill(-1);
+  let opacityOffset = -1;
+
+  for (const plan of layout.propertyPlan) {
+    if (plan.kind === PLY_KIND_SKIP) {
+      continue;
+    }
+    if (plan.kind === PLY_KIND_POSITION) {
+      positionOffsets[plan.index] = plan.floatOffset;
+      directSrc.push(plan.floatOffset);
+      directDst.push(plan.index);
+    } else if (plan.kind === PLY_KIND_SH0) {
+      directSrc.push(plan.floatOffset);
+      directDst.push(11 + plan.index);
+    } else if (plan.kind === PLY_KIND_REST) {
+      directSrc.push(plan.floatOffset);
+      directDst.push(11 + plan.index);
+    } else if (plan.kind === PLY_KIND_SCALE) {
+      scaleOffsets[plan.index] = plan.floatOffset;
+    } else if (plan.kind === PLY_KIND_ROT) {
+      rotOffsets[plan.index] = plan.floatOffset;
+    } else if (plan.kind === PLY_KIND_OPACITY) {
+      opacityOffset = plan.floatOffset;
+    }
+  }
+
+  return {
+    directSrc: Int32Array.from(directSrc),
+    directDst: Int32Array.from(directDst),
+    positionOffsets,
+    scaleOffsets,
+    rotOffsets,
+    opacityOffset,
+  };
+}
+
+function makeCommonFloat32DecodePlan(layout) {
+  if (!layout.binaryFloat32Direct) {
+    return null;
+  }
+
+  const offsetsByName = Object.create(null);
+  for (const plan of layout.propertyPlan) {
+    offsetsByName[plan.name] = plan.floatOffset;
+  }
+
+  const required = [
+    'x',
+    'y',
+    'z',
+    'opacity',
+    'f_dc_0',
+    'f_dc_1',
+    'f_dc_2',
+    'scale_0',
+    'scale_1',
+    'scale_2',
+    'rot_0',
+    'rot_1',
+    'rot_2',
+    'rot_3',
+  ];
+  for (const name of required) {
+    if (!Number.isInteger(offsetsByName[name])) {
+      return null;
+    }
+  }
+
+  const extraDim = layout.coeffCount - 1;
+  let restBaseOffset = -1;
+  if (extraDim > 0) {
+    restBaseOffset = offsetsByName.f_rest_0;
+    if (!Number.isInteger(restBaseOffset)) {
+      return null;
+    }
+    const restScalarCount = extraDim * 3;
+    for (let i = 0; i < restScalarCount; i++) {
+      if (offsetsByName[`f_rest_${i}`] !== restBaseOffset + i) {
+        return null;
+      }
+    }
+  }
+
+  return {
+    positionOffsets: Int32Array.from([
+      offsetsByName.x,
+      offsetsByName.y,
+      offsetsByName.z,
+    ]),
+    scaleOffsets: Int32Array.from([
+      offsetsByName.scale_0,
+      offsetsByName.scale_1,
+      offsetsByName.scale_2,
+    ]),
+    rotOffsets: Int32Array.from([
+      offsetsByName.rot_0,
+      offsetsByName.rot_1,
+      offsetsByName.rot_2,
+      offsetsByName.rot_3,
+    ]),
+    sh0Offsets: Int32Array.from([
+      offsetsByName.f_dc_0,
+      offsetsByName.f_dc_1,
+      offsetsByName.f_dc_2,
+    ]),
+    opacityOffset: offsetsByName.opacity,
+    restBaseOffset,
+    extraDim,
   };
 }
 
@@ -722,6 +845,59 @@ function decodeBinaryFloat32GaussianRecordToCanonical(
   layout,
   rowFloats,
 ) {
+  if (layout.float32CommonPlan) {
+    decodeCommonFloat32GaussianRecordToCanonical(
+      sourceFloats,
+      rowFloatOffset,
+      layout,
+      rowFloats,
+    );
+    return;
+  }
+
+  const decodePlan = layout.float32DecodePlan;
+  if (decodePlan) {
+    const directSrc = decodePlan.directSrc;
+    const directDst = decodePlan.directDst;
+    for (let i = 0; i < directSrc.length; i++) {
+      rowFloats[directDst[i]] = sourceFloats[rowFloatOffset + directSrc[i]];
+    }
+
+    const scaleOffsets = decodePlan.scaleOffsets;
+    if (layout.linearScaleInput) {
+      rowFloats[3] = Math.log(
+        Math.max(sourceFloats[rowFloatOffset + scaleOffsets[0]], 1e-8),
+      );
+      rowFloats[4] = Math.log(
+        Math.max(sourceFloats[rowFloatOffset + scaleOffsets[1]], 1e-8),
+      );
+      rowFloats[5] = Math.log(
+        Math.max(sourceFloats[rowFloatOffset + scaleOffsets[2]], 1e-8),
+      );
+    } else {
+      rowFloats[3] = sourceFloats[rowFloatOffset + scaleOffsets[0]];
+      rowFloats[4] = sourceFloats[rowFloatOffset + scaleOffsets[1]];
+      rowFloats[5] = sourceFloats[rowFloatOffset + scaleOffsets[2]];
+    }
+
+    const opacity = sourceFloats[rowFloatOffset + decodePlan.opacityOffset];
+    rowFloats[10] =
+      layout.inputConvention === 'graphdeco'
+        ? sigmoid(opacity)
+        : clamp(opacity, 0.0, 1.0);
+
+    const rotOffsets = decodePlan.rotOffsets;
+    writeNormalizedQuaternionToFloats(
+      rowFloats,
+      layout.inputConvention,
+      sourceFloats[rowFloatOffset + rotOffsets[0]],
+      sourceFloats[rowFloatOffset + rotOffsets[1]],
+      sourceFloats[rowFloatOffset + rotOffsets[2]],
+      sourceFloats[rowFloatOffset + rotOffsets[3]],
+    );
+    return;
+  }
+
   let r0 = 0.0;
   let r1 = 0.0;
   let r2 = 0.0;
@@ -749,6 +925,158 @@ function decodeBinaryFloat32GaussianRecordToCanonical(
     r2,
     r3,
   );
+}
+
+function decodeCommonFloat32GaussianRecordToCanonical(
+  sourceFloats,
+  rowFloatOffset,
+  layout,
+  rowFloats,
+) {
+  const plan = layout.float32CommonPlan;
+  const positionOffsets = plan.positionOffsets;
+  rowFloats[0] = sourceFloats[rowFloatOffset + positionOffsets[0]];
+  rowFloats[1] = sourceFloats[rowFloatOffset + positionOffsets[1]];
+  rowFloats[2] = sourceFloats[rowFloatOffset + positionOffsets[2]];
+
+  const scaleOffsets = plan.scaleOffsets;
+  if (layout.linearScaleInput) {
+    rowFloats[3] = Math.log(
+      Math.max(sourceFloats[rowFloatOffset + scaleOffsets[0]], 1e-8),
+    );
+    rowFloats[4] = Math.log(
+      Math.max(sourceFloats[rowFloatOffset + scaleOffsets[1]], 1e-8),
+    );
+    rowFloats[5] = Math.log(
+      Math.max(sourceFloats[rowFloatOffset + scaleOffsets[2]], 1e-8),
+    );
+  } else {
+    rowFloats[3] = sourceFloats[rowFloatOffset + scaleOffsets[0]];
+    rowFloats[4] = sourceFloats[rowFloatOffset + scaleOffsets[1]];
+    rowFloats[5] = sourceFloats[rowFloatOffset + scaleOffsets[2]];
+  }
+
+  const rotOffsets = plan.rotOffsets;
+  writeNormalizedQuaternionToFloats(
+    rowFloats,
+    layout.inputConvention,
+    sourceFloats[rowFloatOffset + rotOffsets[0]],
+    sourceFloats[rowFloatOffset + rotOffsets[1]],
+    sourceFloats[rowFloatOffset + rotOffsets[2]],
+    sourceFloats[rowFloatOffset + rotOffsets[3]],
+  );
+
+  const opacity = sourceFloats[rowFloatOffset + plan.opacityOffset];
+  rowFloats[10] =
+    layout.inputConvention === 'graphdeco'
+      ? sigmoid(opacity)
+      : clamp(opacity, 0.0, 1.0);
+
+  const sh0Offsets = plan.sh0Offsets;
+  rowFloats[11] = sourceFloats[rowFloatOffset + sh0Offsets[0]];
+  rowFloats[12] = sourceFloats[rowFloatOffset + sh0Offsets[1]];
+  rowFloats[13] = sourceFloats[rowFloatOffset + sh0Offsets[2]];
+
+  const extraDim = plan.extraDim;
+  if (extraDim <= 0) {
+    return;
+  }
+  const restBase = rowFloatOffset + plan.restBaseOffset;
+  for (let channel = 0; channel < 3; channel++) {
+    const srcBase = restBase + channel * extraDim;
+    for (let coeff = 0; coeff < extraDim; coeff++) {
+      rowFloats[11 + 3 * (1 + coeff) + channel] =
+        sourceFloats[srcBase + coeff];
+    }
+  }
+}
+
+function decodeBinaryFloat32GaussianRecordToCore(
+  sourceFloats,
+  rowFloatOffset,
+  layout,
+  coreFloats,
+) {
+  const plan = layout.float32CommonPlan || layout.float32DecodePlan;
+  const positionOffsets = plan.positionOffsets;
+  coreFloats[0] = sourceFloats[rowFloatOffset + positionOffsets[0]];
+  coreFloats[1] = sourceFloats[rowFloatOffset + positionOffsets[1]];
+  coreFloats[2] = sourceFloats[rowFloatOffset + positionOffsets[2]];
+
+  const scaleOffsets = plan.scaleOffsets;
+  if (layout.linearScaleInput) {
+    coreFloats[3] = Math.log(
+      Math.max(sourceFloats[rowFloatOffset + scaleOffsets[0]], 1e-8),
+    );
+    coreFloats[4] = Math.log(
+      Math.max(sourceFloats[rowFloatOffset + scaleOffsets[1]], 1e-8),
+    );
+    coreFloats[5] = Math.log(
+      Math.max(sourceFloats[rowFloatOffset + scaleOffsets[2]], 1e-8),
+    );
+  } else {
+    coreFloats[3] = sourceFloats[rowFloatOffset + scaleOffsets[0]];
+    coreFloats[4] = sourceFloats[rowFloatOffset + scaleOffsets[1]];
+    coreFloats[5] = sourceFloats[rowFloatOffset + scaleOffsets[2]];
+  }
+
+  const rotOffsets = plan.rotOffsets;
+  writeNormalizedQuaternionToFloats(
+    coreFloats,
+    layout.inputConvention,
+    sourceFloats[rowFloatOffset + rotOffsets[0]],
+    sourceFloats[rowFloatOffset + rotOffsets[1]],
+    sourceFloats[rowFloatOffset + rotOffsets[2]],
+    sourceFloats[rowFloatOffset + rotOffsets[3]],
+  );
+
+  const opacity = sourceFloats[rowFloatOffset + plan.opacityOffset];
+  coreFloats[10] =
+    layout.inputConvention === 'graphdeco'
+      ? sigmoid(opacity)
+      : clamp(opacity, 0.0, 1.0);
+}
+
+function decodeBinaryGaussianRecordToCore(sourceView, offset, layout, coreFloats) {
+  let r0 = 0.0;
+  let r1 = 0.0;
+  let r2 = 0.0;
+  let r3 = 1.0;
+  for (let p = 0; p < layout.propertyPlan.length; p++) {
+    const plan = layout.propertyPlan[p];
+    if (plan.kind === PLY_KIND_SKIP || plan.kind === PLY_KIND_SH0 || plan.kind === PLY_KIND_REST) {
+      offset += plan.typeInfo.size;
+      continue;
+    }
+    const value = readPlyScalar(sourceView, offset, plan.typeInfo);
+    offset += plan.typeInfo.size;
+    if (plan.kind === PLY_KIND_POSITION) {
+      coreFloats[plan.index] = value;
+    } else if (plan.kind === PLY_KIND_SCALE) {
+      coreFloats[3 + plan.index] = layout.linearScaleInput
+        ? Math.log(Math.max(value, 1e-8))
+        : value;
+    } else if (plan.kind === PLY_KIND_OPACITY) {
+      coreFloats[10] =
+        layout.inputConvention === 'graphdeco'
+          ? sigmoid(value)
+          : clamp(value, 0.0, 1.0);
+    } else if (plan.kind === PLY_KIND_ROT) {
+      if (plan.index === 0) r0 = value;
+      else if (plan.index === 1) r1 = value;
+      else if (plan.index === 2) r2 = value;
+      else r3 = value;
+    }
+  }
+  writeNormalizedQuaternionToFloats(
+    coreFloats,
+    layout.inputConvention,
+    r0,
+    r1,
+    r2,
+    r3,
+  );
+  return offset;
 }
 
 async function forEachBinaryGaussianPlyPosition(
@@ -974,6 +1302,102 @@ async function forEachBinaryGaussianPlyCanonicalRecord(
   }
 }
 
+async function forEachBinaryGaussianPlyCoreRecord(
+  handle,
+  filePath,
+  header,
+  layout,
+  onRecord,
+  options = {},
+) {
+  const rowsPerChunk = Math.max(
+    1,
+    Math.floor(streamChunkBytesFromOptions(options) / layout.sourceRecordSize),
+  );
+  const chunkBytes = rowsPerChunk * layout.sourceRecordSize;
+  const chunks = [Buffer.allocUnsafe(chunkBytes), Buffer.allocUnsafe(chunkBytes)];
+  const coreFloats = new Float32Array(11);
+  const canUseFastPath =
+    layout.binaryFloat32Direct &&
+    IS_LITTLE_ENDIAN &&
+    chunks.every((chunk) => (chunk.byteOffset & 3) === 0);
+  const floatsPerRow = layout.sourceRecordSize >>> 2;
+  let nextRowBase = 0;
+  let nextFileOffset = header.dataOffset;
+  let nextChunkIndex = 0;
+
+  const readNextChunk = () => {
+    if (nextRowBase >= header.vertexCount) {
+      return null;
+    }
+    const rowBase = nextRowBase;
+    const rowCount = Math.min(rowsPerChunk, header.vertexCount - rowBase);
+    const byteCount = rowCount * layout.sourceRecordSize;
+    const fileOffset = nextFileOffset;
+    const chunk = chunks[nextChunkIndex];
+    nextRowBase += rowCount;
+    nextFileOffset += byteCount;
+    nextChunkIndex = 1 - nextChunkIndex;
+    return readExact(
+      handle,
+      chunk,
+      byteCount,
+      fileOffset,
+      `Binary PLY payload ended early in ${filePath}.`,
+    ).then(() => ({ chunk, rowBase, rowCount, byteCount }));
+  };
+
+  let chunkPromise = readNextChunk();
+  while (chunkPromise) {
+    const { chunk, rowBase, rowCount, byteCount } = await chunkPromise;
+    const nextChunkPromise = readNextChunk();
+    try {
+      if (canUseFastPath) {
+        const sourceFloats = new Float32Array(
+          chunk.buffer,
+          chunk.byteOffset,
+          byteCount >>> 2,
+        );
+        for (let i = 0; i < rowCount; i++) {
+          decodeBinaryFloat32GaussianRecordToCore(
+            sourceFloats,
+            i * floatsPerRow,
+            layout,
+            coreFloats,
+          );
+          const maybePromise = onRecord(rowBase + i, coreFloats);
+          if (maybePromise && typeof maybePromise.then === 'function') {
+            await maybePromise;
+          }
+        }
+      } else {
+        const view = new DataView(chunk.buffer, chunk.byteOffset, byteCount);
+        let offset = 0;
+        for (let i = 0; i < rowCount; i++) {
+          offset = decodeBinaryGaussianRecordToCore(
+            view,
+            offset,
+            layout,
+            coreFloats,
+          );
+          const maybePromise = onRecord(rowBase + i, coreFloats);
+          if (maybePromise && typeof maybePromise.then === 'function') {
+            await maybePromise;
+          }
+        }
+      }
+    } catch (err) {
+      if (nextChunkPromise) {
+        try {
+          await nextChunkPromise;
+        } catch {}
+      }
+      throw err;
+    }
+    chunkPromise = nextChunkPromise;
+  }
+}
+
 async function forEachAsciiGaussianPlyPosition(
   handle,
   filePath,
@@ -1157,6 +1581,120 @@ async function forEachAsciiGaussianPlyCanonicalRecord(
   );
 }
 
+async function forEachAsciiGaussianPlyCoreRecord(
+  handle,
+  filePath,
+  header,
+  layout,
+  onRecord,
+  options = {},
+) {
+  const expected = header.vertexCount * layout.fieldCount;
+  const chunk = Buffer.allocUnsafe(streamChunkBytesFromOptions(options));
+  const coreFloats = new Float32Array(11);
+  let fileOffset = header.dataOffset;
+  let tokenCarry = '';
+  let rowIndex = 0;
+  let propIndex = 0;
+  let count = 0;
+  let r0 = 0.0;
+  let r1 = 0.0;
+  let r2 = 0.0;
+  let r3 = 1.0;
+
+  const processToken = (token) => {
+    if (rowIndex >= header.vertexCount) {
+      return null;
+    }
+    const plan = layout.propertyPlan[propIndex];
+    if (
+      plan.kind !== PLY_KIND_SKIP &&
+      plan.kind !== PLY_KIND_SH0 &&
+      plan.kind !== PLY_KIND_REST
+    ) {
+      const value = Number.parseFloat(token);
+      if (plan.kind === PLY_KIND_POSITION) {
+        coreFloats[plan.index] = value;
+      } else if (plan.kind === PLY_KIND_SCALE) {
+        coreFloats[3 + plan.index] = layout.linearScaleInput
+          ? Math.log(Math.max(value, 1e-8))
+          : value;
+      } else if (plan.kind === PLY_KIND_OPACITY) {
+        coreFloats[10] =
+          layout.inputConvention === 'graphdeco'
+            ? sigmoid(value)
+            : clamp(value, 0.0, 1.0);
+      } else if (plan.kind === PLY_KIND_ROT) {
+        if (plan.index === 0) r0 = value;
+        else if (plan.index === 1) r1 = value;
+        else if (plan.index === 2) r2 = value;
+        else r3 = value;
+      }
+    }
+    propIndex += 1;
+    count += 1;
+    if (propIndex === layout.fieldCount) {
+      writeNormalizedQuaternionToFloats(
+        coreFloats,
+        layout.inputConvention,
+        r0,
+        r1,
+        r2,
+        r3,
+      );
+      const maybePromise = onRecord(rowIndex, coreFloats);
+      rowIndex += 1;
+      propIndex = 0;
+      r0 = 0.0;
+      r1 = 0.0;
+      r2 = 0.0;
+      r3 = 1.0;
+      return maybePromise;
+    }
+    return null;
+  };
+
+  while (rowIndex < header.vertexCount) {
+    const { bytesRead } = await handle.read(chunk, 0, chunk.length, fileOffset);
+    if (bytesRead === 0) {
+      break;
+    }
+    fileOffset += bytesRead;
+
+    const text = tokenCarry + chunk.toString('ascii', 0, bytesRead);
+    let tokenStart = -1;
+    for (let i = 0; i < text.length && rowIndex < header.vertexCount; i++) {
+      if (text.charCodeAt(i) > 0x20) {
+        if (tokenStart < 0) {
+          tokenStart = i;
+        }
+      } else if (tokenStart >= 0) {
+        const maybePromise = processToken(text.slice(tokenStart, i));
+        if (maybePromise && typeof maybePromise.then === 'function') {
+          await maybePromise;
+        }
+        tokenStart = -1;
+      }
+    }
+    tokenCarry =
+      tokenStart >= 0 && rowIndex < header.vertexCount
+        ? text.slice(tokenStart)
+        : '';
+  }
+
+  if (rowIndex < header.vertexCount && tokenCarry) {
+    const maybePromise = processToken(tokenCarry);
+    if (maybePromise && typeof maybePromise.then === 'function') {
+      await maybePromise;
+    }
+  }
+
+  ensure(
+    count >= expected && rowIndex === header.vertexCount && propIndex === 0,
+    `ASCII PLY rows mismatch. Expected at least ${expected} values, got ${count}.`,
+  );
+}
+
 async function forEachGaussianPlyPosition(
   handle,
   filePath,
@@ -1206,6 +1744,35 @@ async function forEachGaussianPlyCanonicalRecord(
     return;
   }
   await forEachAsciiGaussianPlyCanonicalRecord(
+    handle,
+    filePath,
+    header,
+    layout,
+    onRecord,
+    options,
+  );
+}
+
+async function forEachGaussianPlyCoreRecord(
+  handle,
+  filePath,
+  header,
+  layout,
+  onRecord,
+  options = {},
+) {
+  if (header.format === 'binary_little_endian') {
+    await forEachBinaryGaussianPlyCoreRecord(
+      handle,
+      filePath,
+      header,
+      layout,
+      onRecord,
+      options,
+    );
+    return;
+  }
+  await forEachAsciiGaussianPlyCoreRecord(
     handle,
     filePath,
     header,
@@ -1478,5 +2045,6 @@ module.exports = {
   _readPlyHeaderFromHandle: readPlyHeaderFromHandle,
   _buildGaussianPlyLayout: buildGaussianPlyLayout,
   _forEachGaussianPlyPosition: forEachGaussianPlyPosition,
+  _forEachGaussianPlyCoreRecord: forEachGaussianPlyCoreRecord,
   _forEachGaussianPlyCanonicalRecord: forEachGaussianPlyCanonicalRecord,
 };

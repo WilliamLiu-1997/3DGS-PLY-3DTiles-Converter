@@ -1,5 +1,4 @@
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 
 const {
@@ -12,6 +11,8 @@ const {
   _canonicalGaussianRowByteSize,
   _readPlyHeaderFromHandle,
   _buildGaussianPlyLayout,
+  _forEachGaussianPlyPosition,
+  _forEachGaussianPlyCoreRecord,
   _forEachGaussianPlyCanonicalRecord,
 } = require('./parser');
 const {
@@ -57,6 +58,21 @@ const {
   rootGeometricErrorFromMinLevel,
   writeThreeSigmaExtentComponents,
 } = require('./builder');
+const {
+  DEFAULT_MEMORY_BUDGET_BYTES,
+  MAX_PARTITION_ARENA_BYTES,
+  derivePartitionWriteConcurrency,
+  makeMemoryBudgetPlan,
+  serializeMemoryBudgetPlan,
+} = require('./memory-plan');
+const {
+  fingerprintsMatch,
+  makeEmptyPipelineState,
+  makePipelineFingerprint,
+  pathExists,
+  readPipelineState,
+  removeFileIfExists,
+} = require('./pipeline-state');
 
 const DEFAULT_WORKER_SCRIPT = path.join(__dirname, 'convert-core.js');
 const TEMP_WORKSPACE_NAME = '.tmp-ply-partitions';
@@ -105,22 +121,6 @@ const GAUSSIAN_SPLATTING_GLTF_EXTENSIONS = [
   'KHR_gaussian_splatting',
   'KHR_gaussian_splatting_compression_spz_2',
 ];
-const BYTES_PER_GB = 1024 * 1024 * 1024;
-const BYTES_PER_MB = 1024 * 1024;
-const DEFAULT_MEMORY_BUDGET_BYTES = 2 * BYTES_PER_GB;
-const RUNTIME_RESERVE_FRACTION = 0.25;
-const RUNTIME_RESERVE_MAX_BYTES = 512 * BYTES_PER_MB;
-const DERIVED_CONCURRENCY_BYTES = 128 * 1024 * 1024;
-const PARTITION_WRITE_CONCURRENCY_BYTES = 16 * 1024 * 1024;
-const MAX_DERIVED_CONCURRENCY = 64;
-const MAX_PARTITION_WRITE_CONCURRENCY = 256;
-const MIN_STREAM_CHUNK_BYTES = 1 * BYTES_PER_MB;
-const MAX_STREAM_CHUNK_BYTES = 64 * BYTES_PER_MB;
-const MAX_PARTITION_ARENA_BYTES = 512 * BYTES_PER_MB;
-const MAX_SIMPLIFY_SCRATCH_BYTES = 512 * BYTES_PER_MB;
-const MAX_BUCKET_ENTRY_CACHE_BYTES = 512 * BYTES_PER_MB;
-const MAX_DERIVED_WORKERS = 8;
-
 function makeTilesetAsset() {
   return {
     version: '1.1',
@@ -144,200 +144,6 @@ function applyTilesetGltfContentExtensions(tileset) {
   }
   tileset.extensionsUsed = extensionsUsed;
   return tileset;
-}
-
-function memoryBudgetBytesFromArgs(args) {
-  const budgetGb =
-    args && Number.isFinite(args.memoryBudget)
-      ? args.memoryBudget
-      : DEFAULT_MEMORY_BUDGET_BYTES / BYTES_PER_GB;
-  return Math.max(1, Math.floor(budgetGb * BYTES_PER_GB));
-}
-
-function clampInteger(value, min, max) {
-  return Math.max(min, Math.min(max, Math.floor(value)));
-}
-
-function availableWorkerLimit() {
-  const detected =
-    typeof os.availableParallelism === 'function'
-      ? os.availableParallelism()
-      : os.cpus().length;
-  return Math.max(1, Math.min(MAX_DERIVED_WORKERS, detected || 1));
-}
-
-function deriveWorkerCount(memoryBudgetBytes) {
-  return Math.max(
-    1,
-    Math.min(
-      MAX_DERIVED_CONCURRENCY,
-      availableWorkerLimit(),
-      Math.floor(memoryBudgetBytes / DERIVED_CONCURRENCY_BYTES),
-    ),
-  );
-}
-
-function deriveBuildConcurrency(memoryBudgetBytes) {
-  return deriveWorkerCount(memoryBudgetBytes);
-}
-
-function deriveContentWorkerCount(memoryBudgetBytes) {
-  return deriveWorkerCount(memoryBudgetBytes);
-}
-
-function derivePartitionWriteConcurrency(memoryBudgetBytes) {
-  return Math.max(
-    1,
-    Math.min(
-      MAX_PARTITION_WRITE_CONCURRENCY,
-      Math.floor(memoryBudgetBytes / PARTITION_WRITE_CONCURRENCY_BYTES),
-    ),
-  );
-}
-
-function makeMemoryBudgetPlan(args, { header = null, layout = null } = {}) {
-  const budgetBytes = memoryBudgetBytesFromArgs(args);
-  const includePositionWeights = !!(
-    args && args.orientedBoundingBoxes === true
-  );
-  const runtimeReserveBytes = Math.min(
-    Math.floor(budgetBytes * RUNTIME_RESERVE_FRACTION),
-    RUNTIME_RESERVE_MAX_BYTES,
-  );
-  const usableBudgetBytes = Math.max(1, budgetBytes - runtimeReserveBytes);
-  const buildConcurrency = deriveBuildConcurrency(usableBudgetBytes);
-  const contentWorkers = deriveContentWorkerCount(usableBudgetBytes);
-  const partitionWriteConcurrency = Math.min(
-    derivePartitionWriteConcurrency(usableBudgetBytes),
-    Math.max(1, contentWorkers * 8),
-  );
-  const streamChunkMax = Math.max(
-    1,
-    Math.min(MAX_STREAM_CHUNK_BYTES, Math.floor(usableBudgetBytes / 4)),
-  );
-  const streamChunkBytes = clampInteger(
-    usableBudgetBytes / 64,
-    Math.min(MIN_STREAM_CHUNK_BYTES, streamChunkMax),
-    streamChunkMax,
-  );
-  const bucketChunkBytes = streamChunkBytes;
-  const rowByteSize = layout ? layout.canonicalByteSize : null;
-  const partitionArenaBytes =
-    rowByteSize == null
-      ? null
-      : Math.max(
-          rowByteSize,
-          Math.min(
-            MAX_PARTITION_ARENA_BYTES,
-            Math.floor(usableBudgetBytes / (PARTITION_ARENA_COUNT * 2)),
-          ),
-        );
-  const positionFloatCount = header
-    ? header.vertexCount * (includePositionWeights ? 4 : 3)
-    : null;
-  const positionBytes =
-    positionFloatCount == null
-      ? null
-      : positionFloatCount * Float32Array.BYTES_PER_ELEMENT;
-  const positionIndexBytes = header
-    ? header.vertexCount * POSITION_INDEX_ROW_BYTE_SIZE
-    : null;
-  const positionTilingBytes =
-    positionBytes == null || positionIndexBytes == null
-      ? null
-      : positionBytes + positionIndexBytes;
-  const positionScanBytes =
-    positionBytes == null ? null : positionBytes + streamChunkBytes;
-  const positionMemoryPeakBytes =
-    positionTilingBytes == null || positionScanBytes == null
-      ? null
-      : Math.max(positionTilingBytes, positionScanBytes);
-  const positionTmpBufferMax = Math.max(
-    POSITION_ROW_BYTE_SIZE,
-    Math.min(8 * BYTES_PER_MB, Math.floor(usableBudgetBytes / 16)),
-  );
-  const positionTmpBufferBytes = clampInteger(
-    usableBudgetBytes / 1024,
-    Math.min(POSITION_TMP_BUFFER_BYTES, positionTmpBufferMax),
-    positionTmpBufferMax,
-  );
-  const simplifyScratchMax = Math.max(
-    1,
-    Math.min(
-      MAX_SIMPLIFY_SCRATCH_BYTES,
-      Math.floor(usableBudgetBytes / Math.max(1, buildConcurrency)),
-    ),
-  );
-  const simplifyScratchBytes = clampInteger(
-    usableBudgetBytes / Math.max(1, buildConcurrency * 8),
-    Math.min(1 * BYTES_PER_MB, simplifyScratchMax),
-    simplifyScratchMax,
-  );
-  const bucketEntryCacheMax = Math.max(
-    0,
-    Math.min(
-      MAX_BUCKET_ENTRY_CACHE_BYTES,
-      Math.floor(usableBudgetBytes / Math.max(1, buildConcurrency * 2)),
-    ),
-  );
-  const bucketEntryCacheBytes = clampInteger(
-    usableBudgetBytes / Math.max(1, buildConcurrency * 4),
-    0,
-    bucketEntryCacheMax,
-  );
-
-  return {
-    budgetBytes,
-    runtimeReserveBytes,
-    usableBudgetBytes,
-    buildConcurrency,
-    contentWorkers,
-    partitionWriteConcurrency,
-    scanChunkBytes: streamChunkBytes,
-    bucketChunkBytes,
-    positionBytes,
-    positionIndexBytes,
-    positionTilingBytes,
-    positionScanBytes,
-    positionMemoryPeakBytes,
-    inMemoryPositions:
-      positionMemoryPeakBytes == null
-        ? null
-        : positionMemoryPeakBytes <= usableBudgetBytes &&
-          positionFloatCount <= 0x7fffffff,
-    positionTmpBufferBytes,
-    partitionArenaBytes,
-    simplifyScratchBytes,
-    bucketEntryCacheBytes,
-  };
-}
-
-function serializeMemoryBudgetPlan(plan) {
-  if (!plan) {
-    return null;
-  }
-  return {
-    budget_bytes: plan.budgetBytes,
-    runtime_reserve_bytes: plan.runtimeReserveBytes,
-    usable_budget_bytes: plan.usableBudgetBytes,
-    scan_chunk_bytes: plan.scanChunkBytes,
-    bucket_chunk_bytes: plan.bucketChunkBytes,
-    partition_arena_bytes: plan.partitionArenaBytes,
-    in_memory_positions: plan.inMemoryPositions,
-    position_bytes: plan.positionBytes,
-    position_index_bytes: plan.positionIndexBytes,
-    position_tiling_bytes: plan.positionTilingBytes,
-    position_scan_bytes: plan.positionScanBytes,
-    position_memory_peak_bytes: plan.positionMemoryPeakBytes,
-    position_tmp_buffer_bytes: plan.positionTmpBufferBytes,
-    simplify_scratch_bytes: plan.simplifyScratchBytes,
-    bucket_entry_cache_bytes: plan.bucketEntryCacheBytes,
-    build_concurrency: plan.buildConcurrency,
-    build_worker_limit: availableWorkerLimit(),
-    content_workers: plan.contentWorkers,
-    content_worker_limit: availableWorkerLimit(),
-    partition_write_concurrency: plan.partitionWriteConcurrency,
-  };
 }
 
 function currentPeakRssBytes() {
@@ -461,18 +267,6 @@ function contentRelPath(level, x, y, z) {
   return `tiles/${level}/${x}/${y}/${z}.glb`;
 }
 
-async function pathExists(targetPath) {
-  if (!targetPath) {
-    return false;
-  }
-  try {
-    await fs.promises.access(targetPath);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function serializeBoundsState(bounds) {
   if (!bounds) {
     return null;
@@ -555,6 +349,21 @@ function pruneNodeBuildState(node) {
   const build = existingNodeBuildState(node);
   if (build && Object.keys(build).length === 0) {
     delete node._build;
+  }
+}
+
+function clearNodeBuildStateField(node, field) {
+  const build = existingNodeBuildState(node);
+  if (!build) {
+    return;
+  }
+  delete build[field];
+  pruneNodeBuildState(node);
+}
+
+function clearStatsNodeBuildStateField(statsList, field) {
+  for (const stats of statsList) {
+    clearNodeBuildStateField(stats.node, field);
   }
 }
 
@@ -798,76 +607,6 @@ function resetNodeArtifacts(node) {
   }
   for (const child of node.children) {
     resetNodeArtifacts(child);
-  }
-}
-
-function makePipelineFingerprint(
-  inputPath,
-  inputStat,
-  args,
-  sourceCoordinateSystem,
-) {
-  return {
-    inputPath: path.resolve(inputPath),
-    inputSize: inputStat.size,
-    inputMtimeMs: inputStat.mtimeMs,
-    inputConvention: args.inputConvention,
-    linearScaleInput: args.linearScaleInput,
-    sourceCoordinateSystem:
-      sourceCoordinateSystem || DEFAULT_SOURCE_COORDINATE_SYSTEM,
-    maxDepth: args.maxDepth,
-    tileRefinement: args.tileRefinement,
-    leafLimit: args.leafLimit,
-    orientedBoundingBoxes: useOrientedBoundingBoxes(args),
-    samplingRatePerLevel: args.samplingRatePerLevel,
-    sampleMode: args.sampleMode,
-    minGeometricError: args.minGeometricError,
-    colorSpace: args.colorSpace,
-    spzSh1Bits: args.spzSh1Bits,
-    spzShRestBits: args.spzShRestBits,
-    spzCompressionLevel: args.spzCompressionLevel,
-  };
-}
-
-function fingerprintsMatch(lhs, rhs) {
-  return JSON.stringify(lhs) === JSON.stringify(rhs);
-}
-
-function makeEmptyPipelineState(fingerprint) {
-  return {
-    version: PIPELINE_STATE_VERSION,
-    fingerprint,
-    stage: 'init',
-    rootBounds: null,
-    layout: null,
-    rootNode: null,
-    updatedAt: null,
-  };
-}
-
-async function readPipelineState(tempDir) {
-  const statePath = path.join(tempDir, PIPELINE_STATE_FILE);
-  if (!(await pathExists(statePath))) {
-    return null;
-  }
-  const text = await fs.promises.readFile(statePath, 'utf8');
-  const state = JSON.parse(text);
-  if (state && state.stage === 'partitioned') {
-    state.stage = PIPELINE_STAGE_BUCKETED;
-  }
-  return state;
-}
-
-async function removeFileIfExists(filePath) {
-  if (!filePath) {
-    return;
-  }
-  try {
-    await fs.promises.unlink(filePath);
-  } catch (err) {
-    if (!err || err.code !== 'ENOENT') {
-      throw err;
-    }
   }
 }
 
@@ -1262,15 +1001,13 @@ async function writeArenaRunsToHandle(handle, filePath, sourceBuffer, entry) {
     return;
   }
 
-  const compacted = Buffer.allocUnsafe(entry.byteLength);
-  let writeOffset = 0;
+  const chunks = [];
   for (let i = 0; i < entry.runs.length; i += 2) {
     const start = entry.runs[i];
     const byteLength = entry.runs[i + 1];
-    sourceBuffer.copy(compacted, writeOffset, start, start + byteLength);
-    writeOffset += byteLength;
+    chunks.push(sourceBuffer.subarray(start, start + byteLength));
   }
-  await writeBufferToHandle(handle, compacted, compacted.length, filePath);
+  await writeChunksToHandle(handle, filePath, chunks);
 }
 
 async function partitionLeafBuckets(
@@ -1300,7 +1037,7 @@ async function partitionLeafBuckets(
       : memoryPlan
         ? memoryPlan.partitionWriteConcurrency
         : derivePartitionWriteConcurrency(memoryBudgetBytes);
-  // Budget two read arenas plus two worst-case compaction buffers during flush.
+  // Budget two read arenas; non-contiguous leaf runs are written with writev.
   const arenaByteSize =
     memoryPlan && memoryPlan.partitionArenaBytes != null
       ? memoryPlan.partitionArenaBytes
@@ -1606,9 +1343,15 @@ async function collectBucketEntries(fileSpecs, coeffCount) {
   return { entries, totalRows };
 }
 
-async function forEachBucketSpecRow(fileSpec, coeffCount, onRow, options = {}) {
+async function forEachBucketSpecChunk(
+  fileSpec,
+  coeffCount,
+  rowBase,
+  onChunk,
+  options = {},
+) {
   if (!fileSpec || !fileSpec.filePath) {
-    return;
+    return rowBase;
   }
   const rowByteSize = bucketRowByteSize(fileSpec.encoding, coeffCount);
   ensure(
@@ -1617,7 +1360,7 @@ async function forEachBucketSpecRow(fileSpec, coeffCount, onRow, options = {}) {
   );
   const totalBytes = fileSpec.rowCount * rowByteSize;
   if (totalBytes === 0) {
-    return;
+    return rowBase;
   }
 
   if (Buffer.isBuffer(fileSpec.buffer)) {
@@ -1638,20 +1381,21 @@ async function forEachBucketSpecRow(fileSpec, coeffCount, onRow, options = {}) {
             totalBytes >>> 2,
           )
         : null;
-    for (let offset = 0; offset < totalBytes; offset += rowByteSize) {
-      const maybePromise = onRow(
-        view,
-        offset,
-        fileSpec.encoding,
-        fileSpec.filePath,
-        floatView,
-        floatView ? offset >>> 2 : 0,
-      );
-      if (maybePromise && typeof maybePromise.then === 'function') {
-        await maybePromise;
-      }
+    const maybePromise = onChunk({
+      view,
+      byteOffset: 0,
+      rowBase,
+      rowCount: fileSpec.rowCount,
+      rowByteSize,
+      encoding: fileSpec.encoding,
+      filePath: fileSpec.filePath,
+      floatView,
+      floatBase: 0,
+    });
+    if (maybePromise && typeof maybePromise.then === 'function') {
+      await maybePromise;
     }
-    return;
+    return rowBase + fileSpec.rowCount;
   }
 
   const targetChunkBytes =
@@ -1664,6 +1408,7 @@ async function forEachBucketSpecRow(fileSpec, coeffCount, onRow, options = {}) {
   const handle = await fs.promises.open(fileSpec.filePath, 'r');
   try {
     let fileOffset = 0;
+    let fileRowBase = rowBase;
     while (fileOffset < totalBytes) {
       const expectedBytes = Math.min(chunkBytes, totalBytes - fileOffset);
       const { bytesRead } = await handle.read(
@@ -1683,23 +1428,76 @@ async function forEachBucketSpecRow(fileSpec, coeffCount, onRow, options = {}) {
         IS_LITTLE_ENDIAN && (chunk.byteOffset & 3) === 0
           ? new Float32Array(chunk.buffer, chunk.byteOffset, bytesRead >>> 2)
           : null;
-      for (let offset = 0; offset < bytesRead; offset += rowByteSize) {
+      const rowCount = bytesRead / rowByteSize;
+      const maybePromise = onChunk({
+        view,
+        byteOffset: 0,
+        rowBase: fileRowBase,
+        rowCount,
+        rowByteSize,
+        encoding: fileSpec.encoding,
+        filePath: fileSpec.filePath,
+        floatView,
+        floatBase: 0,
+      });
+      if (maybePromise && typeof maybePromise.then === 'function') {
+        await maybePromise;
+      }
+      fileRowBase += rowCount;
+    }
+    return fileRowBase;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function forEachBucketChunk(entries, coeffCount, onChunk, options = {}) {
+  let rowBase = 0;
+  for (const entry of entries) {
+    rowBase = await forEachBucketSpecChunk(
+      entry,
+      coeffCount,
+      rowBase,
+      onChunk,
+      options,
+    );
+  }
+}
+
+async function forEachBucketSpecRow(fileSpec, coeffCount, onRow, options = {}) {
+  await forEachBucketSpecChunk(
+    fileSpec,
+    coeffCount,
+    0,
+    async (chunk) => {
+      const {
+        view,
+        byteOffset,
+        rowCount,
+        rowByteSize,
+        encoding,
+        filePath,
+        floatView,
+        floatBase,
+      } = chunk;
+      const floatsPerRow = rowByteSize >>> 2;
+      for (let row = 0; row < rowCount; row++) {
+        const offset = byteOffset + row * rowByteSize;
         const maybePromise = onRow(
           view,
           offset,
-          fileSpec.encoding,
-          fileSpec.filePath,
+          encoding,
+          filePath,
           floatView,
-          floatView ? offset >>> 2 : 0,
+          floatView ? floatBase + row * floatsPerRow : 0,
         );
         if (maybePromise && typeof maybePromise.then === 'function') {
           await maybePromise;
         }
       }
-    }
-  } finally {
-    await handle.close();
-  }
+    },
+    options,
+  );
 }
 
 async function forEachBucketEntryRow(entries, coeffCount, onRow, options = {}) {
@@ -1794,20 +1592,32 @@ async function computeBucketEntriesBounds(entries, coeffCount, options = {}) {
   const extentScratch = new Float32Array(3);
   let rowCount = 0;
 
-  await forEachBucketEntryRow(
+  await forEachBucketChunk(
     entries,
     coeffCount,
-    (view, base, encoding, _filePath, floatView, floatBase) => {
-      readBucketCoreRowIntoScratch(
-        encoding,
+    (chunk) => {
+      const {
         view,
-        base,
-        scratch,
+        byteOffset,
+        rowCount: chunkRowCount,
+        rowByteSize,
+        encoding,
         floatView,
         floatBase,
-      );
-      accumulateBoundsFromScratchRow(scratch, minimum, maximum, extentScratch);
-      rowCount += 1;
+      } = chunk;
+      const floatsPerRow = rowByteSize >>> 2;
+      for (let row = 0; row < chunkRowCount; row++) {
+        readBucketCoreRowIntoScratch(
+          encoding,
+          view,
+          byteOffset + row * rowByteSize,
+          scratch,
+          floatView,
+          floatView ? floatBase + row * floatsPerRow : 0,
+        );
+        accumulateBoundsFromScratchRow(scratch, minimum, maximum, extentScratch);
+      }
+      rowCount += chunkRowCount;
     },
     { chunkBytes: options.bucketChunkBytes },
   );
@@ -1842,17 +1652,32 @@ async function packBucketEntriesToSpz(
     extra > 0 ? makeSpzShQuantBuckets(coeffCount, sh1Bits, shRestBits) : null;
 
   let rowIndex = 0;
-  await forEachBucketEntryRow(
+  await forEachBucketChunk(
     entries,
     coeffCount,
-    (view, base, encoding, _filePath, floatView, floatBase) => {
-      if (
-        floatView &&
-        (encoding === LEAF_BUCKET_ENCODING ||
-          encoding === HANDOFF_BUCKET_ENCODING)
-      ) {
-        const src = floatView;
-        const off = floatBase;
+    (chunk) => {
+      const {
+        view,
+        byteOffset,
+        rowCount,
+        rowByteSize,
+        encoding,
+        floatView,
+        floatBase,
+      } = chunk;
+      const floatsPerRow = rowByteSize >>> 2;
+      for (let row = 0; row < rowCount; row++) {
+        const base = byteOffset + row * rowByteSize;
+        const currentFloatBase = floatView
+          ? floatBase + row * floatsPerRow
+          : 0;
+        if (
+          floatView &&
+          (encoding === LEAF_BUCKET_ENCODING ||
+            encoding === HANDOFF_BUCKET_ENCODING)
+        ) {
+          const src = floatView;
+          const off = currentFloatBase;
         const localX = translation
           ? Math.fround(src[off + 0] - tx)
           : src[off + 0];
@@ -1924,8 +1749,8 @@ async function packBucketEntriesToSpz(
         }
 
         rowIndex += 1;
-        return;
-      }
+          continue;
+        }
 
       readBucketRowIntoScratch(
         encoding,
@@ -1934,7 +1759,7 @@ async function packBucketEntriesToSpz(
         coeffCount,
         scratch,
         floatView,
-        floatBase,
+        currentFloatBase,
       );
 
       const localX = translation
@@ -2004,6 +1829,7 @@ async function packBucketEntriesToSpz(
       }
 
       rowIndex += 1;
+      }
     },
     { chunkBytes: options.bucketChunkBytes },
   );
@@ -2128,37 +1954,49 @@ async function loadBucketCloudFromEntries(
   const scratch = makeRowScratch(coeffCount);
   let rowIndex = 0;
 
-  await forEachBucketEntryRow(
+  await forEachBucketChunk(
     entries,
     coeffCount,
-    (view, base, encoding, _filePath, floatView, floatBase) => {
-      readBucketRowIntoScratch(
-        encoding,
+    (chunk) => {
+      const {
         view,
-        base,
-        coeffCount,
-        scratch,
+        byteOffset,
+        rowCount,
+        rowByteSize,
+        encoding,
         floatView,
         floatBase,
-      );
-      const base3 = rowIndex * 3;
-      const base4 = rowIndex * 4;
-      const coeffBase = rowIndex * coeffStride;
-      positions[base3 + 0] = scratch.position[0];
-      positions[base3 + 1] = scratch.position[1];
-      positions[base3 + 2] = scratch.position[2];
-      scaleLog[base3 + 0] = scratch.scaleLog[0];
-      scaleLog[base3 + 1] = scratch.scaleLog[1];
-      scaleLog[base3 + 2] = scratch.scaleLog[2];
-      quats[base4 + 0] = scratch.quat[0];
-      quats[base4 + 1] = scratch.quat[1];
-      quats[base4 + 2] = scratch.quat[2];
-      quats[base4 + 3] = scratch.quat[3];
-      opacity[rowIndex] = scratch.opacity;
-      for (let c = 0; c < coeffStride; c++) {
-        shCoeffs[coeffBase + c] = scratch.sh[c];
+      } = chunk;
+      const floatsPerRow = rowByteSize >>> 2;
+      for (let row = 0; row < rowCount; row++) {
+        readBucketRowIntoScratch(
+          encoding,
+          view,
+          byteOffset + row * rowByteSize,
+          coeffCount,
+          scratch,
+          floatView,
+          floatView ? floatBase + row * floatsPerRow : 0,
+        );
+        const base3 = rowIndex * 3;
+        const base4 = rowIndex * 4;
+        const coeffBase = rowIndex * coeffStride;
+        positions[base3 + 0] = scratch.position[0];
+        positions[base3 + 1] = scratch.position[1];
+        positions[base3 + 2] = scratch.position[2];
+        scaleLog[base3 + 0] = scratch.scaleLog[0];
+        scaleLog[base3 + 1] = scratch.scaleLog[1];
+        scaleLog[base3 + 2] = scratch.scaleLog[2];
+        quats[base4 + 0] = scratch.quat[0];
+        quats[base4 + 1] = scratch.quat[1];
+        quats[base4 + 2] = scratch.quat[2];
+        quats[base4 + 3] = scratch.quat[3];
+        opacity[rowIndex] = scratch.opacity;
+        for (let c = 0; c < coeffStride; c++) {
+          shCoeffs[coeffBase + c] = scratch.sh[c];
+        }
+        rowIndex += 1;
       }
-      rowIndex += 1;
     },
     { chunkBytes: options.bucketChunkBytes },
   );
@@ -2647,35 +2485,48 @@ async function materializeBucketRowsToSlots(
   const scratch = makeRowScratch(coeffCount);
   let rowIndex = 0;
 
-  await forEachBucketEntryRow(
+  await forEachBucketChunk(
     entries,
     coeffCount,
-    (view, base, encoding, _filePath, floatView, floatBase) => {
-      const slots = wantedRows.get(rowIndex);
-      if (slots) {
-        readBucketRowIntoScratch(
-          encoding,
-          view,
-          base,
-          coeffCount,
-          scratch,
-          floatView,
-          floatBase,
-        );
-        for (const slot of slots) {
-          writeScratchRowToArrays(
+    (chunk) => {
+      const {
+        view,
+        byteOffset,
+        rowBase,
+        rowCount,
+        rowByteSize,
+        encoding,
+        floatView,
+        floatBase,
+      } = chunk;
+      const floatsPerRow = rowByteSize >>> 2;
+      for (let row = 0; row < rowCount; row++) {
+        const sourceRowIndex = rowBase + row;
+        const slots = wantedRows.get(sourceRowIndex);
+        if (slots) {
+          readBucketRowIntoScratch(
+            encoding,
+            view,
+            byteOffset + row * rowByteSize,
+            coeffCount,
             scratch,
-            coeffStride,
-            slot,
-            positions,
-            scaleLog,
-            quats,
-            opacity,
-            shCoeffs,
+            floatView,
+            floatView ? floatBase + row * floatsPerRow : 0,
           );
+          for (const slot of slots) {
+            writeScratchRowToArrays(
+              scratch,
+              coeffStride,
+              slot,
+              positions,
+              scaleLog,
+              quats,
+              opacity,
+              shCoeffs,
+            );
+          }
         }
       }
-      rowIndex += 1;
     },
     { chunkBytes: options.bucketChunkBytes },
   );
@@ -2703,40 +2554,52 @@ async function loadBucketSimplifyCoreFromEntries(
   const scratch = makeRowScratch(coeffCount);
   let rowIndex = 0;
 
-  await forEachBucketEntryRow(
+  await forEachBucketChunk(
     entries,
     coeffCount,
-    (view, base, encoding, _filePath, floatView, floatBase) => {
-      readBucketCoreRowIntoScratch(
-        encoding,
+    (chunk) => {
+      const {
         view,
-        base,
-        scratch,
+        byteOffset,
+        rowCount,
+        rowByteSize,
+        encoding,
         floatView,
         floatBase,
-      );
-      const base3 = rowIndex * 3;
-      const base4 = rowIndex * 4;
-      positions[base3 + 0] = scratch.position[0];
-      positions[base3 + 1] = scratch.position[1];
-      positions[base3 + 2] = scratch.position[2];
-      if (keepScaleQuat) {
-        scaleLog[base3 + 0] = scratch.scaleLog[0];
-        scaleLog[base3 + 1] = scratch.scaleLog[1];
-        scaleLog[base3 + 2] = scratch.scaleLog[2];
-        quatsXYZW[base4 + 0] = scratch.quat[0];
-        quatsXYZW[base4 + 1] = scratch.quat[1];
-        quatsXYZW[base4 + 2] = scratch.quat[2];
-        quatsXYZW[base4 + 3] = scratch.quat[3];
+      } = chunk;
+      const floatsPerRow = rowByteSize >>> 2;
+      for (let row = 0; row < rowCount; row++) {
+        readBucketCoreRowIntoScratch(
+          encoding,
+          view,
+          byteOffset + row * rowByteSize,
+          scratch,
+          floatView,
+          floatView ? floatBase + row * floatsPerRow : 0,
+        );
+        const base3 = rowIndex * 3;
+        const base4 = rowIndex * 4;
+        positions[base3 + 0] = scratch.position[0];
+        positions[base3 + 1] = scratch.position[1];
+        positions[base3 + 2] = scratch.position[2];
+        if (keepScaleQuat) {
+          scaleLog[base3 + 0] = scratch.scaleLog[0];
+          scaleLog[base3 + 1] = scratch.scaleLog[1];
+          scaleLog[base3 + 2] = scratch.scaleLog[2];
+          quatsXYZW[base4 + 0] = scratch.quat[0];
+          quatsXYZW[base4 + 1] = scratch.quat[1];
+          quatsXYZW[base4 + 2] = scratch.quat[2];
+          quatsXYZW[base4 + 3] = scratch.quat[3];
+        }
+        opacity[rowIndex] = scratch.opacity;
+        origRadius[rowIndex] = computeThreeSigmaAabbDiagonalRadiusAt(
+          scratch.scaleLog,
+          0,
+          scratch.quat,
+          0,
+        );
+        rowIndex += 1;
       }
-      opacity[rowIndex] = scratch.opacity;
-      origRadius[rowIndex] = computeThreeSigmaAabbDiagonalRadiusAt(
-        scratch.scaleLog,
-        0,
-        scratch.quat,
-        0,
-      );
-      rowIndex += 1;
     },
     { chunkBytes: bucketChunkBytes },
   );
@@ -2800,32 +2663,44 @@ async function mergeSelectedBucketRowsToCloud(
   const scratch = makeRowScratch(coeffCount);
   let rowIndex = 0;
 
-  await forEachBucketEntryRow(
+  await forEachBucketChunk(
     entries,
     coeffCount,
-    (view, base, encoding, _filePath, floatView, floatBase) => {
-      readBucketCoreRowIntoScratch(
-        encoding,
+    (chunk) => {
+      const {
         view,
-        base,
-        scratch,
+        byteOffset,
+        rowCount,
+        rowByteSize,
+        encoding,
         floatView,
         floatBase,
-      );
-      const slot = assignment[rowIndex];
-      const radius = rowRadiusOrScratch(inputRadius, rowIndex, scratch);
-      const weight = mergeAggregationWeight(scratch.opacity, radius, voxelDiag);
-      const base3 = slot * 3;
-      if (firstAssigned[slot] < 0) {
-        firstAssigned[slot] = rowIndex;
+      } = chunk;
+      const floatsPerRow = rowByteSize >>> 2;
+      for (let row = 0; row < rowCount; row++) {
+        readBucketCoreRowIntoScratch(
+          encoding,
+          view,
+          byteOffset + row * rowByteSize,
+          scratch,
+          floatView,
+          floatView ? floatBase + row * floatsPerRow : 0,
+        );
+        const slot = assignment[rowIndex];
+        const radius = rowRadiusOrScratch(inputRadius, rowIndex, scratch);
+        const weight = mergeAggregationWeight(scratch.opacity, radius, voxelDiag);
+        const base3 = slot * 3;
+        if (firstAssigned[slot] < 0) {
+          firstAssigned[slot] = rowIndex;
+        }
+        weightSums[slot] += weight;
+        counts[slot] += 1;
+        weightedPos[base3 + 0] += scratch.position[0] * weight;
+        weightedPos[base3 + 1] += scratch.position[1] * weight;
+        weightedPos[base3 + 2] += scratch.position[2] * weight;
+        weightedOpacity[slot] += scratch.opacity * weight;
+        rowIndex += 1;
       }
-      weightSums[slot] += weight;
-      counts[slot] += 1;
-      weightedPos[base3 + 0] += scratch.position[0] * weight;
-      weightedPos[base3 + 1] += scratch.position[1] * weight;
-      weightedPos[base3 + 2] += scratch.position[2] * weight;
-      weightedOpacity[slot] += scratch.opacity * weight;
-      rowIndex += 1;
     },
     { chunkBytes: bucketChunkBytes },
   );
@@ -2870,57 +2745,70 @@ async function mergeSelectedBucketRowsToCloud(
     const accumulateCovariance = coeffStart === 0;
     let weightedShBlock = new Float64Array(selectedCount * blockWidth);
     rowIndex = 0;
-    await forEachBucketEntryRow(
+    await forEachBucketChunk(
       entries,
       coeffCount,
-      (view, base, encoding, _filePath, floatView, floatBase) => {
-        const slot = assignment[rowIndex];
-        if (
-          !Number.isFinite(weightSums[slot]) ||
-          weightSums[slot] <= 1e-12 ||
-          counts[slot] === 0
-        ) {
-          rowIndex += 1;
-          return;
-        }
-        readBucketRowIntoScratch(
-          encoding,
+      (chunk) => {
+        const {
           view,
-          base,
-          coeffCount,
-          scratch,
+          byteOffset,
+          rowCount,
+          rowByteSize,
+          encoding,
           floatView,
           floatBase,
-        );
-        const radius = rowRadiusOrScratch(inputRadius, rowIndex, scratch);
-        const weight = mergeAggregationWeight(
-          scratch.opacity,
-          radius,
-          voxelDiag,
-        );
-        const blockBase = slot * blockWidth;
-        for (let c = 0; c < blockWidth; c++) {
-          weightedShBlock[blockBase + c] += scratch.sh[coeffStart + c] * weight;
-        }
-        if (accumulateCovariance && counts[slot] > 1) {
-          covarianceComponentsFromScratch(
-            scratch.scaleLog,
-            scratch.quat,
-            covScratch,
+        } = chunk;
+        const floatsPerRow = rowByteSize >>> 2;
+        for (let row = 0; row < rowCount; row++) {
+          const slot = assignment[rowIndex];
+          if (
+            !Number.isFinite(weightSums[slot]) ||
+            weightSums[slot] <= 1e-12 ||
+            counts[slot] === 0
+          ) {
+            rowIndex += 1;
+            continue;
+          }
+          readBucketRowIntoScratch(
+            encoding,
+            view,
+            byteOffset + row * rowByteSize,
+            coeffCount,
+            scratch,
+            floatView,
+            floatView ? floatBase + row * floatsPerRow : 0,
           );
-          const base3 = slot * 3;
-          const covBase = slot * 6;
-          const dx = scratch.position[0] - positions[base3 + 0];
-          const dy = scratch.position[1] - positions[base3 + 1];
-          const dz = scratch.position[2] - positions[base3 + 2];
-          covSums[covBase + 0] += weight * (covScratch[0] + dx * dx);
-          covSums[covBase + 1] += weight * (covScratch[1] + dx * dy);
-          covSums[covBase + 2] += weight * (covScratch[2] + dx * dz);
-          covSums[covBase + 3] += weight * (covScratch[3] + dy * dy);
-          covSums[covBase + 4] += weight * (covScratch[4] + dy * dz);
-          covSums[covBase + 5] += weight * (covScratch[5] + dz * dz);
+          const radius = rowRadiusOrScratch(inputRadius, rowIndex, scratch);
+          const weight = mergeAggregationWeight(
+            scratch.opacity,
+            radius,
+            voxelDiag,
+          );
+          const blockBase = slot * blockWidth;
+          for (let c = 0; c < blockWidth; c++) {
+            weightedShBlock[blockBase + c] +=
+              scratch.sh[coeffStart + c] * weight;
+          }
+          if (accumulateCovariance && counts[slot] > 1) {
+            covarianceComponentsFromScratch(
+              scratch.scaleLog,
+              scratch.quat,
+              covScratch,
+            );
+            const base3 = slot * 3;
+            const covBase = slot * 6;
+            const dx = scratch.position[0] - positions[base3 + 0];
+            const dy = scratch.position[1] - positions[base3 + 1];
+            const dz = scratch.position[2] - positions[base3 + 2];
+            covSums[covBase + 0] += weight * (covScratch[0] + dx * dx);
+            covSums[covBase + 1] += weight * (covScratch[1] + dx * dy);
+            covSums[covBase + 2] += weight * (covScratch[2] + dx * dz);
+            covSums[covBase + 3] += weight * (covScratch[3] + dy * dy);
+            covSums[covBase + 4] += weight * (covScratch[4] + dy * dz);
+            covSums[covBase + 5] += weight * (covScratch[5] + dz * dz);
+          }
+          rowIndex += 1;
         }
-        rowIndex += 1;
       },
       { chunkBytes: bucketChunkBytes },
     );
@@ -3155,27 +3043,39 @@ async function computeExactStreamingOwnErrorFromEntries(
     const scratch = makeRowScratch(coeffCount);
     let rowIndex = 0;
 
-    await forEachBucketEntryRow(
+    await forEachBucketChunk(
       entries,
       coeffCount,
-      (view, base, encoding, _filePath, floatView, floatBase) => {
-        readBucketCoreRowIntoScratch(
-          encoding,
+      (chunk) => {
+        const {
           view,
-          base,
-          scratch,
+          byteOffset,
+          rowCount,
+          rowByteSize,
+          encoding,
           floatView,
           floatBase,
-        );
-        const slot = assignment[rowIndex];
-        const dstBase3 = slot * 3;
-        const dx = scratch.position[0] - outputCloud.positions[dstBase3 + 0];
-        const dy = scratch.position[1] - outputCloud.positions[dstBase3 + 1];
-        const dz = scratch.position[2] - outputCloud.positions[dstBase3 + 2];
-        const radius = rowRadiusOrScratch(inputRadius, rowIndex, scratch);
-        errors[rowIndex] =
-          Math.sqrt(dx * dx + dy * dy + dz * dz) + radius + outputRadius[slot];
-        rowIndex += 1;
+        } = chunk;
+        const floatsPerRow = rowByteSize >>> 2;
+        for (let row = 0; row < rowCount; row++) {
+          readBucketCoreRowIntoScratch(
+            encoding,
+            view,
+            byteOffset + row * rowByteSize,
+            scratch,
+            floatView,
+            floatView ? floatBase + row * floatsPerRow : 0,
+          );
+          const slot = assignment[rowIndex];
+          const dstBase3 = slot * 3;
+          const dx = scratch.position[0] - outputCloud.positions[dstBase3 + 0];
+          const dy = scratch.position[1] - outputCloud.positions[dstBase3 + 1];
+          const dz = scratch.position[2] - outputCloud.positions[dstBase3 + 2];
+          const radius = rowRadiusOrScratch(inputRadius, rowIndex, scratch);
+          errors[rowIndex] =
+            Math.sqrt(dx * dx + dy * dy + dz * dz) + radius + outputRadius[slot];
+          rowIndex += 1;
+        }
       },
       { chunkBytes: options.bucketChunkBytes },
     );
@@ -3193,28 +3093,40 @@ async function computeExactStreamingOwnErrorFromEntries(
   const scratch = makeRowScratch(coeffCount);
   let rowIndex = 0;
 
-  await forEachBucketEntryRow(
+  await forEachBucketChunk(
     entries,
     coeffCount,
-    (view, base, encoding, _filePath, floatView, floatBase) => {
-      readBucketCoreRowIntoScratch(
-        encoding,
+    (chunk) => {
+      const {
         view,
-        base,
-        scratch,
+        byteOffset,
+        rowCount,
+        rowByteSize,
+        encoding,
         floatView,
         floatBase,
-      );
-      const slot = assignment[rowIndex];
-      const dstBase3 = slot * 3;
-      const dx = scratch.position[0] - outputCloud.positions[dstBase3 + 0];
-      const dy = scratch.position[1] - outputCloud.positions[dstBase3 + 1];
-      const dz = scratch.position[2] - outputCloud.positions[dstBase3 + 2];
-      const radius = rowRadiusOrScratch(inputRadius, rowIndex, scratch);
-      const error =
-        Math.sqrt(dx * dx + dy * dy + dz * dz) + radius + outputRadius[slot];
-      tail.pushCandidate(error);
-      rowIndex += 1;
+      } = chunk;
+      const floatsPerRow = rowByteSize >>> 2;
+      for (let row = 0; row < rowCount; row++) {
+        readBucketCoreRowIntoScratch(
+          encoding,
+          view,
+          byteOffset + row * rowByteSize,
+          scratch,
+          floatView,
+          floatView ? floatBase + row * floatsPerRow : 0,
+        );
+        const slot = assignment[rowIndex];
+        const dstBase3 = slot * 3;
+        const dx = scratch.position[0] - outputCloud.positions[dstBase3 + 0];
+        const dy = scratch.position[1] - outputCloud.positions[dstBase3 + 1];
+        const dz = scratch.position[2] - outputCloud.positions[dstBase3 + 2];
+        const radius = rowRadiusOrScratch(inputRadius, rowIndex, scratch);
+        const error =
+          Math.sqrt(dx * dx + dy * dy + dz * dz) + radius + outputRadius[slot];
+        tail.pushCandidate(error);
+        rowIndex += 1;
+      }
     },
     { chunkBytes: options.bucketChunkBytes },
   );
@@ -3898,8 +3810,9 @@ async function scanGlobalBoundsAndWritePositions(
       : null;
   let bufferedRows = 0;
   let count = 0;
-  const scratch = makeRowScratch(0);
+  const scratch = includeWeights ? makeRowScratch(0) : null;
   const extentScratch = includeWeights ? new Float32Array(3) : null;
+  const rootBasisStats = includeWeights ? makeOrientedBoxStats(null) : null;
   const progress = options.progress || null;
   const updateProgress = (force = false) => {
     if (!progress) {
@@ -3937,30 +3850,15 @@ async function scanGlobalBoundsAndWritePositions(
   };
 
   try {
-    await _forEachGaussianPlyCanonicalRecord(
-      handle,
-      filePath,
-      header,
-      layout,
-      (_rowIndex, _rowBuffer, rowView, rowFloats) => {
-        readBucketCoreRowIntoScratch(
-          LEAF_BUCKET_ENCODING,
-          rowView,
-          0,
-          scratch,
-          rowFloats,
-          0,
-        );
-        const x = scratch.position[0];
-        const y = scratch.position[1];
-        const z = scratch.position[2];
+    const stagePosition = (_rowIndex, x, y, z, weight = 1.0) => {
         const fx = Math.fround(x);
         const fy = Math.fround(y);
         const fz = Math.fround(z);
-        const fw = includeWeights
-          ? Math.fround(splitWeightFromScratch(scratch, extentScratch))
-          : 1.0;
+        const fw = Math.fround(weight);
         updatePositionBounds(minimum, maximum, fx, fy, fz);
+        if (rootBasisStats) {
+          updateWeightedPositionMomentStats(rootBasisStats, fx, fy, fz, fw);
+        }
 
         if (floatView) {
           const base = bufferedRows * POSITION_ROW_FLOAT_COUNT;
@@ -3982,9 +3880,46 @@ async function scanGlobalBoundsAndWritePositions(
         if (bufferedRows === rowsPerBuffer) {
           flush();
         }
-      },
-      { chunkBytes: options.chunkBytes },
-    );
+    };
+
+    if (includeWeights) {
+      await _forEachGaussianPlyCoreRecord(
+        handle,
+        filePath,
+        header,
+        layout,
+        (_rowIndex, coreFloats) => {
+          scratch.position[0] = coreFloats[0];
+          scratch.position[1] = coreFloats[1];
+          scratch.position[2] = coreFloats[2];
+          scratch.scaleLog[0] = coreFloats[3];
+          scratch.scaleLog[1] = coreFloats[4];
+          scratch.scaleLog[2] = coreFloats[5];
+          scratch.quat[0] = coreFloats[6];
+          scratch.quat[1] = coreFloats[7];
+          scratch.quat[2] = coreFloats[8];
+          scratch.quat[3] = coreFloats[9];
+          scratch.opacity = coreFloats[10];
+          stagePosition(
+            _rowIndex,
+            coreFloats[0],
+            coreFloats[1],
+            coreFloats[2],
+            splitWeightFromScratch(scratch, extentScratch),
+          );
+        },
+        { chunkBytes: options.chunkBytes },
+      );
+    } else {
+      await _forEachGaussianPlyPosition(
+        handle,
+        filePath,
+        header,
+        layout,
+        stagePosition,
+        { chunkBytes: options.chunkBytes },
+      );
+    }
     flush();
     updateProgress(true);
   } finally {
@@ -3996,7 +3931,12 @@ async function scanGlobalBoundsAndWritePositions(
     count === header.vertexCount,
     `PLY position row count mismatch. Expected ${header.vertexCount}, got ${count}.`,
   );
-  return new Bounds(minimum, maximum);
+  return {
+    bounds: new Bounds(minimum, maximum),
+    rootBasisAxes: rootBasisStats
+      ? orthonormalBasisFromMomentStats(rootBasisStats)
+      : null,
+  };
 }
 
 async function scanGlobalBoundsAndStagePositionsInMemory(
@@ -4012,8 +3952,9 @@ async function scanGlobalBoundsAndStagePositionsInMemory(
   const includeWeights = options.includeWeights === true;
   const weights = includeWeights ? new Float32Array(header.vertexCount) : null;
   let count = 0;
-  const scratch = makeRowScratch(0);
+  const scratch = includeWeights ? makeRowScratch(0) : null;
   const extentScratch = includeWeights ? new Float32Array(3) : null;
+  const rootBasisStats = includeWeights ? makeOrientedBoxStats(null) : null;
   const progress = options.progress || null;
   const updateProgress = (force = false) => {
     if (!progress) {
@@ -4025,23 +3966,7 @@ async function scanGlobalBoundsAndStagePositionsInMemory(
     progress.update(count);
   };
 
-  await _forEachGaussianPlyCanonicalRecord(
-    handle,
-    filePath,
-    header,
-    layout,
-    (rowIndex, _rowBuffer, rowView, rowFloats) => {
-      readBucketCoreRowIntoScratch(
-        LEAF_BUCKET_ENCODING,
-        rowView,
-        0,
-        scratch,
-        rowFloats,
-        0,
-      );
-      const x = scratch.position[0];
-      const y = scratch.position[1];
-      const z = scratch.position[2];
+  const stagePosition = (rowIndex, x, y, z, weight = 1.0) => {
       const fx = Math.fround(x);
       const fy = Math.fround(y);
       const fz = Math.fround(z);
@@ -4052,15 +3977,54 @@ async function scanGlobalBoundsAndStagePositionsInMemory(
       positions[base + 1] = fy;
       positions[base + 2] = fz;
       if (weights) {
-        weights[rowIndex] = Math.fround(
-          splitWeightFromScratch(scratch, extentScratch),
-        );
+        const fw = Math.fround(weight);
+        weights[rowIndex] = fw;
+        if (rootBasisStats) {
+          updateWeightedPositionMomentStats(rootBasisStats, fx, fy, fz, fw);
+        }
       }
       count += 1;
       updateProgress();
-    },
-    { chunkBytes: options.chunkBytes },
-  );
+  };
+
+  if (includeWeights) {
+    await _forEachGaussianPlyCoreRecord(
+      handle,
+      filePath,
+      header,
+      layout,
+      (rowIndex, coreFloats) => {
+        scratch.position[0] = coreFloats[0];
+        scratch.position[1] = coreFloats[1];
+        scratch.position[2] = coreFloats[2];
+        scratch.scaleLog[0] = coreFloats[3];
+        scratch.scaleLog[1] = coreFloats[4];
+        scratch.scaleLog[2] = coreFloats[5];
+        scratch.quat[0] = coreFloats[6];
+        scratch.quat[1] = coreFloats[7];
+        scratch.quat[2] = coreFloats[8];
+        scratch.quat[3] = coreFloats[9];
+        scratch.opacity = coreFloats[10];
+        stagePosition(
+          rowIndex,
+          coreFloats[0],
+          coreFloats[1],
+          coreFloats[2],
+          splitWeightFromScratch(scratch, extentScratch),
+        );
+      },
+      { chunkBytes: options.chunkBytes },
+    );
+  } else {
+    await _forEachGaussianPlyPosition(
+      handle,
+      filePath,
+      header,
+      layout,
+      stagePosition,
+      { chunkBytes: options.chunkBytes },
+    );
+  }
   updateProgress(true);
 
   ensure(count > 0, `PLY file ${filePath} does not contain any vertices.`);
@@ -4072,6 +4036,9 @@ async function scanGlobalBoundsAndStagePositionsInMemory(
     bounds: new Bounds(minimum, maximum),
     positions,
     weights,
+    rootBasisAxes: rootBasisStats
+      ? orthonormalBasisFromMomentStats(rootBasisStats)
+      : null,
   };
 }
 
@@ -4305,13 +4272,16 @@ function boundsLongWidthAspect(bounds) {
   return longWidthAspectFromExtents(bounds.extents()).aspect;
 }
 
-function volumeFromExtents(extents) {
+function volumeFromExtentValues(extentX, extentY, extentZ) {
   let maxExtent = 0.0;
-  for (let axis = 0; axis < extents.length; axis++) {
-    const extent = extents[axis];
-    if (Number.isFinite(extent) && extent > maxExtent) {
-      maxExtent = extent;
-    }
+  if (Number.isFinite(extentX) && extentX > maxExtent) {
+    maxExtent = extentX;
+  }
+  if (Number.isFinite(extentY) && extentY > maxExtent) {
+    maxExtent = extentY;
+  }
+  if (Number.isFinite(extentZ) && extentZ > maxExtent) {
+    maxExtent = extentZ;
   }
   const epsilon = Math.max(
     ADAPTIVE_SPLIT_EPSILON,
@@ -4319,13 +4289,18 @@ function volumeFromExtents(extents) {
   );
   // Keep planar or linear leaves in same-depth scale comparisons instead of
   // letting one degenerate axis collapse their regularized volume to zero.
-  let volume = 1.0;
-  for (let axis = 0; axis < extents.length; axis++) {
-    const extent = extents[axis];
-    const finite = Number.isFinite(extent) && extent > 0.0 ? extent : 0.0;
-    volume *= Math.max(finite, epsilon);
-  }
-  return volume;
+  const finiteX = Number.isFinite(extentX) && extentX > 0.0 ? extentX : 0.0;
+  const finiteY = Number.isFinite(extentY) && extentY > 0.0 ? extentY : 0.0;
+  const finiteZ = Number.isFinite(extentZ) && extentZ > 0.0 ? extentZ : 0.0;
+  return (
+    Math.max(finiteX, epsilon) *
+    Math.max(finiteY, epsilon) *
+    Math.max(finiteZ, epsilon)
+  );
+}
+
+function volumeFromExtents(extents) {
+  return volumeFromExtentValues(extents[0], extents[1], extents[2]);
 }
 
 function boundsVolume(bounds) {
@@ -4344,11 +4319,11 @@ function volumeFromMinMax(minimum, maximum) {
   ) {
     return Infinity;
   }
-  return volumeFromExtents([
+  return volumeFromExtentValues(
     maximum[0] - minimum[0],
     maximum[1] - minimum[1],
     maximum[2] - minimum[2],
-  ]);
+  );
 }
 
 function medianSorted(values) {
@@ -4915,6 +4890,12 @@ function updateOrientedBoxProjectionStats(stats, x, y, z) {
   }
 }
 
+function updateOrientedBoxStatsWithBasis(stats, x, y, z) {
+  stats.count += 1;
+  updatePositionStatsBounds(stats, x, y, z);
+  updateOrientedBoxProjectionStats(stats, x, y, z);
+}
+
 function orientedBoxFromProjectionStats(stats, fallbackBounds) {
   if (!stats || !stats.axes || stats.count <= 0) {
     return fallbackBounds ? fallbackBounds.toBoxArray() : null;
@@ -5062,10 +5043,7 @@ function resetAdaptiveProjectionStats(stats) {
     projectionMin: candidate.projectionMin,
     projectionMax: candidate.projectionMax,
     parentVolume,
-    projectionBins: Array.from(
-      { length: segmentCount },
-      makeProjectionVolumeBin,
-    ),
+    projectionBins: makeProjectionVolumeBins(segmentCount),
     projectionTotalCount: 0,
   }));
 }
@@ -5093,39 +5071,63 @@ function makeProjectionVolumeBin() {
   };
 }
 
-function updateProjectionVolumeBin(bin, x, y, z) {
-  bin.count += 1;
-  const minimum = bin.minimum;
-  const maximum = bin.maximum;
-  if (x < minimum[0]) minimum[0] = x;
-  if (y < minimum[1]) minimum[1] = y;
-  if (z < minimum[2]) minimum[2] = z;
-  if (x > maximum[0]) maximum[0] = x;
-  if (y > maximum[1]) maximum[1] = y;
-  if (z > maximum[2]) maximum[2] = z;
+function makeProjectionVolumeBins(binCount) {
+  const count = new Float64Array(binCount);
+  const minimum = new Float64Array(binCount * 3);
+  const maximum = new Float64Array(binCount * 3);
+  minimum.fill(Infinity);
+  maximum.fill(-Infinity);
+  return {
+    binCount,
+    count,
+    minimum,
+    maximum,
+  };
 }
 
-function addVolumeBinToAccumulator(accumulator, bin) {
-  if (bin.count <= 0) {
+function updateProjectionVolumeBin(bins, index, x, y, z) {
+  bins.count[index] += 1;
+  const base = index * 3;
+  const minimum = bins.minimum;
+  const maximum = bins.maximum;
+  if (x < minimum[base + 0]) minimum[base + 0] = x;
+  if (y < minimum[base + 1]) minimum[base + 1] = y;
+  if (z < minimum[base + 2]) minimum[base + 2] = z;
+  if (x > maximum[base + 0]) maximum[base + 0] = x;
+  if (y > maximum[base + 1]) maximum[base + 1] = y;
+  if (z > maximum[base + 2]) maximum[base + 2] = z;
+}
+
+function addVolumeBinToAccumulator(accumulator, bins, index) {
+  const binCount = bins.count[index];
+  if (binCount <= 0) {
     return;
   }
-  accumulator.count += bin.count;
+  accumulator.count += binCount;
+  const base = index * 3;
   const accMin = accumulator.minimum;
   const accMax = accumulator.maximum;
-  const binMin = bin.minimum;
-  const binMax = bin.maximum;
-  if (binMin[0] < accMin[0]) accMin[0] = binMin[0];
-  if (binMin[1] < accMin[1]) accMin[1] = binMin[1];
-  if (binMin[2] < accMin[2]) accMin[2] = binMin[2];
-  if (binMax[0] > accMax[0]) accMax[0] = binMax[0];
-  if (binMax[1] > accMax[1]) accMax[1] = binMax[1];
-  if (binMax[2] > accMax[2]) accMax[2] = binMax[2];
+  const binMin = bins.minimum;
+  const binMax = bins.maximum;
+  const minX = binMin[base + 0];
+  const minY = binMin[base + 1];
+  const minZ = binMin[base + 2];
+  const maxX = binMax[base + 0];
+  const maxY = binMax[base + 1];
+  const maxZ = binMax[base + 2];
+  if (minX < accMin[0]) accMin[0] = minX;
+  if (minY < accMin[1]) accMin[1] = minY;
+  if (minZ < accMin[2]) accMin[2] = minZ;
+  if (maxX > accMax[0]) accMax[0] = maxX;
+  if (maxY > accMax[1]) accMax[1] = maxY;
+  if (maxZ > accMax[2]) accMax[2] = maxZ;
 }
 
 function buildProjectionVolumeSuffixAccumulators(bins) {
-  const count = new Float64Array(bins.length + 1);
-  const minimum = new Float64Array((bins.length + 1) * 3);
-  const maximum = new Float64Array((bins.length + 1) * 3);
+  const binCount = bins.binCount;
+  const count = new Float64Array(binCount + 1);
+  const minimum = new Float64Array((binCount + 1) * 3);
+  const maximum = new Float64Array((binCount + 1) * 3);
   let suffixCount = 0;
   let minX = Infinity;
   let minY = Infinity;
@@ -5143,19 +5145,20 @@ function buildProjectionVolumeSuffixAccumulators(bins) {
     maximum[base + 1] = maxY;
     maximum[base + 2] = maxZ;
   };
-  store(bins.length);
-  for (let index = bins.length - 1; index >= 0; index--) {
-    const bin = bins[index];
-    if (bin.count > 0) {
-      suffixCount += bin.count;
-      const binMin = bin.minimum;
-      const binMax = bin.maximum;
-      if (binMin[0] < minX) minX = binMin[0];
-      if (binMin[1] < minY) minY = binMin[1];
-      if (binMin[2] < minZ) minZ = binMin[2];
-      if (binMax[0] > maxX) maxX = binMax[0];
-      if (binMax[1] > maxY) maxY = binMax[1];
-      if (binMax[2] > maxZ) maxZ = binMax[2];
+  store(binCount);
+  for (let index = binCount - 1; index >= 0; index--) {
+    const currentCount = bins.count[index];
+    if (currentCount > 0) {
+      suffixCount += currentCount;
+      const base = index * 3;
+      const binMin = bins.minimum;
+      const binMax = bins.maximum;
+      if (binMin[base + 0] < minX) minX = binMin[base + 0];
+      if (binMin[base + 1] < minY) minY = binMin[base + 1];
+      if (binMin[base + 2] < minZ) minZ = binMin[base + 2];
+      if (binMax[base + 0] > maxX) maxX = binMax[base + 0];
+      if (binMax[base + 1] > maxY) maxY = binMax[base + 1];
+      if (binMax[base + 2] > maxZ) maxZ = binMax[base + 2];
     }
     store(index);
   }
@@ -5164,11 +5167,11 @@ function buildProjectionVolumeSuffixAccumulators(bins) {
 
 function suffixAccumulatorVolume(suffixes, index) {
   const base = index * 3;
-  return volumeFromExtents([
+  return volumeFromExtentValues(
     suffixes.maximum[base + 0] - suffixes.minimum[base + 0],
     suffixes.maximum[base + 1] - suffixes.minimum[base + 1],
     suffixes.maximum[base + 2] - suffixes.minimum[base + 2],
-  ]);
+  );
 }
 
 function childEntryFromValues(slot, count, minimum, maximum) {
@@ -5193,7 +5196,7 @@ function addProjectionVolumePoint(candidate, projection, x, y, z) {
   const min = candidate.projectionMin;
   const max = candidate.projectionMax;
   const extent = max - min;
-  const binCount = bins ? bins.length : 0;
+  const binCount = bins ? bins.binCount : 0;
   if (!bins || binCount <= 0) {
     return false;
   }
@@ -5204,7 +5207,7 @@ function addProjectionVolumePoint(candidate, projection, x, y, z) {
     return false;
   }
   const bin = projectionBinIndex(projection, min, extent, binCount);
-  updateProjectionVolumeBin(bins[bin], x, y, z);
+  updateProjectionVolumeBin(bins, bin, x, y, z);
   return true;
 }
 
@@ -5269,7 +5272,7 @@ function chooseProjectionSplitForCandidate(candidate) {
   const min = candidate.projectionMin;
   const max = candidate.projectionMax;
   const extent = max - min;
-  const binCount = bins.length;
+  const binCount = bins.binCount;
   const epsilon = Math.max(
     ADAPTIVE_SPLIT_EPSILON,
     Math.abs(extent) * ADAPTIVE_SPLIT_EPSILON,
@@ -5300,7 +5303,7 @@ function chooseProjectionSplitForCandidate(candidate) {
   let bestUpperMinimum = null;
   let bestUpperMaximum = null;
   for (let boundary = 1; boundary < binCount; boundary++) {
-    addVolumeBinToAccumulator(lower, bins[boundary - 1]);
+    addVolumeBinToAccumulator(lower, bins, boundary - 1);
     const upperCount = suffixes.count[boundary];
     if (lower.count <= 0 || upperCount <= 0) {
       continue;
@@ -5736,11 +5739,19 @@ function childSlotForAdaptiveAction(stats, x, y, z) {
   return pointKdSlotForAction(stats.action, x, y, z);
 }
 
+function makeAdaptiveChildStatsSlots() {
+  return new Array(KD_CHILD_SLOT_COUNT).fill(null);
+}
+
+function adaptiveChildStatsHasEntries(childStats) {
+  return !!(childStats && childStats.some((entry) => !!entry));
+}
+
 function updateAdaptiveChildStats(stats, slot, x, y, z) {
   if (!stats.childStats) {
-    stats.childStats = new Map();
+    stats.childStats = makeAdaptiveChildStatsSlots();
   }
-  let entry = stats.childStats.get(slot);
+  let entry = stats.childStats[slot];
   if (!entry) {
     entry = {
       slot,
@@ -5748,7 +5759,7 @@ function updateAdaptiveChildStats(stats, slot, x, y, z) {
       minimum: [Infinity, Infinity, Infinity],
       maximum: [-Infinity, -Infinity, -Infinity],
     };
-    stats.childStats.set(slot, entry);
+    stats.childStats[slot] = entry;
   }
   entry.count += 1;
   const minimum = entry.minimum;
@@ -5765,27 +5776,33 @@ function sortedAdaptiveChildStats(stats) {
   if (!stats.childStats) {
     return [];
   }
-  return Array.from(stats.childStats.values()).sort((a, b) => a.slot - b.slot);
+  return stats.childStats.filter((entry) => !!entry);
 }
 
-function childStatsMapFromSplitAction(action) {
+function childStatsSlotsFromSplitAction(action) {
   const entries = action && action.childEntries;
   if (!Array.isArray(entries) || entries.length === 0) {
     return null;
   }
-  const out = new Map();
+  const out = makeAdaptiveChildStatsSlots();
   for (const entry of entries) {
-    if (!entry || entry.count <= 0 || !Number.isInteger(entry.slot)) {
+    if (
+      !entry ||
+      entry.count <= 0 ||
+      !Number.isInteger(entry.slot) ||
+      entry.slot < 0 ||
+      entry.slot >= KD_CHILD_SLOT_COUNT
+    ) {
       continue;
     }
-    out.set(entry.slot, {
+    out[entry.slot] = {
       slot: entry.slot,
       count: entry.count,
       minimum: entry.minimum.slice(),
       maximum: entry.maximum.slice(),
-    });
+    };
   }
-  return out.size > 0 ? out : null;
+  return adaptiveChildStatsHasEntries(out) ? out : null;
 }
 
 function makeAdaptiveChildEntry(slot, start = null, end = null) {
@@ -6227,43 +6244,26 @@ async function computeRootBasisAxesFromPositions(source) {
 async function computeNodeOrientedBoxesFromPositions(
   root,
   source,
-  rootBasisAxes = null,
+  rootBasisAxes,
 ) {
+  ensure(!!rootBasisAxes, 'Missing root basis axes for OBB computation.');
   const statsByNode = new Map();
   await forEachStagedPosition(source, (x, y, z) => {
     forEachNodeOnPointPath(root, x, y, z, (node) => {
       let stats = statsByNode.get(node);
       if (!stats) {
         stats = makeOrientedBoxStats(node);
+        prepareOrientedBoxStats(stats, rootBasisAxes);
         statsByNode.set(node, stats);
       }
-      updatePositionMomentStats(stats, x, y, z);
+      updateOrientedBoxStatsWithBasis(stats, x, y, z);
     });
   });
-
-  const rootStats = statsByNode.get(root);
-  const activeRootBasisAxes =
-    rootBasisAxes ||
-    (rootStats ? orthonormalBasisFromMomentStats(rootStats) : null);
 
   for (const stats of statsByNode.values()) {
     const node = stats.node;
     node.count = stats.count;
     node.bounds = boundsFromMinMax(stats.minimum, stats.maximum, node.bounds);
-    prepareOrientedBoxStats(stats, activeRootBasisAxes);
-  }
-
-  await forEachStagedPosition(source, (x, y, z) => {
-    forEachNodeOnPointPath(root, x, y, z, (node) => {
-      const stats = statsByNode.get(node);
-      if (stats) {
-        updateOrientedBoxProjectionStats(stats, x, y, z);
-      }
-    });
-  });
-
-  for (const stats of statsByNode.values()) {
-    const node = stats.node;
     node.orientedBox = normalizeOrientedBox(
       orientedBoxFromProjectionStats(stats, node.bounds),
     );
@@ -6279,7 +6279,7 @@ async function buildAdaptiveNodeTreeFromPositions(
 ) {
   const orientedBoundingBoxes = options.orientedBoundingBoxes === true;
   const rootBasisAxes = orientedBoundingBoxes
-    ? await computeRootBasisAxesFromPositions(source)
+    ? options.rootBasisAxes || (await computeRootBasisAxesFromPositions(source))
     : null;
   const buildOptions = {
     ...options,
@@ -6371,7 +6371,7 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
         candidateRowTotal,
         `building k-d tree | split candidates=${candidates.length}`,
       );
-      const statsByNode = new Map();
+      const statsList = [];
       for (const range of candidateRanges) {
         const node = range.node;
         const stats = makeAdaptiveSplitStats(node, splitBasisAxes);
@@ -6385,13 +6385,13 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
           range.end,
           splitProgress,
         );
-        statsByNode.set(node, stats);
+        statsList.push(stats);
       }
       advanceTilingProgress(splitProgress, 0, { force: true });
 
       const actionStats = [];
       const kdActionStats = [];
-      for (const stats of statsByNode.values()) {
+      for (const stats of statsList) {
         stats.node.count = stats.count;
         const tightBounds = boundsFromMinMax(
           stats.minimum,
@@ -6601,22 +6601,29 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
       break;
     }
 
-    const statsByNode = new Map();
+    const statsList = [];
     for (const node of candidates) {
-      statsByNode.set(node, makeAdaptiveSplitStats(node, splitBasisAxes));
+      const stats = makeAdaptiveSplitStats(node, splitBasisAxes);
+      statsList.push(stats);
+      nodeBuildState(node).activeSplitStats = stats;
     }
 
-    await forEachStagedPosition(source, (x, y, z) => {
-      const leaf = resolveLeafNodeForPoint(root, x, y, z);
-      const stats = statsByNode.get(leaf);
-      if (stats) {
-        updateAdaptiveSplitStats(stats, x, y, z);
-      }
-    });
+    try {
+      await forEachStagedPosition(source, (x, y, z) => {
+        const leaf = resolveLeafNodeForPoint(root, x, y, z);
+        const build = leaf._build;
+        const stats = build ? build.activeSplitStats : null;
+        if (stats) {
+          updateAdaptiveSplitStats(stats, x, y, z);
+        }
+      });
+    } finally {
+      clearStatsNodeBuildStateField(statsList, 'activeSplitStats');
+    }
 
     const actionStats = [];
     const kdActionStats = [];
-    for (const stats of statsByNode.values()) {
+    for (const stats of statsList) {
       stats.node.count = stats.count;
       const tightBounds = boundsFromMinMax(
         stats.minimum,
@@ -6657,17 +6664,21 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
     }
 
     if (kdActionStats.length > 0) {
-      const kdStatsByNode = new Map();
       for (const stats of kdActionStats) {
-        kdStatsByNode.set(stats.node, stats);
+        nodeBuildState(stats.node).activeProjectionStats = stats;
       }
-      await forEachStagedPosition(source, (x, y, z) => {
-        const leaf = resolveLeafNodeForPoint(root, x, y, z);
-        const stats = kdStatsByNode.get(leaf);
-        if (stats) {
-          updateAdaptiveProjectionStats(stats, x, y, z);
-        }
-      });
+      try {
+        await forEachStagedPosition(source, (x, y, z) => {
+          const leaf = resolveLeafNodeForPoint(root, x, y, z);
+          const build = leaf._build;
+          const stats = build ? build.activeProjectionStats : null;
+          if (stats) {
+            updateAdaptiveProjectionStats(stats, x, y, z);
+          }
+        });
+      } finally {
+        clearStatsNodeBuildStateField(kdActionStats, 'activeProjectionStats');
+      }
     }
 
     const splittableStats = [];
@@ -6684,9 +6695,9 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
         clearVolumeRebalanceSplitRequest(stats.node);
       }
       applyAdaptiveSplitActionToNode(stats.node, stats.action);
-      stats.childStats = childStatsMapFromSplitAction(stats.action);
+      stats.childStats = childStatsSlotsFromSplitAction(stats.action);
       if (!stats.childStats) {
-        stats.childStats = new Map();
+        stats.childStats = makeAdaptiveChildStatsSlots();
         needsChildStatsScan = true;
       }
       splittableStats.push(stats);
@@ -6697,22 +6708,28 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
     }
 
     if (needsChildStatsScan) {
-      const splittableByNode = new Map();
+      const childScanStats = [];
       for (const stats of splittableStats) {
-        if (stats.childStats.size === 0) {
-          splittableByNode.set(stats.node, stats);
+        if (!adaptiveChildStatsHasEntries(stats.childStats)) {
+          childScanStats.push(stats);
+          nodeBuildState(stats.node).activeChildStats = stats;
         }
       }
 
-      await forEachStagedPosition(source, (x, y, z) => {
-        const leaf = resolveLeafNodeForPoint(root, x, y, z);
-        const stats = splittableByNode.get(leaf);
-        if (!stats) {
-          return;
-        }
-        const slot = childSlotForAdaptiveAction(stats, x, y, z);
-        updateAdaptiveChildStats(stats, slot, x, y, z);
-      });
+      try {
+        await forEachStagedPosition(source, (x, y, z) => {
+          const leaf = resolveLeafNodeForPoint(root, x, y, z);
+          const build = leaf._build;
+          const stats = build ? build.activeChildStats : null;
+          if (!stats) {
+            return;
+          }
+          const slot = childSlotForAdaptiveAction(stats, x, y, z);
+          updateAdaptiveChildStats(stats, slot, x, y, z);
+        });
+      } finally {
+        clearStatsNodeBuildStateField(childScanStats, 'activeChildStats');
+      }
     }
 
     let splitNodeCount = 0;
@@ -7592,10 +7609,15 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
       inputStat,
       args,
       sourceCoordinateSystemDetection.sourceCoordinateSystem,
+      DEFAULT_SOURCE_COORDINATE_SYSTEM,
     );
 
     if (!args.clean) {
-      pipelineState = await readPipelineState(tempDir);
+      pipelineState = await readPipelineState(
+        tempDir,
+        PIPELINE_STATE_FILE,
+        PIPELINE_STAGE_BUCKETED,
+      );
       if (
         pipelineState &&
         pipelineState.version === PIPELINE_STATE_VERSION &&
@@ -7616,7 +7638,10 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
     if (!pipelineState) {
       await fs.promises.rm(tempDir, { recursive: true, force: true });
       await fs.promises.mkdir(tempDir, { recursive: true });
-      pipelineState = makeEmptyPipelineState(fingerprint);
+      pipelineState = makeEmptyPipelineState(
+        PIPELINE_STATE_VERSION,
+        fingerprint,
+      );
     } else {
       await fs.promises.mkdir(tempDir, { recursive: true });
     }
@@ -7685,6 +7710,7 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
             {
               progress: tilingProgress,
               orientedBoundingBoxes: useOrientedBoundingBoxes(args),
+              rootBasisAxes: staged.rootBasisAxes,
               tileRefinement: args.tileRefinement,
             },
           );
@@ -7693,7 +7719,7 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
           staged.positions = null;
           staged.weights = null;
         } else {
-          rootBounds = await scanGlobalBoundsAndWritePositions(
+          const staged = await scanGlobalBoundsAndWritePositions(
             handle,
             inputPath,
             header,
@@ -7706,6 +7732,7 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
               progress: scanProgress,
             },
           );
+          rootBounds = staged.bounds;
           timingsMs.scan_positions_ms = elapsedMsSince(scanStartedAt);
           scanProgress.done(`ms=${timingsMs.scan_positions_ms}`);
 
@@ -7724,6 +7751,7 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
             args.leafLimit,
             {
               orientedBoundingBoxes: useOrientedBoundingBoxes(args),
+              rootBasisAxes: staged.rootBasisAxes,
               tileRefinement: args.tileRefinement,
             },
           );
