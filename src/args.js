@@ -42,7 +42,7 @@ const DEFAULT_CONVERSION_ARGS = {
   colorSpace: 'srgb_rec709_display',
   maxDepth: 8,
   tileRefinement: 2,
-  leafLimit: 100,
+  leafLimit: 1000,
   minGeometricError: null,
   spzSh1Bits: 8,
   spzShRestBits: 8,

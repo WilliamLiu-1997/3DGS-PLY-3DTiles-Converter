@@ -61,7 +61,7 @@ const {
 const DEFAULT_WORKER_SCRIPT = path.join(__dirname, 'convert-core.js');
 const TEMP_WORKSPACE_NAME = '.tmp-ply-partitions';
 const PIPELINE_STATE_FILE = 'pipeline-state.json';
-const PIPELINE_STATE_VERSION = 16;
+const PIPELINE_STATE_VERSION = 18;
 const PIPELINE_STAGE_BUCKETED = 'bucketed';
 const LEAF_BUCKET_DIR = 'leaf';
 const HANDOFF_BUCKET_DIR = 'handoff';
@@ -74,7 +74,9 @@ const SCAN_PROGRESS_ROW_INTERVAL = 8192;
 const PARTITION_PROGRESS_ROW_INTERVAL = 8192;
 const TILING_TREE_PROGRESS_ROW_INTERVAL = 65536;
 const POSITION_TMP_FILE = 'positions.tmp';
-const POSITION_ROW_BYTE_SIZE = 16;
+const POSITION_ROW_FLOAT_COUNT = 4;
+const POSITION_ROW_BYTE_SIZE =
+  POSITION_ROW_FLOAT_COUNT * Float32Array.BYTES_PER_ELEMENT;
 const POSITION_INDEX_ROW_BYTE_SIZE = Uint32Array.BYTES_PER_ELEMENT;
 const POSITION_TMP_BUFFER_BYTES = 256 * 1024;
 const WRITEV_BATCH_CHUNKS = 1024;
@@ -89,7 +91,7 @@ const LONG_TILE_SPLIT_MODE =
   'virtual_single_weak_connection_range_midpoint_projection_split';
 const KD_TREE_SPLIT_DIRECTION = 'root_pca_basis_axis';
 const KD_TREE_SPLIT_DIRECTION_AABB = 'aabb_axis';
-const KD_TREE_COVARIANCE_WEIGHTING = 'unweighted_splat_centers';
+const KD_TREE_COVARIANCE_WEIGHTING = 'split_visual_weighted_splat_centers';
 const KD_TREE_SPLIT_PLANE =
   'weak_connection_range_midpoint_projection_histogram';
 const KD_TREE_SPLIT_BALANCE = 'root_pca_axis_weak_connection_range_midpoint';
@@ -100,6 +102,9 @@ const SPLIT_WEIGHT_FORMULA = 'max(opacity,1e-4)*radius3sigma^2';
 const ADAPTIVE_SPLIT_HISTOGRAM_BINS = 64;
 const ADAPTIVE_SPLIT_RANGE_MIDPOINT_SCORE_WEIGHT = 2;
 const ADAPTIVE_SPLIT_CONNECTION_SCORE_WEIGHT = 1;
+const KD_TREE_AXIS_COMPETITION_ASPECT_RATIO = 1.5;
+const KD_TREE_AXIS_COMPETITION_SCORE_BIAS =
+  'score*longest_projection_extent/candidate_projection_extent';
 const KD_TREE_SPLIT_OBJECTIVE =
   `${ADAPTIVE_SPLIT_RANGE_MIDPOINT_SCORE_WEIGHT}*range_midpoint_penalty` +
   `+${ADAPTIVE_SPLIT_CONNECTION_SCORE_WEIGHT}*histogram_minmax_connection_strength_penalty`;
@@ -257,7 +262,9 @@ function makeMemoryBudgetPlan(args, { header = null, layout = null } = {}) {
     positionTilingBytes == null || positionScanBytes == null
       ? null
       : Math.max(positionTilingBytes, positionScanBytes);
-  const positionFloatCount = header ? header.vertexCount * 4 : null;
+  const positionFloatCount = header
+    ? header.vertexCount * POSITION_ROW_FLOAT_COUNT
+    : null;
   const positionTmpBufferMax = Math.max(
     POSITION_ROW_BYTE_SIZE,
     Math.min(8 * BYTES_PER_MB, Math.floor(usableBudgetBytes / 16)),
@@ -885,6 +892,10 @@ function makePipelineFingerprint(
     tileBoundingVolumeMode: tileBoundingVolumeModeForArgs(args),
     splitWeightFormula: SPLIT_WEIGHT_FORMULA,
     kdTreeSplitHistogramBins: ADAPTIVE_SPLIT_HISTOGRAM_BINS,
+    kdTreeSplitAxisCompetitionAspectRatio:
+      KD_TREE_AXIS_COMPETITION_ASPECT_RATIO,
+    kdTreeSplitAxisCompetitionScoreBias:
+      KD_TREE_AXIS_COMPETITION_SCORE_BIAS,
     kdTreeMaxLongWidthRatio: ADAPTIVE_MAX_LONG_WIDTH_RATIO,
     kdTreeLongTileSplitMode: LONG_TILE_SPLIT_MODE,
     kdTreeVolumeRebalanceRule: ADAPTIVE_VOLUME_REBALANCE_RULE,
@@ -3952,7 +3963,11 @@ async function scanGlobalBoundsAndWritePositions(
   const buffer = Buffer.allocUnsafe(rowsPerBuffer * POSITION_ROW_BYTE_SIZE);
   const floatView =
     IS_LITTLE_ENDIAN && (buffer.byteOffset & 3) === 0
-      ? new Float32Array(buffer.buffer, buffer.byteOffset, rowsPerBuffer * 4)
+      ? new Float32Array(
+          buffer.buffer,
+          buffer.byteOffset,
+          rowsPerBuffer * POSITION_ROW_FLOAT_COUNT,
+        )
       : null;
   let bufferedRows = 0;
   let count = 0;
@@ -4020,7 +4035,7 @@ async function scanGlobalBoundsAndWritePositions(
         updatePositionBounds(minimum, maximum, fx, fy, fz);
 
         if (floatView) {
-          const base = bufferedRows * 4;
+          const base = bufferedRows * POSITION_ROW_FLOAT_COUNT;
           floatView[base + 0] = fx;
           floatView[base + 1] = fy;
           floatView[base + 2] = fz;
@@ -4297,9 +4312,6 @@ function makeAdaptiveSplitStats(node, basisAxes = null) {
   return {
     node,
     count: 0,
-    totalWeight: 0.0,
-    mean: [0.0, 0.0, 0.0],
-    covarianceM2: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     minimum: [Infinity, Infinity, Infinity],
     maximum: [-Infinity, -Infinity, -Infinity],
     splitPoint: null,
@@ -4309,7 +4321,8 @@ function makeAdaptiveSplitStats(node, basisAxes = null) {
     projectionMin: null,
     projectionMax: null,
     projectionHistogram: null,
-    projectionConnectionHistogram: null,
+    projectionCandidateStats: null,
+    projectionHistogramBinCount: 0,
     projectionTotalWeight: 0.0,
     projectionTotalCount: 0,
     basisAxes: normalizedBasisAxes,
@@ -4489,9 +4502,21 @@ function markCurrentLodTilesForVolumeRebalance(root, targetDepths = null) {
   }
 }
 
-function updatePositionMomentStats(stats, x, y, z) {
+function updatePositionStatsBounds(stats, x, y, z) {
   const minimum = stats.minimum;
   const maximum = stats.maximum;
+
+  if (x < minimum[0]) minimum[0] = x;
+  if (x > maximum[0]) maximum[0] = x;
+
+  if (y < minimum[1]) minimum[1] = y;
+  if (y > maximum[1]) maximum[1] = y;
+
+  if (z < minimum[2]) minimum[2] = z;
+  if (z > maximum[2]) maximum[2] = z;
+}
+
+function updatePositionMomentStats(stats, x, y, z) {
   const nextCount = stats.count + 1;
   const mean = stats.mean;
   const dx = x - mean[0];
@@ -4515,20 +4540,50 @@ function updatePositionMomentStats(stats, x, y, z) {
   m2[5] += dz * dz2;
 
   stats.count = nextCount;
-
-  if (x < minimum[0]) minimum[0] = x;
-  if (x > maximum[0]) maximum[0] = x;
-
-  if (y < minimum[1]) minimum[1] = y;
-  if (y > maximum[1]) maximum[1] = y;
-
-  if (z < minimum[2]) minimum[2] = z;
-  if (z > maximum[2]) maximum[2] = z;
+  updatePositionStatsBounds(stats, x, y, z);
 }
 
-function updateAdaptiveSplitStats(stats, x, y, z, weight = 1.0) {
-  updatePositionMomentStats(stats, x, y, z);
-  stats.totalWeight += normalizeSplitWeight(weight);
+function updateWeightedPositionMomentStats(stats, x, y, z, weight = 1.0) {
+  const splitWeight = normalizeSplitWeight(weight);
+  const totalWeight =
+    Number.isFinite(stats.totalWeight) && stats.totalWeight > 0.0
+      ? stats.totalWeight
+      : 0.0;
+  const nextTotalWeight = totalWeight + splitWeight;
+  if (!Number.isFinite(nextTotalWeight) || nextTotalWeight <= 0.0) {
+    updatePositionMomentStats(stats, x, y, z);
+    return;
+  }
+
+  const mean = stats.mean;
+  const dx = x - mean[0];
+  const dy = y - mean[1];
+  const dz = z - mean[2];
+  const weightRatio = splitWeight / nextTotalWeight;
+
+  mean[0] += dx * weightRatio;
+  mean[1] += dy * weightRatio;
+  mean[2] += dz * weightRatio;
+
+  const dx2 = x - mean[0];
+  const dy2 = y - mean[1];
+  const dz2 = z - mean[2];
+  const m2 = stats.covarianceM2;
+  m2[0] += splitWeight * dx * dx2;
+  m2[1] += splitWeight * dx * dy2;
+  m2[2] += splitWeight * dx * dz2;
+  m2[3] += splitWeight * dy * dy2;
+  m2[4] += splitWeight * dy * dz2;
+  m2[5] += splitWeight * dz * dz2;
+
+  stats.count += 1;
+  stats.totalWeight = nextTotalWeight;
+  updatePositionStatsBounds(stats, x, y, z);
+}
+
+function updateAdaptiveSplitStats(stats, x, y, z) {
+  stats.count += 1;
+  updatePositionStatsBounds(stats, x, y, z);
   if (stats.basisAxes) {
     for (let axis = 0; axis < 3; axis++) {
       const projection = dotDirection(stats.basisAxes[axis], x, y, z);
@@ -4662,9 +4717,9 @@ function normalizeBasisAxes(axes) {
   return normalized.every((axis) => !!axis) ? normalized : defaultBasisAxes();
 }
 
-function projectedAspectInfoForBasis(bounds, basisAxes) {
+function projectedAxisInfosForBasis(bounds, basisAxes) {
   const axes = normalizeBasisAxes(basisAxes);
-  const ranked = axes
+  return axes
     .map((direction, axis) => {
       const range = projectionRangeForBounds(bounds, direction);
       const extent = range.maximum - range.minimum;
@@ -4676,8 +4731,45 @@ function projectedAspectInfoForBasis(bounds, basisAxes) {
       };
     })
     .sort((a, b) => b.extent - a.extent);
+}
+
+function projectedAxisInfosFromStats(stats, bounds, basisAxes) {
+  if (
+    stats &&
+    stats.basisAxes &&
+    stats.basisProjectionMinimum &&
+    stats.basisProjectionMaximum
+  ) {
+    return stats.basisAxes
+      .map((direction, axis) => {
+        const minimum = stats.basisProjectionMinimum[axis];
+        const maximum = stats.basisProjectionMaximum[axis];
+        const extent = maximum - minimum;
+        return {
+          axis,
+          direction,
+          range: { minimum, maximum },
+          extent: Number.isFinite(extent) ? Math.max(0.0, extent) : 0.0,
+        };
+      })
+      .sort((a, b) => b.extent - a.extent);
+  }
+  return projectedAxisInfosForBasis(bounds, basisAxes);
+}
+
+function projectedAspectInfoFromAxisInfos(ranked) {
+  if (!ranked || ranked.length === 0) {
+    return {
+      aspect: 1.0,
+      axis: 0,
+      direction: [1.0, 0.0, 0.0],
+      range: { minimum: 0.0, maximum: 0.0 },
+      longestExtent: 0.0,
+      widthExtent: 0.0,
+    };
+  }
   const longest = ranked[0];
-  const width = ranked[1];
+  const width = ranked[1] || longest;
   const epsilon = Math.max(
     ADAPTIVE_SPLIT_EPSILON,
     longest.extent * ADAPTIVE_SPLIT_EPSILON,
@@ -4695,45 +4787,16 @@ function projectedAspectInfoForBasis(bounds, basisAxes) {
   };
 }
 
+function projectedAspectInfoForBasis(bounds, basisAxes) {
+  return projectedAspectInfoFromAxisInfos(
+    projectedAxisInfosForBasis(bounds, basisAxes),
+  );
+}
+
 function projectedAspectInfoFromStats(stats, bounds, basisAxes) {
-  if (
-    stats &&
-    stats.basisAxes &&
-    stats.basisProjectionMinimum &&
-    stats.basisProjectionMaximum
-  ) {
-    const ranked = stats.basisAxes
-      .map((direction, axis) => {
-        const minimum = stats.basisProjectionMinimum[axis];
-        const maximum = stats.basisProjectionMaximum[axis];
-        const extent = maximum - minimum;
-        return {
-          axis,
-          direction,
-          range: { minimum, maximum },
-          extent: Number.isFinite(extent) ? Math.max(0.0, extent) : 0.0,
-        };
-      })
-      .sort((a, b) => b.extent - a.extent);
-    const longest = ranked[0];
-    const width = ranked[1];
-    const epsilon = Math.max(
-      ADAPTIVE_SPLIT_EPSILON,
-      longest.extent * ADAPTIVE_SPLIT_EPSILON,
-    );
-    return {
-      aspect:
-        longest.extent > epsilon
-          ? longest.extent / Math.max(width.extent, epsilon)
-          : 1.0,
-      axis: longest.axis,
-      direction: longest.direction,
-      range: longest.range,
-      longestExtent: longest.extent,
-      widthExtent: width.extent,
-    };
-  }
-  return projectedAspectInfoForBasis(bounds, basisAxes);
+  return projectedAspectInfoFromAxisInfos(
+    projectedAxisInfosFromStats(stats, bounds, basisAxes),
+  );
 }
 
 function cross3(lhs, rhs) {
@@ -4847,6 +4910,7 @@ function makeOrientedBoxStats(node) {
   return {
     node,
     count: 0,
+    totalWeight: 0.0,
     mean: [0.0, 0.0, 0.0],
     covarianceM2: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     minimum: [Infinity, Infinity, Infinity],
@@ -4925,14 +4989,13 @@ function orientedBoxFromProjectionStats(stats, fallbackBounds) {
   ];
 }
 
-function makeKdSplitAction(stats, tightBounds, basisAxes = null) {
-  const basisInfo = projectedAspectInfoFromStats(stats, tightBounds, basisAxes);
-  const splitDirection = basisInfo.direction;
-  if (!splitDirection || !basisInfo.range) {
+function kdProjectionCandidateFromAxisInfo(axisInfo) {
+  if (!axisInfo || !axisInfo.direction || !axisInfo.range) {
     return null;
   }
-  const projectionRange = basisInfo.range;
-  const projectionExtent = projectionRange.maximum - projectionRange.minimum;
+  const projectionMin = axisInfo.range.minimum;
+  const projectionMax = axisInfo.range.maximum;
+  const projectionExtent = projectionMax - projectionMin;
   const epsilon = Math.max(
     ADAPTIVE_SPLIT_EPSILON,
     Math.abs(projectionExtent) * ADAPTIVE_SPLIT_EPSILON,
@@ -4940,18 +5003,63 @@ function makeKdSplitAction(stats, tightBounds, basisAxes = null) {
   if (
     !Number.isFinite(projectionExtent) ||
     projectionExtent <= epsilon ||
-    !Number.isFinite(projectionRange.minimum) ||
-    !Number.isFinite(projectionRange.maximum)
+    !Number.isFinite(projectionMin) ||
+    !Number.isFinite(projectionMax)
   ) {
     return null;
   }
   return {
+    basisAxis: axisInfo.axis,
+    splitDirection: axisInfo.direction.slice(),
+    projectionMin,
+    projectionMax,
+    projectionExtent,
+    axisScoreMultiplier: 1.0,
+  };
+}
+
+function kdProjectionCandidatesFromAxisInfos(axisInfos) {
+  const primary = kdProjectionCandidateFromAxisInfo(axisInfos && axisInfos[0]);
+  if (!primary) {
+    return [];
+  }
+  primary.axisScoreMultiplier = 1.0;
+
+  const candidates = [primary];
+  const secondaryInfo = axisInfos[1];
+  const secondary = kdProjectionCandidateFromAxisInfo(secondaryInfo);
+  if (secondary) {
+    const ratio =
+      secondary.projectionExtent > ADAPTIVE_SPLIT_EPSILON
+        ? primary.projectionExtent / secondary.projectionExtent
+        : Infinity;
+    if (
+      Number.isFinite(ratio) &&
+      ratio < KD_TREE_AXIS_COMPETITION_ASPECT_RATIO
+    ) {
+      secondary.axisScoreMultiplier = Math.max(1.0, ratio);
+      candidates.push(secondary);
+    }
+  }
+  return candidates;
+}
+
+function makeKdSplitAction(stats, tightBounds, basisAxes = null) {
+  const candidates = kdProjectionCandidatesFromAxisInfos(
+    projectedAxisInfosFromStats(stats, tightBounds, basisAxes),
+  );
+  const primary = candidates[0];
+  if (!primary) {
+    return null;
+  }
+  return {
     kind: ROUTE_MODE_KD,
-    basisAxis: basisInfo.axis,
-    splitDirection,
+    basisAxis: primary.basisAxis,
+    splitDirection: primary.splitDirection.slice(),
     splitOffset: null,
-    projectionMin: projectionRange.minimum,
-    projectionMax: projectionRange.maximum,
+    projectionMin: primary.projectionMin,
+    projectionMax: primary.projectionMax,
+    projectionCandidates: candidates,
   };
 }
 
@@ -4961,38 +5069,93 @@ function resetAdaptiveProjectionStats(stats) {
     action && action.kind === ROUTE_MODE_KD,
     `Missing k-d projection action for node ${stats.node.key}.`,
   );
-  stats.projectionMin = action.projectionMin;
-  stats.projectionMax = action.projectionMax;
-  stats.projectionHistogram = new Float64Array(ADAPTIVE_SPLIT_HISTOGRAM_BINS);
-  stats.projectionConnectionHistogram = new Float64Array(
-    ADAPTIVE_SPLIT_HISTOGRAM_BINS,
-  );
+  const binCount = ADAPTIVE_SPLIT_HISTOGRAM_BINS;
+  const candidates =
+    action.projectionCandidates && action.projectionCandidates.length > 0
+      ? action.projectionCandidates
+      : [
+          {
+            basisAxis: action.basisAxis,
+            splitDirection: action.splitDirection,
+            projectionMin: action.projectionMin,
+            projectionMax: action.projectionMax,
+            axisScoreMultiplier: 1.0,
+          },
+        ];
+  stats.projectionCandidateStats = candidates.map((candidate) => ({
+    basisAxis: candidate.basisAxis,
+    splitDirection: candidate.splitDirection.slice(),
+    projectionMin: candidate.projectionMin,
+    projectionMax: candidate.projectionMax,
+    axisScoreMultiplier:
+      Number.isFinite(candidate.axisScoreMultiplier) &&
+      candidate.axisScoreMultiplier >= 1.0
+        ? candidate.axisScoreMultiplier
+        : 1.0,
+    projectionHistogram: new Float64Array(binCount),
+    projectionTotalWeight: 0.0,
+    projectionTotalCount: 0,
+  }));
+  const primary = stats.projectionCandidateStats[0];
+  stats.projectionMin = primary.projectionMin;
+  stats.projectionMax = primary.projectionMax;
+  stats.projectionHistogram = primary.projectionHistogram;
   stats.projectionTotalWeight = 0.0;
   stats.projectionTotalCount = 0;
+  stats.projectionHistogramBinCount = binCount;
+  action.projectionHistogramBinCount = binCount;
 }
 
-function updateAdaptiveProjectionStats(stats, x, y, z, weight = 1.0) {
-  const action = stats.action;
-  const direction = action ? action.splitDirection : null;
-  if (!direction || !stats.projectionHistogram) {
+function projectionBinIndex(projection, min, extent, binCount) {
+  if (
+    !Number.isFinite(projection) ||
+    !Number.isFinite(min) ||
+    !Number.isFinite(extent) ||
+    extent <= 0.0 ||
+    !Number.isInteger(binCount) ||
+    binCount <= 0
+  ) {
+    return 0;
+  }
+  let bin = Math.floor(((projection - min) / extent) * binCount);
+  return Math.max(0, Math.min(binCount - 1, bin));
+}
+
+function addWeightedProjectionPoint(candidate, projection, weight) {
+  const histogram = candidate.projectionHistogram;
+  const min = candidate.projectionMin;
+  const max = candidate.projectionMax;
+  const extent = max - min;
+  const binCount = histogram ? histogram.length : 0;
+  if (!histogram || binCount <= 0) {
     return;
   }
-  const min = stats.projectionMin;
-  const max = stats.projectionMax;
-  const extent = max - min;
+  if (!Number.isFinite(projection)) {
+    return;
+  }
   if (!Number.isFinite(extent) || extent <= 0.0) {
     return;
   }
-  const projection = dotDirection(direction, x, y, z);
+  const bin = projectionBinIndex(projection, min, extent, binCount);
+  histogram[bin] += weight;
+}
+
+function updateAdaptiveProjectionStats(stats, x, y, z, weight = 1.0) {
+  const candidates = stats.projectionCandidateStats;
+  if (!candidates || candidates.length === 0) {
+    return;
+  }
   const splitWeight = normalizeSplitWeight(weight);
-  let bin = Math.floor(
-    ((projection - min) / extent) * ADAPTIVE_SPLIT_HISTOGRAM_BINS,
-  );
-  bin = Math.max(0, Math.min(ADAPTIVE_SPLIT_HISTOGRAM_BINS - 1, bin));
-  stats.projectionHistogram[bin] += splitWeight;
-  stats.projectionConnectionHistogram[bin] += splitWeight;
-  stats.projectionTotalWeight += splitWeight;
-  stats.projectionTotalCount += 1;
+  for (const candidate of candidates) {
+    const direction = candidate.splitDirection;
+    const projection = dotDirection(direction, x, y, z);
+    addWeightedProjectionPoint(candidate, projection, splitWeight);
+    candidate.projectionTotalWeight += splitWeight;
+    candidate.projectionTotalCount += 1;
+  }
+  const primary = candidates[0];
+  stats.projectionTotalWeight = primary.projectionTotalWeight;
+  stats.projectionTotalCount = primary.projectionTotalCount;
 }
 
 function normalizedProjectionMidpointPenalty(split, min, max) {
@@ -5062,11 +5225,7 @@ function projectionSplitObjectiveScore(
   );
 }
 
-function collectProjectionSplitCandidates(
-  histogram,
-  connectionHistogram,
-  totalWeight,
-) {
+function collectProjectionSplitCandidates(histogram, totalWeight) {
   const binCount = histogram ? histogram.length : 0;
   const candidates = [];
   let lowerWeight = 0.0;
@@ -5078,7 +5237,7 @@ function collectProjectionSplitCandidates(
       continue;
     }
     const connectionStrength = projectionBoundaryConnectionStrength(
-      connectionHistogram,
+      histogram,
       boundary,
     );
     if (!Number.isFinite(connectionStrength)) {
@@ -5104,15 +5263,13 @@ function collectProjectionSplitCandidates(
   };
 }
 
-function chooseProjectionSplitOffset(stats) {
-  const action = stats.action;
-  const histogram = stats.projectionHistogram;
-  const connectionHistogram = stats.projectionConnectionHistogram;
-  if (!action || !histogram || !connectionHistogram) {
+function chooseProjectionSplitForCandidate(candidate) {
+  const histogram = candidate.projectionHistogram;
+  if (!histogram) {
     return null;
   }
-  const min = stats.projectionMin;
-  const max = stats.projectionMax;
+  const min = candidate.projectionMin;
+  const max = candidate.projectionMax;
   const extent = max - min;
   const binCount = histogram.length;
   const epsilon = Math.max(
@@ -5123,8 +5280,8 @@ function chooseProjectionSplitOffset(stats) {
     !Number.isFinite(extent) ||
     extent <= epsilon ||
     binCount <= 1 ||
-    !Number.isFinite(stats.projectionTotalWeight) ||
-    stats.projectionTotalWeight <= 0.0
+    !Number.isFinite(candidate.projectionTotalWeight) ||
+    candidate.projectionTotalWeight <= 0.0
   ) {
     return null;
   }
@@ -5132,22 +5289,22 @@ function chooseProjectionSplitOffset(stats) {
   const { candidates, minimumConnectionStrength, maximumConnectionStrength } =
     collectProjectionSplitCandidates(
       histogram,
-      connectionHistogram,
-      stats.projectionTotalWeight,
+      candidate.projectionTotalWeight,
     );
   let bestBoundary = -1;
   let bestScore = Infinity;
   let bestConnectionPenalty = Infinity;
   let bestMidpointPenalty = Infinity;
-  for (const candidate of candidates) {
-    const split = min + (extent * candidate.boundary) / binCount;
+  let bestConnectionStrength = Infinity;
+  for (const splitCandidate of candidates) {
+    const split = min + (extent * splitCandidate.boundary) / binCount;
     const midpointPenalty = normalizedProjectionMidpointPenalty(
       split,
       min,
       max,
     );
     const connectionPenalty = normalizedProjectionConnectionStrengthPenalty(
-      candidate.connectionStrength,
+      splitCandidate.connectionStrength,
       minimumConnectionStrength,
       maximumConnectionStrength,
     );
@@ -5166,14 +5323,30 @@ function chooseProjectionSplitOffset(stats) {
       bestScore = score;
       bestConnectionPenalty = connectionPenalty;
       bestMidpointPenalty = midpointPenalty;
-      bestBoundary = candidate.boundary;
+      bestConnectionStrength = splitCandidate.connectionStrength;
+      bestBoundary = splitCandidate.boundary;
     }
   }
 
   if (bestBoundary > 0) {
     const split = min + (extent * bestBoundary) / binCount;
     if (split > min + epsilon && split < max - epsilon) {
-      return split;
+      const scoreMultiplier =
+        Number.isFinite(candidate.axisScoreMultiplier) &&
+        candidate.axisScoreMultiplier >= 1.0
+          ? candidate.axisScoreMultiplier
+          : 1.0;
+      return {
+        candidate,
+        splitOffset: split,
+        score: bestScore,
+        axisAdjustedScore: bestScore * scoreMultiplier,
+        axisScoreMultiplier: scoreMultiplier,
+        connectionPenalty: bestConnectionPenalty,
+        midpointPenalty: bestMidpointPenalty,
+        connectionStrength: bestConnectionStrength,
+        fallback: false,
+      };
     }
   }
 
@@ -5182,9 +5355,122 @@ function chooseProjectionSplitOffset(stats) {
     midpointProjection > min + epsilon &&
     midpointProjection < max - epsilon
   ) {
-    return midpointProjection;
+    const scoreMultiplier =
+      Number.isFinite(candidate.axisScoreMultiplier) &&
+      candidate.axisScoreMultiplier >= 1.0
+        ? candidate.axisScoreMultiplier
+        : 1.0;
+    return {
+      candidate,
+      splitOffset: midpointProjection,
+      score: Infinity,
+      axisAdjustedScore: Infinity,
+      axisScoreMultiplier: scoreMultiplier,
+      connectionPenalty: Infinity,
+      midpointPenalty: 0.0,
+      connectionStrength: Infinity,
+      fallback: true,
+    };
   }
   return null;
+}
+
+function projectionSplitChoiceIsBetter(choice, bestChoice) {
+  if (!choice) {
+    return false;
+  }
+  if (!bestChoice) {
+    return true;
+  }
+  if (choice.fallback !== bestChoice.fallback) {
+    return !choice.fallback;
+  }
+  const choiceScore = Number.isFinite(choice.axisAdjustedScore)
+    ? choice.axisAdjustedScore
+    : choice.score;
+  const bestScore = Number.isFinite(bestChoice.axisAdjustedScore)
+    ? bestChoice.axisAdjustedScore
+    : bestChoice.score;
+  if (choiceScore < bestScore - ADAPTIVE_SPLIT_EPSILON) {
+    return true;
+  }
+  if (choiceScore > bestScore + ADAPTIVE_SPLIT_EPSILON) {
+    return false;
+  }
+  const choiceAxisMultiplier =
+    Number.isFinite(choice.axisScoreMultiplier) &&
+    choice.axisScoreMultiplier >= 1.0
+      ? choice.axisScoreMultiplier
+      : 1.0;
+  const bestAxisMultiplier =
+    Number.isFinite(bestChoice.axisScoreMultiplier) &&
+    bestChoice.axisScoreMultiplier >= 1.0
+      ? bestChoice.axisScoreMultiplier
+      : 1.0;
+  if (
+    choiceAxisMultiplier <
+    bestAxisMultiplier - ADAPTIVE_SPLIT_EPSILON
+  ) {
+    return true;
+  }
+  if (
+    choiceAxisMultiplier >
+    bestAxisMultiplier + ADAPTIVE_SPLIT_EPSILON
+  ) {
+    return false;
+  }
+  if (choice.score < bestChoice.score - ADAPTIVE_SPLIT_EPSILON) {
+    return true;
+  }
+  if (choice.score > bestChoice.score + ADAPTIVE_SPLIT_EPSILON) {
+    return false;
+  }
+  if (
+    choice.connectionPenalty <
+    bestChoice.connectionPenalty - ADAPTIVE_SPLIT_EPSILON
+  ) {
+    return true;
+  }
+  if (
+    choice.connectionPenalty >
+    bestChoice.connectionPenalty + ADAPTIVE_SPLIT_EPSILON
+  ) {
+    return false;
+  }
+  if (
+    choice.midpointPenalty <
+    bestChoice.midpointPenalty - ADAPTIVE_SPLIT_EPSILON
+  ) {
+    return true;
+  }
+  if (
+    choice.midpointPenalty >
+    bestChoice.midpointPenalty + ADAPTIVE_SPLIT_EPSILON
+  ) {
+    return false;
+  }
+  const choiceExtent =
+    choice.candidate.projectionMax - choice.candidate.projectionMin;
+  const bestExtent =
+    bestChoice.candidate.projectionMax - bestChoice.candidate.projectionMin;
+  return choiceExtent > bestExtent + ADAPTIVE_SPLIT_EPSILON;
+}
+
+function chooseProjectionSplit(stats) {
+  const action = stats.action;
+  const candidates = stats.projectionCandidateStats;
+  if (!action || !candidates || candidates.length === 0) {
+    return null;
+  }
+
+  let bestChoice = null;
+  for (const candidate of candidates) {
+    const choice = chooseProjectionSplitForCandidate(candidate);
+    if (projectionSplitChoiceIsBetter(choice, bestChoice)) {
+      bestChoice = choice;
+    }
+  }
+  return bestChoice;
 }
 
 function finalizeKdSplitAction(stats) {
@@ -5192,10 +5478,16 @@ function finalizeKdSplitAction(stats) {
   if (!action || action.kind !== ROUTE_MODE_KD) {
     return true;
   }
-  const splitOffset = chooseProjectionSplitOffset(stats);
+  const choice = chooseProjectionSplit(stats);
+  const splitOffset = choice ? choice.splitOffset : null;
   if (!Number.isFinite(splitOffset)) {
     return false;
   }
+  const candidate = choice.candidate;
+  action.basisAxis = candidate.basisAxis;
+  action.splitDirection = candidate.splitDirection.slice();
+  action.projectionMin = candidate.projectionMin;
+  action.projectionMax = candidate.projectionMax;
   action.splitOffset = splitOffset;
   stats.splitDirection = action.splitDirection.slice();
   stats.splitOffset = splitOffset;
@@ -5598,7 +5890,6 @@ function advanceTilingProgress(state, rows, { force = false } = {}) {
 function updateAdaptiveSplitStatsForPositionIndexRange(
   stats,
   positions,
-  weights,
   indices,
   start,
   end,
@@ -5613,7 +5904,6 @@ function updateAdaptiveSplitStatsForPositionIndexRange(
       positions[base + 0],
       positions[base + 1],
       positions[base + 2],
-      weights ? weights[rowIndex] : 1.0,
     );
     pendingProgressRows += 1;
     if (pendingProgressRows >= TILING_TREE_PROGRESS_ROW_INTERVAL) {
@@ -5767,7 +6057,11 @@ async function forEachStagedPosition(source, callback) {
   const chunk = Buffer.allocUnsafe(rowsPerChunk * POSITION_ROW_BYTE_SIZE);
   const floatView =
     IS_LITTLE_ENDIAN && (chunk.byteOffset & 3) === 0
-      ? new Float32Array(chunk.buffer, chunk.byteOffset, rowsPerChunk * 4)
+      ? new Float32Array(
+          chunk.buffer,
+          chunk.byteOffset,
+          rowsPerChunk * POSITION_ROW_FLOAT_COUNT,
+        )
       : null;
   const handle = await fs.promises.open(source.positionsPath, 'r');
   try {
@@ -5794,7 +6088,7 @@ async function forEachStagedPosition(source, callback) {
         let z;
         let weight;
         if (floatView) {
-          const base = i * 4;
+          const base = i * POSITION_ROW_FLOAT_COUNT;
           x = floatView[base + 0];
           y = floatView[base + 1];
           z = floatView[base + 2];
@@ -5834,8 +6128,8 @@ function forEachNodeOnPointPath(root, x, y, z, callback) {
 
 async function computeRootBasisAxesFromPositions(source) {
   const stats = makeOrientedBoxStats(null);
-  await forEachStagedPosition(source, (x, y, z) => {
-    updatePositionMomentStats(stats, x, y, z);
+  await forEachStagedPosition(source, (x, y, z, weight) => {
+    updateWeightedPositionMomentStats(stats, x, y, z, weight);
   });
   return orthonormalBasisFromMomentStats(stats);
 }
@@ -5994,7 +6288,6 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
         updateAdaptiveSplitStatsForPositionIndexRange(
           stats,
           positions,
-          weights,
           indices,
           range.start,
           range.end,
@@ -6223,11 +6516,11 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
       statsByNode.set(node, makeAdaptiveSplitStats(node, splitBasisAxes));
     }
 
-    await forEachStagedPosition(source, (x, y, z, weight) => {
+    await forEachStagedPosition(source, (x, y, z) => {
       const leaf = resolveLeafNodeForPoint(root, x, y, z);
       const stats = statsByNode.get(leaf);
       if (stats) {
-        updateAdaptiveSplitStats(stats, x, y, z, weight);
+        updateAdaptiveSplitStats(stats, x, y, z);
       }
     });
 
@@ -7057,6 +7350,10 @@ function makeBuildSummary(
     tile_bounding_volume_mode: tileBoundingVolumeModeForArgs(args),
     split_weight_formula: SPLIT_WEIGHT_FORMULA,
     kd_tree_split_histogram_bins: ADAPTIVE_SPLIT_HISTOGRAM_BINS,
+    kd_tree_split_axis_competition_aspect_ratio:
+      KD_TREE_AXIS_COMPETITION_ASPECT_RATIO,
+    kd_tree_split_axis_competition_score_bias:
+      KD_TREE_AXIS_COMPETITION_SCORE_BIAS,
     kd_tree_max_long_width_ratio: ADAPTIVE_MAX_LONG_WIDTH_RATIO,
     kd_tree_long_tile_split_mode: LONG_TILE_SPLIT_MODE,
     kd_tree_long_tile_split_virtual: true,

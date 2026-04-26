@@ -52,7 +52,7 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 - Replaced the in-memory octree build path with a single explicit, visual-cost-balanced k-d tree pipeline that uses root PCA axes by default and keeps leaf buckets balanced by weighted splat count.
 - Replaced long, thin non-root k-d tiles with equal-length virtual segment paths so emitted intermediate tiles avoid extreme aspect ratios while logical LOD depth remains bounded by `maxDepth`.
-- Changed defaults: `maxDepth` is now `8`, `leafLimit` is now `100`, SPZ gzip compression level is now `8`, `clean` is now `true`, `selfTestCount` is now `1000000`, and inspector launch is enabled by default.
+- Changed defaults: `maxDepth` is now `8`, `leafLimit` is now `1000`, SPZ gzip compression level is now `8`, `clean` is now `true`, `selfTestCount` is now `1000000`, and inspector launch is enabled by default.
 - Changed resume semantics so the default conversion rebuilds from a clean output directory; use `--continue` or `clean: false` to reuse a preserved checkpoint.
 - Updated voxel simplification so retained splat targets drive voxel grouping directly and representative selection stays coarse-biased across `sample` and `merge` modes.
 - Improved large-file conversion throughput by staging position data when it fits the memory budget, prefetching binary PLY chunks, compacting partition writes, limiting active leaf file handles, batching GLB writes, streaming unsimplified bucket content directly to SPZ/GLB output, and running exact bucket simplification and content packing in the derived worker pool.
