@@ -6,6 +6,8 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-04-27
+
 ### Added
 
 - Added `splitMidpointPenalty` / `--split-midpoint-penalty` and `splitCountBalancePenalty` / `--split-count-balance-penalty` controls for k-d split-plane scoring, with both values recorded in `build_summary.json`.
