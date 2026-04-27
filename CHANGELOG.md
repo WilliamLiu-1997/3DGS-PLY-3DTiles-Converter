@@ -6,13 +6,21 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+### Added
+
+- Added `splitMidpointPenalty` / `--split-midpoint-penalty` and `splitCountBalancePenalty` / `--split-count-balance-penalty` controls for k-d split-plane scoring, with both values recorded in `build_summary.json`.
+- Added same-LOD virtual volume-rebalance splits for leaf tiles whose volume is more than 3x the median volume at the same logical depth.
+
 ### Changed
 
-- Changed k-d split-plane selection to test 64 equal longest-axis boundaries and score each split by normalized child tile volume sum plus midpoint-distance penalty; when the longest/second-longest axis ratio is below 1.5, the second axis is tested too.
-- Changed long-tile virtual splitting to use the same 64-segment volume/midpoint score, with a single virtual split per long-tile branch instead of equal-length segment buckets.
-- Added a virtual volume-rebalance split after k-d splits for current-LOD leaf tiles whose volume is more than 3x the median volume at the same logical depth.
+- Reworked adaptive k-d split-plane selection to divide candidate axes into 256 equal projection segments and score each internal boundary by normalized child tile volume sum plus configurable midpoint-distance and splat-count balance penalties.
+- Changed secondary-axis split competition so the second-longest axis is evaluated when the longest axis is less than 2x longer, with the secondary score multiplied by `sqrt(longest / second)`.
+- Changed long, thin non-root tile handling to use one scored virtual k-d split at the same logical LOD instead of equal-length virtual segment buckets.
+- Changed the default `leafLimit` / `--leaf-limit` value from `100` to `1000`.
 - Changed the default estimated geometric-error multiplier from `2.5` to `2`.
-- Updated the `3dtiles-inspector` dependency range to `^0.1.7`.
+- Refactored the large-PLY conversion pipeline into staged adaptive tiling, scan, bucket I/O, bottom-up build, tile content, and tileset output modules while preserving the public `convert` API.
+- Improved large-file hot paths with direct binary Float32 decode plans, staged in-memory position data when the memory budget allows, chunked bucket entry caching, and shared concurrency helpers.
+- Updated the `3dtiles-inspector` dependency range to `^0.1.7` and added the `3dgs` npm keyword.
 
 ## [0.3.3] - 2026-04-25
 
