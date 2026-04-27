@@ -67,6 +67,163 @@ const HANDOFF_BUCKET_DIR = 'handoff';
 const POSITION_TMP_FILE = 'positions.tmp';
 const PIPELINE_STATE_SAVE_INTERVAL_MS = 5000;
 const PIPELINE_STATE_SAVE_NODE_INTERVAL = 512;
+const AUTO_MAX_DEPTH_TARGET_SPLATS = 160000;
+const AUTO_TILE_REFINEMENT_LEAF_LIMIT_MULTIPLIER = 5;
+
+function calculateAutoMaxDepth(splatCount, samplingRatePerLevel) {
+  if (
+    !Number.isFinite(splatCount) ||
+    splatCount <= AUTO_MAX_DEPTH_TARGET_SPLATS
+  ) {
+    return 0;
+  }
+  if (!Number.isFinite(samplingRatePerLevel) || samplingRatePerLevel >= 1.0) {
+    return 0;
+  }
+  const rawDepth =
+    Math.log(AUTO_MAX_DEPTH_TARGET_SPLATS / splatCount) /
+    Math.log(samplingRatePerLevel);
+  if (!Number.isFinite(rawDepth) || rawDepth <= 0.0) {
+    return 0;
+  }
+  return Math.ceil(rawDepth);
+}
+
+function resolveMaxDepthFromHeader(args, header) {
+  if (args.maxDepth != null) {
+    args.maxDepthSource = 'explicit';
+    return;
+  }
+  args.maxDepth = calculateAutoMaxDepth(
+    header.vertexCount,
+    args.samplingRatePerLevel,
+  );
+  args.maxDepthSource = 'auto';
+  args.autoMaxDepthTargetSplats = AUTO_MAX_DEPTH_TARGET_SPLATS;
+}
+
+function estimateRootRefinementTileCount(tileRefinement, maxDepth) {
+  if (!Number.isFinite(maxDepth) || maxDepth <= 0) {
+    return 1;
+  }
+  const refinement = Math.max(1, Math.floor(tileRefinement || 1));
+  let tileCount = 2;
+  for (let pass = 1; pass < refinement; pass++) {
+    tileCount += Math.floor(tileCount / 2);
+  }
+  return tileCount;
+}
+
+function calculateAutoTileRefinement(
+  splatCount,
+  leafLimit,
+  maxDepth,
+  samplingRatePerLevel,
+) {
+  const depth = Math.max(0, Math.floor(maxDepth || 0));
+  const depthTileFactor =
+    depth <= 0 || !Number.isFinite(samplingRatePerLevel)
+      ? 1
+      : (1 / samplingRatePerLevel) ** depth;
+  const denominator =
+    leafLimit * AUTO_TILE_REFINEMENT_LEAF_LIMIT_MULTIPLIER * depthTileFactor;
+  if (depth <= 0) {
+    return {
+      tileRefinement: 1,
+      targetRootTiles:
+        Number.isFinite(splatCount) &&
+        Number.isFinite(denominator) &&
+        denominator > 0.0
+          ? splatCount / denominator
+          : 1,
+      estimatedRootTiles: 1,
+    };
+  }
+  if (
+    !Number.isFinite(splatCount) ||
+    !Number.isFinite(denominator) ||
+    denominator <= 0.0 ||
+    splatCount <= denominator
+  ) {
+    return {
+      tileRefinement: 1,
+      targetRootTiles: 1,
+      estimatedRootTiles: estimateRootRefinementTileCount(1, depth),
+    };
+  }
+
+  const targetRootTiles = splatCount / denominator;
+  let tileRefinement = 1;
+  let estimatedRootTiles = estimateRootRefinementTileCount(
+    tileRefinement,
+    depth,
+  );
+  while (estimatedRootTiles < targetRootTiles) {
+    tileRefinement += 1;
+    estimatedRootTiles = estimateRootRefinementTileCount(tileRefinement, depth);
+  }
+  return { tileRefinement, targetRootTiles, estimatedRootTiles };
+}
+
+function resolveTileRefinementFromHeader(args, header) {
+  if (args.tileRefinement != null) {
+    args.tileRefinementSource = 'explicit';
+    return;
+  }
+  const resolved = calculateAutoTileRefinement(
+    header.vertexCount,
+    args.leafLimit,
+    args.maxDepth,
+    args.samplingRatePerLevel,
+  );
+  args.tileRefinement = resolved.tileRefinement;
+  args.tileRefinementSource = 'auto';
+  args.autoTileRefinementLeafLimitMultiplier =
+    AUTO_TILE_REFINEMENT_LEAF_LIMIT_MULTIPLIER;
+  args.autoTileRefinementTargetRootTiles = resolved.targetRootTiles;
+  args.autoTileRefinementEstimatedRootTiles = resolved.estimatedRootTiles;
+}
+
+function formatTilingParameterNumber(value, fractionDigits = 3) {
+  return Number.isFinite(value) ? value.toFixed(fractionDigits) : String(value);
+}
+
+function logResolvedTilingParameters(args, header) {
+  const maxDepthParts = [
+    `maxDepth=${args.maxDepth}`,
+    `source=${args.maxDepthSource || 'explicit'}`,
+  ];
+  if (args.maxDepthSource === 'auto') {
+    maxDepthParts.push(`targetSplats=${args.autoMaxDepthTargetSplats}`);
+    maxDepthParts.push(`inputSplats=${header.vertexCount}`);
+    maxDepthParts.push(`samplingRatePerLevel=${args.samplingRatePerLevel}`);
+  }
+
+  const tileRefinementParts = [
+    `tileRefinement=${args.tileRefinement}`,
+    `source=${args.tileRefinementSource || 'explicit'}`,
+  ];
+  if (args.tileRefinementSource === 'auto') {
+    tileRefinementParts.push(
+      `targetRootTiles=${formatTilingParameterNumber(
+        args.autoTileRefinementTargetRootTiles,
+      )}`,
+    );
+    tileRefinementParts.push(
+      `estimatedRootTiles=${args.autoTileRefinementEstimatedRootTiles}`,
+    );
+    tileRefinementParts.push(`leafLimit=${args.leafLimit}`);
+    tileRefinementParts.push(`samplingRatePerLevel=${args.samplingRatePerLevel}`);
+    tileRefinementParts.push(
+      `leafLimitMultiplier=${args.autoTileRefinementLeafLimitMultiplier}`,
+    );
+  }
+
+  console.log(
+    `[info] resolved tiling parameters | ${maxDepthParts.join(' ')} | ${tileRefinementParts.join(' ')}`,
+  );
+}
+
 function currentPeakRssBytes() {
   if (typeof process.resourceUsage === 'function') {
     const usage = process.resourceUsage();
@@ -173,6 +330,9 @@ async function convertPartitionedPlyTo3DTiles(inputPath, outputDir, args) {
       args.inputConvention,
       args.linearScaleInput,
     );
+    resolveMaxDepthFromHeader(args, header);
+    resolveTileRefinementFromHeader(args, header);
+    logResolvedTilingParameters(args, header);
     timingsMs.header_ms = elapsedMsSince(headerStartedAt);
     const fingerprint = makePipelineFingerprint(
       inputPath,

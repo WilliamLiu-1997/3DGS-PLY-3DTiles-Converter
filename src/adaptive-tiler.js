@@ -410,15 +410,24 @@ function rootTileRefinementDepth(node) {
     : null;
 }
 
-function canSplitRootTileRefinement(node, maxDepth, tileRefinement) {
+function canSplitRootTileRefinement(
+  node,
+  maxDepth,
+  tileRefinement,
+  rootTileRefinementPass = null,
+) {
   const refinement = normalizedTileRefinement(tileRefinement);
   const depth = rootTileRefinementDepth(node);
+  const pass = Number.isInteger(rootTileRefinementPass)
+    ? rootTileRefinementPass
+    : depth;
   return (
     maxDepth > 0 &&
     refinement > 1 &&
     depth != null &&
     depth > 0 &&
-    depth < refinement &&
+    depth <= pass &&
+    pass < refinement &&
     existingNodeBuildState(node)?.rootTileRefinementExhausted !== true &&
     node.count > 1
   );
@@ -428,6 +437,51 @@ function markRootTileRefinementExhausted(node) {
   if (node && rootTileRefinementDepth(node) != null) {
     nodeBuildState(node).rootTileRefinementExhausted = true;
   }
+}
+
+function splitActionIsRootTileRefinement(action) {
+  return !!(action && action.rootTileRefinement);
+}
+
+function rootTileRefinementStatsVolume(stats) {
+  const volume = boundsVolume(stats.node.bounds);
+  return Number.isFinite(volume) && volume > 0.0 ? volume : 0.0;
+}
+
+function compareRootTileRefinementStatsByVolume(left, right) {
+  const volumeDelta =
+    rootTileRefinementStatsVolume(right) -
+    rootTileRefinementStatsVolume(left);
+  if (Number.isFinite(volumeDelta) && volumeDelta !== 0.0) {
+    return volumeDelta;
+  }
+  const leftKey = left.node.key || '';
+  const rightKey = right.node.key || '';
+  return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+}
+
+function limitRootTileRefinementActionStats(actionStats) {
+  const rootRefinementStats = actionStats.filter((stats) =>
+    splitActionIsRootTileRefinement(stats.action),
+  );
+  if (rootRefinementStats.length <= 1) {
+    return actionStats;
+  }
+
+  const keepCount = Math.max(1, Math.floor(rootRefinementStats.length / 2));
+  const keptStats = new Set(
+    rootRefinementStats
+      .slice()
+      .sort(compareRootTileRefinementStatsByVolume)
+      .slice(0, keepCount),
+  );
+  const filteredStats = [];
+  for (const stats of actionStats) {
+    if (!splitActionIsRootTileRefinement(stats.action) || keptStats.has(stats)) {
+      filteredStats.push(stats);
+    }
+  }
+  return filteredStats;
 }
 
 function splitActionKeepsLogicalDepth(action) {
@@ -495,6 +549,9 @@ function assignRootTileRefinementChildState(parent, child, action, refinement) {
 function makeAdaptiveSplitCandidateOptions(options = {}) {
   return {
     tileRefinement: normalizedTileRefinement(options.tileRefinement),
+    rootTileRefinementPass: Number.isInteger(options.rootTileRefinementPass)
+      ? options.rootTileRefinementPass
+      : null,
   };
 }
 
@@ -529,12 +586,14 @@ function collectAdaptiveSplitCandidates(
       node,
       maxDepth,
       candidateOptions.tileRefinement,
+      candidateOptions.rootTileRefinementPass,
     );
     const canSplitByCount =
       !node.splitExhausted && node.depth < maxDepth && node.count > leafLimit;
     const canSplitByAspect =
       node.level > 0 &&
       !node.aspectSplitExhausted &&
+      node.count > leafLimit &&
       boundsLongWidthAspect(node.bounds) > ADAPTIVE_MAX_LONG_WIDTH_RATIO;
     const build = existingNodeBuildState(node);
     const canSplitByVolumeRebalance =
@@ -2042,6 +2101,9 @@ function chooseAdaptiveSplitAction(
 ) {
   const node = stats.node;
   const tileRefinement = normalizedTileRefinement(options.tileRefinement);
+  const rootTileRefinementPass = Number.isInteger(options.rootTileRefinementPass)
+    ? options.rootTileRefinementPass
+    : null;
   const build = existingNodeBuildState(node);
   if (
     build?.forceVolumeRebalanceSplit === true &&
@@ -2060,7 +2122,14 @@ function chooseAdaptiveSplitAction(
     };
   }
 
-  if (canSplitRootTileRefinement(node, maxDepth, tileRefinement)) {
+  if (
+    canSplitRootTileRefinement(
+      node,
+      maxDepth,
+      tileRefinement,
+      rootTileRefinementPass,
+    )
+  ) {
     const action = makeKdSplitAction(stats, tightBounds, basisAxes);
     if (action) {
       action.rootTileRefinement = true;
@@ -2080,6 +2149,7 @@ function chooseAdaptiveSplitAction(
   const aspectCandidate =
     node.level > 0 &&
     !node.aspectSplitExhausted &&
+    node.count > leafLimit &&
     (projectedAspectInfo
       ? projectedAspectInfo.aspect
       : boundsLongWidthAspect(tightBounds)) > ADAPTIVE_MAX_LONG_WIDTH_RATIO;
@@ -2724,6 +2794,7 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
 
   const root = makeAdaptiveRootNode(rootBounds, source.vertexCount);
   const tileRefinement = normalizedTileRefinement(options.tileRefinement);
+  let rootTileRefinementPass = 1;
   markRootTileRefinementStart(root, tileRefinement);
 
   if (maxDepth <= 0 || source.vertexCount <= 1) {
@@ -2750,6 +2821,7 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
       const candidates = [];
       collectAdaptiveSplitCandidates(root, maxDepth, leafLimit, candidates, {
         tileRefinement,
+        rootTileRefinementPass,
       });
       if (candidates.length === 0) {
         break;
@@ -2795,8 +2867,7 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
       }
       advanceTilingProgress(splitProgress, 0, { force: true });
 
-      const actionStats = [];
-      const kdActionStats = [];
+      let actionStats = [];
       for (const stats of statsList) {
         stats.node.count = stats.count;
         const tightBounds = boundsFromMinMax(
@@ -2810,7 +2881,7 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
           maxDepth,
           leafLimit,
           splitBasisAxes,
-          { tileRefinement },
+          { tileRefinement, rootTileRefinementPass },
         );
         if (!action.kind) {
           stats.node.bounds = tightBounds;
@@ -2831,7 +2902,15 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
         stats.node.bounds = tightBounds;
         stats.action = action;
         actionStats.push(stats);
-        if (action.kind === ROUTE_MODE_KD) {
+      }
+      actionStats = limitRootTileRefinementActionStats(actionStats);
+      const advancesRootTileRefinementPass = actionStats.some((stats) =>
+        splitActionIsRootTileRefinement(stats.action),
+      );
+
+      const kdActionStats = [];
+      for (const stats of actionStats) {
+        if (stats.action.kind === ROUTE_MODE_KD) {
           resetAdaptiveProjectionStats(stats);
           kdActionStats.push(stats);
         }
@@ -2878,6 +2957,10 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
       }
 
       if (splittableStats.length === 0) {
+        if (advancesRootTileRefinementPass) {
+          rootTileRefinementPass += 1;
+          continue;
+        }
         break;
       }
 
@@ -2963,7 +3046,13 @@ async function buildAdaptiveNodeTreeFromMemoryPositions(
         markCurrentLodTilesForVolumeRebalance(root, affectedVolumeDepths);
       }
       advanceTilingProgress(bucketProgress, 0, { force: true });
+      if (advancesRootTileRefinementPass) {
+        rootTileRefinementPass += 1;
+      }
       if (splitNodeCount === 0) {
+        if (advancesRootTileRefinementPass) {
+          continue;
+        }
         break;
       }
     }
@@ -2993,6 +3082,7 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
   const splitBasisAxes = options.splitBasisAxes || null;
   const splitPenaltyOptions = makeAdaptiveSplitPenaltyOptions(options);
   const tileRefinement = normalizedTileRefinement(options.tileRefinement);
+  let rootTileRefinementPass = 1;
   markRootTileRefinementStart(root, tileRefinement);
 
   if (maxDepth <= 0 || source.vertexCount <= 1) {
@@ -3003,6 +3093,7 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
     const candidates = [];
     collectAdaptiveSplitCandidates(root, maxDepth, leafLimit, candidates, {
       tileRefinement,
+      rootTileRefinementPass,
     });
     if (candidates.length === 0) {
       break;
@@ -3032,8 +3123,7 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
       clearStatsNodeBuildStateField(statsList, 'activeSplitStats');
     }
 
-    const actionStats = [];
-    const kdActionStats = [];
+    let actionStats = [];
     for (const stats of statsList) {
       stats.node.count = stats.count;
       const tightBounds = boundsFromMinMax(
@@ -3047,7 +3137,7 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
         maxDepth,
         leafLimit,
         splitBasisAxes,
-        { tileRefinement },
+        { tileRefinement, rootTileRefinementPass },
       );
       if (!action.kind) {
         stats.node.bounds = tightBounds;
@@ -3067,11 +3157,19 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
       }
       stats.node.bounds = tightBounds;
       stats.action = action;
-      if (action.kind === ROUTE_MODE_KD) {
+      actionStats.push(stats);
+    }
+    actionStats = limitRootTileRefinementActionStats(actionStats);
+    const advancesRootTileRefinementPass = actionStats.some((stats) =>
+      splitActionIsRootTileRefinement(stats.action),
+    );
+
+    const kdActionStats = [];
+    for (const stats of actionStats) {
+      if (stats.action.kind === ROUTE_MODE_KD) {
         resetAdaptiveProjectionStats(stats);
         kdActionStats.push(stats);
       }
-      actionStats.push(stats);
     }
 
     if (kdActionStats.length > 0) {
@@ -3115,6 +3213,10 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
     }
 
     if (splittableStats.length === 0) {
+      if (advancesRootTileRefinementPass) {
+        rootTileRefinementPass += 1;
+        continue;
+      }
       break;
     }
 
@@ -3200,7 +3302,13 @@ async function buildAdaptiveNodeTreeFromStreamingPositions(
     if (splitNodeCount > 0) {
       markCurrentLodTilesForVolumeRebalance(root, affectedVolumeDepths);
     }
+    if (advancesRootTileRefinementPass) {
+      rootTileRefinementPass += 1;
+    }
     if (splitNodeCount === 0) {
+      if (advancesRootTileRefinementPass) {
+        continue;
+      }
       break;
     }
   }

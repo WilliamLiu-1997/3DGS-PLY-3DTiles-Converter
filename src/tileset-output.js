@@ -6,7 +6,6 @@ const { makeMemoryBudgetPlan, serializeMemoryBudgetPlan } = require('./memory-pl
 const { HANDOFF_BUCKET_ENCODING } = require('./bucket-io');
 
 const TILING_STRATEGY_KD_TREE = 'kd_tree';
-const ESTIMATED_GEOMETRIC_ERROR_MULTIPLIER = 2;
 const GLTF_TILESET_CONTENT_EXTENSION = '3DTILES_content_gltf';
 const GAUSSIAN_SPLATTING_GLTF_EXTENSIONS = [
   'KHR_gaussian_splatting',
@@ -104,18 +103,14 @@ function resolveRootGeometricError(rootNode, rootBounds, params, lodMaxDepth) {
     const ex = rootBounds.extents();
     const diag = Math.sqrt(ex[0] * ex[0] + ex[1] * ex[1] + ex[2] * ex[2]);
     return {
-      value:
-        Math.max(rootNode.ownError, diag * 1e-6, 1e-6) *
-        ESTIMATED_GEOMETRIC_ERROR_MULTIPLIER,
-      source: 'estimated_root_simplify_scaled',
+      value: Math.max(rootNode.ownError, diag * 1e-6, 1e-6),
+      source: 'estimated_root_simplify',
     };
   }
 
   return {
-    value:
-      fallbackRootGeometricError(rootBounds, rootNode.count) *
-      ESTIMATED_GEOMETRIC_ERROR_MULTIPLIER,
-    source: 'estimated_root_fallback_scaled',
+    value: fallbackRootGeometricError(rootBounds, rootNode.count),
+    source: 'estimated_root_fallback',
   };
 }
 
@@ -261,7 +256,23 @@ function makeBuildSummary(
     sh_degree: layout.degree,
     handoff_encoding: HANDOFF_BUCKET_ENCODING,
     max_depth: args.maxDepth,
+    max_depth_source: args.maxDepthSource || 'explicit',
+    auto_max_depth_target_splats:
+      args.maxDepthSource === 'auto' ? args.autoMaxDepthTargetSplats : null,
     tile_refinement: args.tileRefinement,
+    tile_refinement_source: args.tileRefinementSource || 'explicit',
+    auto_tile_refinement_leaf_limit_multiplier:
+      args.tileRefinementSource === 'auto'
+        ? args.autoTileRefinementLeafLimitMultiplier
+        : null,
+    auto_tile_refinement_target_root_tiles:
+      args.tileRefinementSource === 'auto'
+        ? args.autoTileRefinementTargetRootTiles
+        : null,
+    auto_tile_refinement_estimated_root_tiles:
+      args.tileRefinementSource === 'auto'
+        ? args.autoTileRefinementEstimatedRootTiles
+        : null,
     leaf_limit: args.leafLimit,
     split_midpoint_penalty: args.splitMidpointPenalty,
     split_count_balance_penalty: args.splitCountBalancePenalty,

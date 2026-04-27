@@ -6,6 +6,17 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-04-28
+
+### Changed
+
+- Changed `tileRefinement` / `--tile-refinement` root-refinement passes to re-sort current candidate leaves and split only the largest half by bounds volume, while keeping skipped tiles eligible for later passes.
+- Changed long-tile virtual splits to run only when a tile has more splats than `leafLimit`.
+- Changed the default `spzCompressionLevel` / `--spz-compression-level` value from `8` to `9`.
+- Changed omitted `tileRefinement` / `--tile-refinement` handling to compute root refinement from splat count, `leafLimit`, and `maxDepth`.
+- Changed omitted `maxDepth` / `--max-depth` handling to compute depth from splat count and `samplingRatePerLevel` for a 160000-splat root target.
+- Removed the extra 2x multiplier from estimated root geometric-error values.
+
 ## [0.3.5] - 2026-04-27
 
 ### Changed

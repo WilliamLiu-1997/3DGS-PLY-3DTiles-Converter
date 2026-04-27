@@ -42,15 +42,15 @@ const DEFAULT_CONVERSION_ARGS = {
   inputConvention: 'graphdeco',
   linearScaleInput: false,
   colorSpace: 'srgb_rec709_display',
-  maxDepth: 8,
-  tileRefinement: 2,
+  maxDepth: null,
+  tileRefinement: null,
   leafLimit: 1000,
   splitMidpointPenalty: 0.5,
   splitCountBalancePenalty: 0.1,
   minGeometricError: null,
   spzSh1Bits: 8,
   spzShRestBits: 8,
-  spzCompressionLevel: 8,
+  spzCompressionLevel: 9,
   transform: null,
   coordinate: null,
   samplingRatePerLevel: 0.5,
@@ -303,10 +303,13 @@ function assertChoice(value, choices, flagName) {
 }
 
 function validateConversionArgs(args, { requireInput = false } = {}) {
-  if (args.maxDepth < 0) {
+  if (args.maxDepth != null && args.maxDepth < 0) {
     throw new ConversionError('--max-depth must be >= 0');
   }
-  if (!Number.isInteger(args.tileRefinement) || args.tileRefinement < 1) {
+  if (
+    args.tileRefinement != null &&
+    (!Number.isInteger(args.tileRefinement) || args.tileRefinement < 1)
+  ) {
     throw new ConversionError('--tile-refinement must be an integer >= 1');
   }
   if (args.leafLimit < 1) {

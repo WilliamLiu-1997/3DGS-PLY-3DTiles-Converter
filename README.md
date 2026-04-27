@@ -78,8 +78,6 @@ const { convert } = require('3dgs-ply-3dtiles-converter');
 (async () => {
   const result = await convert('data/scene.ply', './out/tileset', {
     memoryBudget: 4,
-    maxDepth: 8,
-    tileRefinement: 2,
     leafLimit: 1000,
     openInspector: false,
   });
@@ -107,14 +105,14 @@ The library API accepts the same option names as the CLI, using camelCase fields
 | Input convention      | `--input-convention <value>`                            | `inputConvention`             | `graphdeco`           | Use `graphdeco` or `khr_native`; controls quaternion interpretation and opacity mapping.    |
 | Linear scale input    | `--linear-scale-input`                                  | `linearScaleInput`            | `false`               | Converts linear scale values to log scale.                                                  |
 | Color space           | `--color-space <value>`                                 | `colorSpace`                  | `srgb_rec709_display` | Use `lin_rec709_display` or `srgb_rec709_display`; written to tileset extension metadata.   |
-| Tiling depth          | `--max-depth <int>`                                     | `maxDepth`                    | `8`                   | Maximum tree LOD depth.                                                                     |
-| Root tile refinement  | `--tile-refinement <int>`                               | `tileRefinement`              | `2`                   | Higher values produce more, smaller tiles.                                                  |
+| Tiling depth          | `--max-depth <int>`                                     | `maxDepth`                    | `auto`                | Maximum tree LOD depth. If omitted, computed from splat count and `samplingRatePerLevel`.   |
+| Root tile refinement  | `--tile-refinement <int>`                               | `tileRefinement`              | `auto`                | Higher values produce more, smaller root-refinement tiles.                                  |
 | Leaf size             | `--leaf-limit <int>`                                    | `leafLimit`                   | `1000`                | Target splat-count limit for leaf tiles.                                                    |
 | Split midpoint bias   | `--split-midpoint-penalty <number>`                     | `splitMidpointPenalty`        | `0.5`                 | Higher values prefer split planes closer to the projection midpoint.                        |
 | Split count balance   | `--split-count-balance-penalty <number>`                | `splitCountBalancePenalty`    | `0.1`                 | Higher values prefer more even splat counts across child tiles.                             |
 | Geometric error floor | `--min-geometric-error <number>`                        | `minGeometricError`           | `null`                | Minimum geometric error for the deepest emitted level.                                      |
 | SPZ quantization      | `--spz-sh1-bits <1..8>` and `--spz-sh-rest-bits <1..8>` | `spzSh1Bits`, `spzShRestBits` | `8`, `8`              | SH coefficient quantization bits.                                                           |
-| SPZ compression       | `--spz-compression-level <0..9>`                        | `spzCompressionLevel`         | `8`                   | gzip compression level for SPZ payloads.                                                    |
+| SPZ compression       | `--spz-compression-level <0..9>`                        | `spzCompressionLevel`         | `9`                   | gzip compression level for SPZ payloads.                                                    |
 | Placement matrix      | `--transform <json_matrix4>`                            | `transform`                   | `null`                | Writes `tileset.root.transform` directly.                                                   |
 | Placement coordinate  | `--coordinate <json_[lat,long,height]>`                 | `coordinate`                  | `null`                | Generates an ENU root transform from WGS84 degrees/meters.                                  |
 | LOD sampling          | `--sampling-rate-per-level <0..1]`                      | `samplingRatePerLevel`        | `0.5`                 | Sampling ratio between LOD levels.                                                          |
@@ -131,10 +129,6 @@ Use `--help` to print the CLI usage text.
 
 The converter always writes explicit 3D Tiles with `REPLACE` refinement. It builds a volume-aware adaptive k-d tree with AABB bounds and split planes by default. Use `--obb` to enable root-PCA oriented bounding boxes and root-basis split planes.
 
-For regular k-d splits, each candidate axis is divided into 128 equal projection segments. Every internal boundary is scored by normalized child tile volume sum plus configurable midpoint-distance and splat-count balance penalties. When the longest axis is less than 2x the second-longest axis, the second axis is tested in the same pass, but its score is multiplied by `sqrt(longest / second)` so the primary axis keeps a proportional preference.
-
-Some splits refine physical tile paths without increasing logical LOD depth. `--tile-refinement 2` performs two initial root k-d split rounds and emits up to four direct child tiles at logical depth 1; higher integer values continue the same pattern. Long, thin non-root tiles with a long/width aspect above 4 get one scored virtual k-d split. After each k-d split pass, current-LOD leaf tiles whose volume is more than 3x the median volume at the same logical depth get one extra virtual volume-rebalance split.
-
 Large PLY files are processed through a staged temp-file-backed pipeline: scan global bounds and positions, build the adaptive tiling tree, partition leaf buckets, build parent LODs bottom-up from handoff buckets, then write tileset metadata. The pipeline stages position data in memory when it fits the configured `memoryBudget`; otherwise it streams positions through the temp workspace. Successful conversions remove the temp workspace. Failed conversions preserve it so a later run with `--continue` can reuse checkpoints.
 
 Internal scan, partition, build, content, and worker concurrency are derived from `memoryBudget`. Larger budgets allow larger scan and bucket chunks, more simplify scratch space, more bucket entry caching, and more build/content workers, up to internal safety limits.
@@ -144,8 +138,8 @@ Internal scan, partition, build, content, and worker concurrency are derived fro
 The converter resolves a single root `geometricError` and scales child tile errors by logical LOD depth:
 
 - If `--min-geometric-error` / `minGeometricError` is set, the root value is back-computed so the deepest emitted logical level receives that configured value.
-- Otherwise, if the root content was simplified, the root value is `max(rootOwnError, rootDiagonal * 1e-6, 1e-6) * 2`.
-- If the root was not simplified, the fallback root value is based on the root bounding-box diagonal and is also multiplied by `2`.
+- Otherwise, if the root content was simplified, the root value is `max(rootOwnError, rootDiagonal * 1e-6, 1e-6)`.
+- If the root was not simplified, the fallback root value is based on the root bounding-box diagonal.
 
 For each emitted tile:
 
