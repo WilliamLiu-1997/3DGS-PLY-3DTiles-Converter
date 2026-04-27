@@ -6,6 +6,12 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-04-27
+
+### Changed
+
+- Changed adaptive k-d split-plane candidate sampling from 256 equal projection segments to 128.
+
 ## [0.3.4] - 2026-04-27
 
 ### Added

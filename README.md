@@ -131,7 +131,7 @@ Use `--help` to print the CLI usage text.
 
 The converter always writes explicit 3D Tiles with `REPLACE` refinement. It builds a volume-aware adaptive k-d tree with AABB bounds and split planes by default. Use `--obb` to enable root-PCA oriented bounding boxes and root-basis split planes.
 
-For regular k-d splits, each candidate axis is divided into 256 equal projection segments. Every internal boundary is scored by normalized child tile volume sum plus configurable midpoint-distance and splat-count balance penalties. When the longest axis is less than 2x the second-longest axis, the second axis is tested in the same pass, but its score is multiplied by `sqrt(longest / second)` so the primary axis keeps a proportional preference.
+For regular k-d splits, each candidate axis is divided into 128 equal projection segments. Every internal boundary is scored by normalized child tile volume sum plus configurable midpoint-distance and splat-count balance penalties. When the longest axis is less than 2x the second-longest axis, the second axis is tested in the same pass, but its score is multiplied by `sqrt(longest / second)` so the primary axis keeps a proportional preference.
 
 Some splits refine physical tile paths without increasing logical LOD depth. `--tile-refinement 2` performs two initial root k-d split rounds and emits up to four direct child tiles at logical depth 1; higher integer values continue the same pattern. Long, thin non-root tiles with a long/width aspect above 4 get one scored virtual k-d split. After each k-d split pass, current-LOD leaf tiles whose volume is more than 3x the median volume at the same logical depth get one extra virtual volume-rebalance split.
 
