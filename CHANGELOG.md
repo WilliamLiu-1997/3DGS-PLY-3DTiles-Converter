@@ -6,6 +6,22 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+### Added
+
+- Added `splitMidpointPenalty` / `--split-midpoint-penalty` and `splitCountBalancePenalty` / `--split-count-balance-penalty` controls for k-d split-plane scoring, with both values recorded in `build_summary.json`.
+- Added same-LOD virtual volume-rebalance splits for leaf tiles whose volume is more than 3x the median volume at the same logical depth.
+
+### Changed
+
+- Reworked adaptive k-d split-plane selection to divide candidate axes into 256 equal projection segments and score each internal boundary by normalized child tile volume sum plus configurable midpoint-distance and splat-count balance penalties.
+- Changed secondary-axis split competition so the second-longest axis is evaluated when the longest axis is less than 2x longer, with the secondary score multiplied by `sqrt(longest / second)`.
+- Changed long, thin non-root tile handling to use one scored virtual k-d split at the same logical LOD instead of equal-length virtual segment buckets.
+- Changed the default `leafLimit` / `--leaf-limit` value from `100` to `1000`.
+- Changed the default estimated geometric-error multiplier from `2.5` to `2`.
+- Refactored the large-PLY conversion pipeline into staged adaptive tiling, scan, bucket I/O, bottom-up build, tile content, and tileset output modules while preserving the public `convert` API.
+- Improved large-file hot paths with direct binary Float32 decode plans, staged in-memory position data when the memory budget allows, chunked bucket entry caching, and shared concurrency helpers.
+- Updated the `3dtiles-inspector` dependency range to `^0.1.7` and added the `3dgs` npm keyword.
+
 ## [0.3.3] - 2026-04-25
 
 ### Changed
@@ -46,7 +62,7 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 - Replaced the in-memory octree build path with a single explicit, visual-cost-balanced k-d tree pipeline that uses root PCA axes by default and keeps leaf buckets balanced by weighted splat count.
 - Replaced long, thin non-root k-d tiles with equal-length virtual segment paths so emitted intermediate tiles avoid extreme aspect ratios while logical LOD depth remains bounded by `maxDepth`.
-- Changed defaults: `maxDepth` is now `8`, `leafLimit` is now `100`, SPZ gzip compression level is now `8`, `clean` is now `true`, `selfTestCount` is now `1000000`, and inspector launch is enabled by default.
+- Changed defaults: `maxDepth` is now `8`, `leafLimit` is now `1000`, SPZ gzip compression level is now `8`, `clean` is now `true`, `selfTestCount` is now `1000000`, and inspector launch is enabled by default.
 - Changed resume semantics so the default conversion rebuilds from a clean output directory; use `--continue` or `clean: false` to reuse a preserved checkpoint.
 - Updated voxel simplification so retained splat targets drive voxel grouping directly and representative selection stays coarse-biased across `sample` and `merge` modes.
 - Improved large-file conversion throughput by staging position data when it fits the memory budget, prefetching binary PLY chunks, compacting partition writes, limiting active leaf file handles, batching GLB writes, streaming unsimplified bucket content directly to SPZ/GLB output, and running exact bucket simplification and content packing in the derived worker pool.

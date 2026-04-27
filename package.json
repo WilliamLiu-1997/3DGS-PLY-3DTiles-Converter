@@ -41,9 +41,10 @@
     "gaussian-splatting",
     "ply",
     "spz",
-    "converter"
+    "converter",
+    "3dgs"
   ],
   "dependencies": {
-    "3dtiles-inspector": "^0.1.4"
+    "3dtiles-inspector": "^0.1.7"
   }
 }

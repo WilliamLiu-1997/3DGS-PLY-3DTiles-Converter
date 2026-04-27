@@ -12,7 +12,7 @@
 
 </div>
 
-Node.js CLI and library for converting GraphDECO or KHR-native Gaussian Splatting PLY files into explicit 3D Tiles. The converter writes SPZ-compressed GLB tile content, uses a temp-file-backed pipeline for large inputs, and supports optional geospatial placement through a root transform or WGS84 coordinate.
+Node.js CLI and library for converting GraphDECO or KHR-native Gaussian Splatting PLY files into explicit 3D Tiles. The converter builds a volume-aware adaptive k-d tree, writes SPZ-compressed GLB tile content, uses a temp-file-backed pipeline for large inputs, and supports optional geospatial placement through a root transform or WGS84 coordinate.
 
 ## Install
 
@@ -59,7 +59,7 @@ By default, conversion removes the existing `output_dir` before rebuilding and o
 Generated output includes:
 
 - `tileset.json` - compact explicit 3D Tiles tileset.
-- `build_summary.json` - compact conversion metadata, timings, memory plan, checkpoint state, tiling metadata, and placement fields.
+- `build_summary.json` - compact conversion metadata, timings, memory plan, checkpoint state, tiling and geometric-error metadata, split settings, and placement fields.
 - `tiles/{level}/{x}/{y}/{z}.glb` - SPZ-compressed tile content.
 
 Generated `tileset.json` files declare top-level `3DTILES_content_gltf` extension metadata so CesiumJS can detect `KHR_gaussian_splatting` and `KHR_gaussian_splatting_compression_spz_2` content.
@@ -80,7 +80,7 @@ const { convert } = require('3dgs-ply-3dtiles-converter');
     memoryBudget: 4,
     maxDepth: 8,
     tileRefinement: 2,
-    leafLimit: 100,
+    leafLimit: 1000,
     openInspector: false,
   });
 
@@ -109,7 +109,9 @@ The library API accepts the same option names as the CLI, using camelCase fields
 | Color space           | `--color-space <value>`                                 | `colorSpace`                  | `srgb_rec709_display` | Use `lin_rec709_display` or `srgb_rec709_display`; written to tileset extension metadata.   |
 | Tiling depth          | `--max-depth <int>`                                     | `maxDepth`                    | `8`                   | Maximum tree LOD depth.                                                                     |
 | Root tile refinement  | `--tile-refinement <int>`                               | `tileRefinement`              | `2`                   | Higher values produce more, smaller tiles.                                                  |
-| Leaf size             | `--leaf-limit <int>`                                    | `leafLimit`                   | `100`                 | Target splat-count limit for leaf tiles.                                                    |
+| Leaf size             | `--leaf-limit <int>`                                    | `leafLimit`                   | `1000`                | Target splat-count limit for leaf tiles.                                                    |
+| Split midpoint bias   | `--split-midpoint-penalty <number>`                     | `splitMidpointPenalty`        | `0.5`                 | Higher values prefer split planes closer to the projection midpoint.                        |
+| Split count balance   | `--split-count-balance-penalty <number>`                | `splitCountBalancePenalty`    | `0.1`                 | Higher values prefer more even splat counts across child tiles.                             |
 | Geometric error floor | `--min-geometric-error <number>`                        | `minGeometricError`           | `null`                | Minimum geometric error for the deepest emitted level.                                      |
 | SPZ quantization      | `--spz-sh1-bits <1..8>` and `--spz-sh-rest-bits <1..8>` | `spzSh1Bits`, `spzShRestBits` | `8`, `8`              | SH coefficient quantization bits.                                                           |
 | SPZ compression       | `--spz-compression-level <0..9>`                        | `spzCompressionLevel`         | `8`                   | gzip compression level for SPZ payloads.                                                    |
@@ -127,11 +129,31 @@ Use `--help` to print the CLI usage text.
 
 ## Tiling and Performance
 
-The converter always writes explicit 3D Tiles. It builds a visual-cost-balanced k-d tree with AABB bounds and split planes by default. Use `--obb` to enable root-PCA oriented bounding boxes and root-basis split planes.
+The converter always writes explicit 3D Tiles with `REPLACE` refinement. It builds a volume-aware adaptive k-d tree with AABB bounds and split planes by default. Use `--obb` to enable root-PCA oriented bounding boxes and root-basis split planes.
 
-Use `--tile-refinement 2` when the first tile level should be finer: the root performs two initial k-d split rounds and emits up to four direct child tiles while keeping those children at logical depth 1. Higher integer values continue the same pattern.
+For regular k-d splits, each candidate axis is divided into 256 equal projection segments. Every internal boundary is scored by normalized child tile volume sum plus configurable midpoint-distance and splat-count balance penalties. When the longest axis is less than 2x the second-longest axis, the second axis is tested in the same pass, but its score is multiplied by `sqrt(longest / second)` so the primary axis keeps a proportional preference.
 
-Large PLY files are processed through a temp-file-backed pipeline. The pipeline streams PLY records into leaf and handoff buckets, builds parent LODs bottom-up, and derives internal concurrency from `memoryBudget`. Successful conversions remove the temp workspace. Failed conversions preserve it so a later run with `--continue` can reuse checkpoints.
+Some splits refine physical tile paths without increasing logical LOD depth. `--tile-refinement 2` performs two initial root k-d split rounds and emits up to four direct child tiles at logical depth 1; higher integer values continue the same pattern. Long, thin non-root tiles with a long/width aspect above 4 get one scored virtual k-d split. After each k-d split pass, current-LOD leaf tiles whose volume is more than 3x the median volume at the same logical depth get one extra virtual volume-rebalance split.
+
+Large PLY files are processed through a staged temp-file-backed pipeline: scan global bounds and positions, build the adaptive tiling tree, partition leaf buckets, build parent LODs bottom-up from handoff buckets, then write tileset metadata. The pipeline stages position data in memory when it fits the configured `memoryBudget`; otherwise it streams positions through the temp workspace. Successful conversions remove the temp workspace. Failed conversions preserve it so a later run with `--continue` can reuse checkpoints.
+
+Internal scan, partition, build, content, and worker concurrency are derived from `memoryBudget`. Larger budgets allow larger scan and bucket chunks, more simplify scratch space, more bucket entry caching, and more build/content workers, up to internal safety limits.
+
+## Geometric Error
+
+The converter resolves a single root `geometricError` and scales child tile errors by logical LOD depth:
+
+- If `--min-geometric-error` / `minGeometricError` is set, the root value is back-computed so the deepest emitted logical level receives that configured value.
+- Otherwise, if the root content was simplified, the root value is `max(rootOwnError, rootDiagonal * 1e-6, 1e-6) * 2`.
+- If the root was not simplified, the fallback root value is based on the root bounding-box diagonal and is also multiplied by `2`.
+
+For each emitted tile:
+
+```txt
+tile.geometricError = rootGeometricError * geometricErrorScaleForDepth(tileLogicalDepth)
+```
+
+With the default `samplingRatePerLevel` of `0.5`, that means depth 0 uses the root error, depth 1 uses half, depth 2 uses one quarter, and so on. Virtual splits can create deeper physical tile paths, but their emitted errors still follow the logical depth.
 
 ## Global Placement
 
@@ -160,11 +182,21 @@ await convert('scene.ply', './out_tiles', {
 - `src/index.js` - package export.
 - `src/cli.js` - CLI runner.
 - `src/args.js` - CLI/API argument parsing and validation.
-- `src/parser.js` - PLY streaming helpers and self-test data.
+- `src/parser.js` - PLY header parsing, canonical record decoding, streaming helpers, and self-test data.
+- `src/adaptive-tiler.js` - adaptive k-d tree construction, split scoring, virtual splits, and tile metadata serialization.
+- `src/scan-stage.js` - global bounds/position scans and leaf-bucket partitioning.
+- `src/bucket-io.js` - canonical bucket and handoff bucket read/write helpers.
+- `src/build-stage.js` - bottom-up LOD build scheduling and handoff cleanup.
+- `src/tile-content.js` - bucket simplification, SPZ/GLB content writing, and worker task handlers.
+- `src/tileset-output.js` - tileset JSON, geometric-error calculation, and build-summary output.
+- `src/memory-plan.js` - memory-budget sizing for chunks, scratch buffers, caches, and worker counts.
+- `src/pipeline-state.js` - resumable checkpoint state and fingerprint helpers.
+- `src/pipeline-paths.js` - canonical temp-workspace path helpers.
+- `src/concurrency.js` - shared bounded-concurrency helpers.
 - `src/codec.js` - SPZ encoding and worker payload helpers.
 - `src/gltf.js` - GLB assembly.
 - `src/builder.js` - shared simplify planning, progress, and worker-pool utilities.
-- `src/partitioned-ply.js` - temp-file-backed conversion pipeline.
+- `src/partitioned-ply.js` - top-level temp-file-backed conversion orchestrator.
 - `src/convert-core.js` - top-level conversion wiring and worker entry.
 - `bin/3dgs-ply-3dtiles-converter.js` - npm binary entry.
 
