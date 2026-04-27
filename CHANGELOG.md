@@ -12,6 +12,7 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 - Changed long-tile virtual splitting to use the same 64-segment volume/midpoint score, with a single virtual split per long-tile branch instead of equal-length segment buckets.
 - Added a virtual volume-rebalance split after k-d splits for current-LOD leaf tiles whose volume is more than 3x the median volume at the same logical depth.
 - Changed the default estimated geometric-error multiplier from `2.5` to `2`.
+- Updated the `3dtiles-inspector` dependency range to `^0.1.7`.
 
 ## [0.3.3] - 2026-04-25
 
