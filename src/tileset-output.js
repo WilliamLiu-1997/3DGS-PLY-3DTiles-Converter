@@ -6,7 +6,7 @@ const { makeMemoryBudgetPlan, serializeMemoryBudgetPlan } = require('./memory-pl
 const { HANDOFF_BUCKET_ENCODING } = require('./bucket-io');
 
 const TILING_STRATEGY_KD_TREE = 'kd_tree';
-const ESTIMATED_GEOMETRIC_ERROR_MULTIPLIER = 2.5;
+const ESTIMATED_GEOMETRIC_ERROR_MULTIPLIER = 2;
 const GLTF_TILESET_CONTENT_EXTENSION = '3DTILES_content_gltf';
 const GAUSSIAN_SPLATTING_GLTF_EXTENSIONS = [
   'KHR_gaussian_splatting',

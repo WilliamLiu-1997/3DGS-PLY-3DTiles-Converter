@@ -11,6 +11,7 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 - Changed k-d split-plane selection to test 64 equal longest-axis boundaries and score each split by normalized child tile volume sum plus midpoint-distance penalty; when the longest/second-longest axis ratio is below 1.5, the second axis is tested too.
 - Changed long-tile virtual splitting to use the same 64-segment volume/midpoint score, with a single virtual split per long-tile branch instead of equal-length segment buckets.
 - Added a virtual volume-rebalance split after k-d splits for current-LOD leaf tiles whose volume is more than 3x the median volume at the same logical depth.
+- Changed the default estimated geometric-error multiplier from `2.5` to `2`.
 
 ## [0.3.3] - 2026-04-25
 
